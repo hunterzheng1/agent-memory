@@ -63,3 +63,7 @@ python3 scripts/codex_memory_index.py --search "复用流程" --memory-type work
 3. Agent 自我进化单独放在 `agent/`，其中 case 和 skill 候选用于复用经验沉淀。
 4. 用正交字段过滤记忆：`user_id`、`agent_id`、`app_id`、`project_id`、`session_id`、`track`、`memory_type`、`status`。
 5. API key 只放本地 `.env`，永远不写进 Markdown 记忆和公开仓库。
+
+## 致谢
+
+本项目的部分设计思路受 [EverOS](https://github.com/EverMind-AI/EverOS) 启发，详见 [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md)。
