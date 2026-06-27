@@ -1,3 +1,4 @@
 zvec
 sentence-transformers
 torch
+numpy
