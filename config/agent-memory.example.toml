@@ -1,8 +1,8 @@
 # Example config. The current scripts use environment variables by default.
 # You can keep this file as human-readable documentation for your setup.
 
-memory_root = "/path/to/your/codex-memory-vault"
-state_db = "~/.config/codex-memory/state.sqlite"
+memory_root = "/path/to/your/agent-memory-vault"
+state_db = "~/.config/agent-memory/state.sqlite"
 
 user_id = "demo-user"
 agent_id = "codex"
@@ -15,7 +15,7 @@ run_sqlite_index_after_closeout = true
 
 [semantic_retrieval]
 enabled = false
-vector_dir = "~/.config/codex-memory/zvec/memory_chunks_embeddinggemma_768"
+vector_dir = "~/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"
 embedding_model = "google/embeddinggemma-300m"
 embedding_dim = 768
 embedding_device = "cpu"

@@ -1,7 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-project_id: codex-memory-sqlite-index
+project_id: agent-memory-sqlite-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}

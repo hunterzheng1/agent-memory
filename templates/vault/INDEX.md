@@ -1,7 +1,7 @@
 ---
 memory_type: routing
 track: routing
-project_id: codex-memory-index
+project_id: agent-memory-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -40,8 +40,8 @@ keywords:
 优先用 SQLite 搜索，再读命中的少量 Markdown：
 
 ```bash
-python3 scripts/codex_memory_index.py --search "关键词" --limit 5
-python3 scripts/codex_memory_index.py --search "关键词" --track project
-python3 scripts/codex_memory_index.py --search "关键词" --has-open-loop
-python3 scripts/codex_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
+python3 scripts/agent_memory_index.py --search "关键词" --limit 5
+python3 scripts/agent_memory_index.py --search "关键词" --track project
+python3 scripts/agent_memory_index.py --search "关键词" --has-open-loop
+python3 scripts/agent_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
 ```

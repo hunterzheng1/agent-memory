@@ -16,7 +16,7 @@
 ## 2. 用模板初始化新的本地 vault
 
 ```bash
-python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-env
+python3 scripts/bootstrap.py --memory-root "$HOME/agent-memory-vault" --write-env
 ```
 
 如果目标目录已经存在，脚本默认只补齐缺失文件，不覆盖已有文件。
@@ -45,9 +45,9 @@ python3 scripts/bootstrap.py --memory-root "$HOME/codex-memory-vault" --write-en
 
 ```bash
 source .env
-python3 scripts/codex_agent_evolution.py --init --scan --report
-python3 scripts/codex_memory_index.py --init --scan --report
-python3 scripts/codex_memory_check.py
+python3 scripts/agent_evolution.py --init --scan --report
+python3 scripts/agent_memory_index.py --init --scan --report
+python3 scripts/agent_memory_check.py
 ```
 
 检查通过后，就可以开始在本地使用这个模板。

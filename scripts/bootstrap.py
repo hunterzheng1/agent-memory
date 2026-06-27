@@ -59,11 +59,11 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
         return
     content = "\n".join(
         [
-            f"CODEX_MEMORY_ROOT={memory_root}",
-            f"CODEX_MEMORY_STATE_DB={expand_path(args.state_db)}",
-            f"CODEX_MEMORY_USER_ID={args.user_id}",
-            f"CODEX_MEMORY_AGENT_ID={args.agent_id}",
-            f"CODEX_MEMORY_APP_ID={args.app_id}",
+            f"AGENT_MEMORY_ROOT={memory_root}",
+            f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db)}",
+            f"AGENT_MEMORY_USER_ID={args.user_id}",
+            f"AGENT_MEMORY_AGENT_ID={args.agent_id}",
+            f"AGENT_MEMORY_APP_ID={args.app_id}",
             "",
         ]
     )
@@ -72,11 +72,11 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a local Codex memory vault from the public template.")
+    parser = argparse.ArgumentParser(description="Create a local agent memory vault from the public template.")
     parser.add_argument("--memory-root", required=True, help="Target local memory vault path.")
     parser.add_argument(
         "--state-db",
-        default="$HOME/.config/codex-memory/state.sqlite",
+        default="$HOME/.config/agent-memory/state.sqlite",
         help="SQLite state database path.",
     )
     parser.add_argument("--user-id", default="demo-user", help="Non-secret user identifier.")
@@ -109,12 +109,12 @@ def main() -> int:
 
     print("next_commands:")
     print("  source .env")
-    print("  python3 scripts/codex_agent_evolution.py --init --scan --report")
-    print("  python3 scripts/codex_memory_index.py --init --scan --report")
-    print("  python3 scripts/codex_memory_check.py")
+    print("  python3 scripts/agent_evolution.py --init --scan --report")
+    print("  python3 scripts/agent_memory_index.py --init --scan --report")
+    print("  python3 scripts/agent_memory_check.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")
-    print("  python3 scripts/codex_memory_zvec_index.py --init --scan")
+    print("  python3 scripts/agent_memory_zvec_index.py --init --scan")
     return 0
 
 
