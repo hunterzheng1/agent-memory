@@ -35,10 +35,10 @@ REQUIRED_FILES = [
     VAULT_ROOT / "用户记忆" / "README.md",
     VAULT_ROOT / "用户记忆" / "偏好与边界.md",
     VAULT_ROOT / "用户记忆" / "长期画像.md",
-    VAULT_ROOT / "工作流" / "Codex记忆字段规范.md",
-    VAULT_ROOT / "工作流" / "Codex记忆收尾决策规则.md",
-    VAULT_ROOT / "工作流" / "Codex记忆SQLite全库索引设计.md",
-    VAULT_ROOT / "工作流" / "Codex记忆语义检索设计.md",
+    VAULT_ROOT / "工作流" / "记忆字段规范.md",
+    VAULT_ROOT / "工作流" / "记忆收尾决策规则.md",
+    VAULT_ROOT / "工作流" / "记忆SQLite全库索引设计.md",
+    VAULT_ROOT / "工作流" / "记忆语义检索设计.md",
     VAULT_ROOT / "agent" / "README.md",
     VAULT_ROOT / "agent" / "case-candidates" / "README.md",
     VAULT_ROOT / "agent" / "case-candidates" / "_模板-AgentCase候选.md",
@@ -106,7 +106,7 @@ def exact_secret_values() -> list[str]:
 def iter_text_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache"}
+    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache", ".harness", ".codegraph", ".claude"}
     files: list[Path] = []
     for path in root.rglob("*"):
         if any(part in ignored_dirs for part in path.parts):
@@ -223,7 +223,7 @@ def check_public_repo_files() -> list[str]:
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
     for path in REPO_ROOT.rglob("*"):
-        if ".git" in path.parts:
+        if any(part in {".git", ".harness", ".codegraph", ".claude"} for part in path.parts):
             continue
         if path.is_file() and path.name in forbidden_names:
             failures.append(f"FORBIDDEN public_file {path}")

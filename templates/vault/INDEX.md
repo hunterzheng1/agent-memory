@@ -14,17 +14,17 @@ keywords:
   - routing
 ---
 
-# Codex 记忆索引
+# 记忆索引
 
 ## 读取入口
 
-- 全局规则：`AGENTS.md`
+- 全局规则：`AGENTS.md`（Codex）/ `CLAUDE.md`（Claude Code）
 - 用户偏好：`用户记忆/偏好与边界.md`
 - 用户画像：`用户记忆/长期画像.md`
-- 字段规范：`工作流/Codex记忆字段规范.md`
-- 收尾规则：`工作流/Codex记忆收尾决策规则.md`
-- SQLite 索引：`工作流/Codex记忆SQLite全库索引设计.md`
-- 语义检索：`工作流/Codex记忆语义检索设计.md`
+- 字段规范：`工作流/记忆字段规范.md`
+- 收尾规则：`工作流/记忆收尾决策规则.md`
+- SQLite 索引：`工作流/记忆SQLite全库索引设计.md`
+- 语义检索：`工作流/记忆语义检索设计.md`
 - Agent 记忆：`agent/README.md`
 
 ## 目录职责

@@ -1,10 +1,10 @@
-# Codex 记忆库模板
+# 记忆库模板
 
-这是一个本地 Codex 记忆库模板。真实使用时，你可以把这个目录当作普通 Markdown 文件夹使用；如果你使用 Obsidian，也可以把它作为 Obsidian vault 打开。
+这是一个本地记忆库模板。真实使用时，你可以把这个目录当作普通 Markdown 文件夹使用；如果你使用 Obsidian，也可以把它作为 Obsidian vault 打开。
 
 建议读取顺序：
 
-1. `AGENTS.md`
+1. `AGENTS.md`（Codex）/ `CLAUDE.md`（Claude Code）
 2. `INDEX.md`
 3. 根据任务关键词读取最相关的 1-3 个文件
 

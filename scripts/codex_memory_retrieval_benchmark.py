@@ -17,22 +17,22 @@ DEFAULT_BENCHMARK_CASES = [
     {
         "id": "field_rules",
         "query": "frontmatter user_id agent_id project_id fields",
-        "expected": ["工作流/Codex记忆字段规范.md"],
+        "expected": ["工作流/记忆字段规范.md"],
     },
     {
         "id": "closeout_rules",
         "query": "important conversation closeout write memory",
-        "expected": ["工作流/Codex记忆收尾决策规则.md"],
+        "expected": ["工作流/记忆收尾决策规则.md"],
     },
     {
         "id": "sqlite_index",
         "query": "full vault SQLite FTS search and open loops",
-        "expected": ["工作流/Codex记忆SQLite全库索引设计.md"],
+        "expected": ["工作流/记忆SQLite全库索引设计.md"],
     },
     {
         "id": "semantic_index",
         "query": "semantic retrieval embedding zvec vector search",
-        "expected": ["工作流/Codex记忆语义检索设计.md"],
+        "expected": ["工作流/记忆语义检索设计.md"],
     },
     {
         "id": "user_profile",
