@@ -84,12 +84,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--memory-root", required=True, help="Target local memory vault path.")
     parser.add_argument(
         "--state-db",
-        default="$HOME/.config/agent-memory/state.sqlite",
+        default="~/.config/agent-memory/state.sqlite",
         help="SQLite state database path.",
     )
     parser.add_argument(
         "--config-root",
-        default="$HOME/.config/agent-memory",
+        default="~/.config/agent-memory",
         help="Local config/state directory for logs, audit decisions, and derived indexes.",
     )
     parser.add_argument(
@@ -129,7 +129,7 @@ def main() -> int:
     print("  source .env")
     print("  python3 scripts/agent_evolution.py --init --scan --report")
     print("  python3 scripts/agent_memory_index.py --init --scan --report")
-    print("  python3 scripts/codex_memory_closeout.py --dry-run")
+    print("  python3 scripts/agent_memory_closeout.py --dry-run")
     print("  python3 scripts/agent_memory_check.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")

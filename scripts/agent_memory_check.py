@@ -17,7 +17,7 @@ VAULT_ROOT = Path(
 ).expanduser().resolve()
 STATE_DB = Path(
     os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "~/.config/agent-memory/state.sqlite"))
     )
 ).expanduser().resolve()
 
@@ -57,12 +57,16 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_check.py",
     SCRIPT_ROOT / "agent_evolution.py",
     SCRIPT_ROOT / "agent_memory_index.py",
+    SCRIPT_ROOT / "agent_memory_search.py",
+    SCRIPT_ROOT / "agent_memory_closeout.py",
+    SCRIPT_ROOT / "agent_memory_audit.py",
+    SCRIPT_ROOT / "agent_memory_audit_autorun.py",
+    SCRIPT_ROOT / "agent_memory_zvec_index.py",
+    SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
     SCRIPT_ROOT / "codex_memory_search.py",
     SCRIPT_ROOT / "codex_memory_closeout.py",
     SCRIPT_ROOT / "codex_memory_audit.py",
     SCRIPT_ROOT / "codex_memory_audit_autorun.py",
-    SCRIPT_ROOT / "agent_memory_zvec_index.py",
-    SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
 ]
 
 REQUIRED_STATE_TABLES = {

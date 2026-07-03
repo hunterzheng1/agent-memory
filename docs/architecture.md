@@ -74,7 +74,7 @@ status: active
 
 查询建议：
 
-1. 默认使用 `codex_memory_search.py`。
+1. 默认使用 `agent_memory_search.py`。
 2. 关键词、项目名、路径、字段明确时，SQLite/FTS 会给出稳定结果。
 3. 表达模糊时，可以启用 Zvec 做语义候选召回。
 4. Zvec 命中的 chunk 只作为候选，最终仍然回读 Markdown 原文。

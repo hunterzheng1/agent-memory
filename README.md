@@ -1,12 +1,12 @@
-# Codex Memory Template
+# Agent Memory Template
 
-这是一个 Codex 长期记忆库模板。它把普通 Markdown 文件当作长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
+这是一个面向多 Agent 的长期记忆库模板。它把普通 Markdown 文件当作长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
 ## 它解决什么问题
 
-- 让 Codex 每次开始重要任务时，先读最相关的长期记忆。
+- 让 Codex、Claude Code 等 Agent 每次开始重要任务时，先读最相关的长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -35,16 +35,17 @@ templates/vault/
 scripts/
   bootstrap.py           # 从模板创建本地私有 vault
   agent_memory_index.py  # 全库 SQLite 索引和搜索
-  codex_memory_search.py # 统一搜索入口：SQLite + 可选 Zvec + 手动 rg
-  codex_memory_closeout.py
+  agent_memory_search.py # 统一搜索入口：SQLite + 可选 Zvec + 手动 rg
+  agent_memory_closeout.py
                           # 任务结束收尾：检查、对账、刷新索引、审计、可选提交
-  codex_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
-  codex_memory_audit_autorun.py
+  agent_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
+  agent_memory_audit_autorun.py
                           # audit 自动触发器：超过间隔才运行
   agent_memory_zvec_index.py
   agent_memory_retrieval_benchmark.py
   agent_evolution.py
   agent_memory_check.py
+  codex_memory_*.py       # 兼容包装，转发到 agent_memory_*.py
 ```
 
 ## 快速开始
@@ -68,29 +69,29 @@ python3 scripts/agent_memory_check.py
 搜索示例：
 
 ```bash
-python3 scripts/codex_memory_search.py "项目 收尾" --limit 5
-python3 scripts/codex_memory_search.py "偏好" --track user
-python3 scripts/codex_memory_search.py "复用流程" --memory-type workflow
+python3 scripts/agent_memory_search.py "项目 收尾" --limit 5
+python3 scripts/agent_memory_search.py "偏好" --track user
+python3 scripts/agent_memory_search.py "复用流程" --memory-type workflow
 ```
 
 任务结束时建议使用统一收尾脚本。它会自动发现记忆库里的变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新，并在 audit 超过间隔时顺手跑一次体检。
 
 ```bash
-python3 scripts/codex_memory_closeout.py --dry-run
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/agent_memory_closeout.py --dry-run
+python3 scripts/agent_memory_closeout.py --commit
 ```
 
 写入正式记忆前，可以先让脚本做一次对账，判断应该新建、更新旧文件、跳过、还是需要人工合并：
 
 ```bash
-python3 scripts/codex_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要"
 ```
 
 audit 可以手动运行，也可以由 closeout 捎带触发：
 
 ```bash
-python3 scripts/codex_memory_audit.py
-python3 scripts/codex_memory_audit_autorun.py --reason manual --json
+python3 scripts/agent_memory_audit.py
+python3 scripts/agent_memory_audit_autorun.py --reason manual --json
 ```
 
 可选的 Stop hook 提醒和 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。

@@ -41,8 +41,8 @@ keywords:
 优先用统一搜索入口，再读命中的少量 Markdown：
 
 ```bash
-python3 scripts/codex_memory_search.py "关键词" --limit 5
-python3 scripts/codex_memory_search.py "关键词" --track project
-python3 scripts/codex_memory_search.py "关键词" --has-open-loop
-python3 scripts/codex_memory_search.py "只记得大概意思的问题" --limit 5
+python3 scripts/agent_memory_search.py "关键词" --limit 5
+python3 scripts/agent_memory_search.py "关键词" --track project
+python3 scripts/agent_memory_search.py "关键词" --has-open-loop
+python3 scripts/agent_memory_search.py "只记得大概意思的问题" --limit 5
 ```

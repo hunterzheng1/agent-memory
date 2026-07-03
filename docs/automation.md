@@ -1,6 +1,6 @@
 # Automation
 
-Codex Memory can run without background automation. The recommended automated setup is layered:
+Agent Memory can run without background automation. The recommended automated setup is layered:
 
 1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
 2. Optional Stop hook reminder: the Agent runtime only reminds when memory files changed or audit is overdue.
@@ -13,13 +13,13 @@ Automation should only produce reminders, reports, logs, and local audit decisio
 This is the primary path because it runs when an Agent is already present to read and explain the result.
 
 ```bash
-python3 scripts/codex_memory_closeout.py --commit
+python3 scripts/agent_memory_closeout.py --commit
 ```
 
 By default, closeout calls:
 
 ```bash
-python3 scripts/codex_memory_audit_autorun.py \
+python3 scripts/agent_memory_audit_autorun.py \
   --reason closeout \
   --min-interval-days 7 \
   --json
@@ -44,7 +44,7 @@ on Stop:
   if memory vault has dirty Markdown files:
     if state.sqlite is older than the changed files:
       if this session was not reminded:
-        notify: run codex_memory_closeout.py --dry-run
+        notify: run agent_memory_closeout.py --dry-run
 
   if audit has not succeeded in the last 7 days:
     if today was not reminded:
@@ -55,7 +55,7 @@ on Stop:
 
 Use `launchd` when you want a weekly audit even if no Agent session happens.
 
-Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
+Create `~/Library/LaunchAgents/com.example.agent-memory-audit.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -64,12 +64,12 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.example.codex-memory-audit</string>
+  <string>com.example.agent-memory-audit</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/path/to/codex-memory/scripts/codex_memory_audit_autorun.py</string>
+    <string>/path/to/agent-memory/scripts/agent_memory_audit_autorun.py</string>
     <string>--reason</string>
     <string>launchd</string>
     <string>--force</string>
@@ -88,13 +88,13 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
   </dict>
 
   <key>StandardOutPath</key>
-  <string>/path/to/codex-memory-config/logs/audit-launchd.out.log</string>
+  <string>/path/to/agent-memory-config/logs/audit-launchd.out.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/path/to/codex-memory-config/logs/audit-launchd.err.log</string>
+  <string>/path/to/agent-memory-config/logs/audit-launchd.err.log</string>
 
   <key>WorkingDirectory</key>
-  <string>/path/to/codex-memory</string>
+  <string>/path/to/agent-memory</string>
 </dict>
 </plist>
 ```
@@ -102,14 +102,14 @@ Create `~/Library/LaunchAgents/com.example.codex-memory-audit.plist`:
 Load it:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
-launchctl list | grep codex-memory-audit
+launchctl load ~/Library/LaunchAgents/com.example.agent-memory-audit.plist
+launchctl list | grep agent-memory-audit
 ```
 
 Unload it:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
+launchctl unload ~/Library/LaunchAgents/com.example.agent-memory-audit.plist
 ```
 
 ## Reading Results
@@ -117,7 +117,7 @@ launchctl unload ~/Library/LaunchAgents/com.example.codex-memory-audit.plist
 The latest report is local:
 
 ```bash
-cat "$CODEX_MEMORY_AUDIT_REPORT"
+cat "$AGENT_MEMORY_AUDIT_REPORT"
 ```
 
 Typical findings mean:

@@ -25,6 +25,8 @@ model-cache/
 
 # AI tooling metadata — local-only, not part of public template
 /.claude/
+/.agents/
+/.codex/
 /.harness/
 /.codegraph/
 /CLAUDE.md

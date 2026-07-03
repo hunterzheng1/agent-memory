@@ -15,7 +15,7 @@ keywords:
   - index
 ---
 
-# Codex 记忆 SQLite 全库索引设计
+# Agent 记忆 SQLite 全库索引设计
 
 ## 当前有效摘要
 

@@ -1,6 +1,6 @@
 # Migration Guide
 
-这份指南用于把一个已经在使用的私人 Codex 记忆系统，整理成可复用模板。
+这份指南用于把一个已经在使用的私人 agent/Codex 记忆系统，整理成可复用模板。
 
 ## 1. 不要直接复制真实 vault
 
@@ -48,7 +48,7 @@ python3 scripts/bootstrap.py --memory-root "$HOME/agent-memory-vault" --write-en
 source .env
 python3 scripts/agent_evolution.py --init --scan --report
 python3 scripts/agent_memory_index.py --init --scan --report
-python3 scripts/codex_memory_closeout.py --dry-run
+python3 scripts/agent_memory_closeout.py --dry-run
 python3 scripts/agent_memory_check.py
 ```
 

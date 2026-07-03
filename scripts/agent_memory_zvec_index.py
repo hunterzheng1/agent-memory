@@ -20,12 +20,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 STATE_DB = Path(
     os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "~/.config/agent-memory/state.sqlite"))
     )
 ).expanduser().resolve()
 DEFAULT_COLLECTION_PATH = Path(
     os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_VECTOR_DIR", os.environ.get("CODEX_MEMORY_VECTOR_DIR", "$HOME/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"))
+        os.environ.get("AGENT_MEMORY_VECTOR_DIR", os.environ.get("CODEX_MEMORY_VECTOR_DIR", "~/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"))
     )
 ).expanduser().resolve()
 DEFAULT_MODEL = os.environ.get("AGENT_MEMORY_EMBEDDING_MODEL", os.environ.get("CODEX_MEMORY_EMBEDDING_MODEL", "google/embeddinggemma-300m"))

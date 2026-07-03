@@ -19,7 +19,7 @@ VAULT_ROOT = Path(
 AGENT_ROOT = VAULT_ROOT / "agent"
 STATE_DB = Path(
     os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "~/.config/agent-memory/state.sqlite"))
     )
 ).expanduser().resolve()
 

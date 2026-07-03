@@ -18,7 +18,7 @@ VAULT_ROOT = Path(
 ).expanduser().resolve()
 STATE_DB = Path(
     os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "~/.config/agent-memory/state.sqlite"))
     )
 ).expanduser().resolve()
 DEFAULT_USER_ID = os.environ.get("AGENT_MEMORY_USER_ID", os.environ.get("CODEX_MEMORY_USER_ID", "demo-user"))
