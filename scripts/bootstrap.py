@@ -57,13 +57,21 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
     if env_path.exists() and not args.overwrite_env:
         print(f"SKIP env_exists {env_path}")
         return
+    config_root = expand_path(args.config_root)
+    git_root = expand_path(args.git_root) if args.git_root else memory_root
     content = "\n".join(
         [
             f"AGENT_MEMORY_ROOT={memory_root}",
+            f"AGENT_MEMORY_GIT_ROOT={git_root}",
+            f"AGENT_MEMORY_CONFIG_ROOT={config_root}",
             f"AGENT_MEMORY_STATE_DB={expand_path(args.state_db)}",
             f"AGENT_MEMORY_USER_ID={args.user_id}",
             f"AGENT_MEMORY_AGENT_ID={args.agent_id}",
             f"AGENT_MEMORY_APP_ID={args.app_id}",
+            f"AGENT_MEMORY_AUDIT_DB={config_root / 'audit_decisions.sqlite'}",
+            f"AGENT_MEMORY_CLOSEOUT_LOG={config_root / 'logs' / 'closeout.jsonl'}",
+            f"AGENT_MEMORY_AUDIT_RUN_LOG={config_root / 'logs' / 'audit_runs.jsonl'}",
+            f"AGENT_MEMORY_AUDIT_REPORT={config_root / 'reports' / 'latest-audit.json'}",
             "",
         ]
     )
@@ -78,6 +86,16 @@ def parse_args() -> argparse.Namespace:
         "--state-db",
         default="$HOME/.config/agent-memory/state.sqlite",
         help="SQLite state database path.",
+    )
+    parser.add_argument(
+        "--config-root",
+        default="$HOME/.config/agent-memory",
+        help="Local config/state directory for logs, audit decisions, and derived indexes.",
+    )
+    parser.add_argument(
+        "--git-root",
+        default="",
+        help="Git root that contains the memory vault. Defaults to --memory-root.",
     )
     parser.add_argument("--user-id", default="demo-user", help="Non-secret user identifier.")
     parser.add_argument("--agent-id", default="codex", help="Agent identifier.")
@@ -111,6 +129,7 @@ def main() -> int:
     print("  source .env")
     print("  python3 scripts/agent_evolution.py --init --scan --report")
     print("  python3 scripts/agent_memory_index.py --init --scan --report")
+    print("  python3 scripts/codex_memory_closeout.py --dry-run")
     print("  python3 scripts/agent_memory_check.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")
