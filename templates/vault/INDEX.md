@@ -18,7 +18,7 @@ keywords:
 
 ## 读取入口
 
-- 全局规则：`AGENTS.md`（Codex）/ `CLAUDE.md`（Claude Code）
+- 全局规则：`AGENTS.md`（Codex/通用）/ `CLAUDE.md`（Claude Code）/ `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule（Cursor）
 - 用户偏好：`用户记忆/偏好与边界.md`
 - 用户画像：`用户记忆/长期画像.md`
 - 字段规范：`工作流/记忆字段规范.md`

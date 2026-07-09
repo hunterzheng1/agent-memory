@@ -194,6 +194,8 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
         completed = subprocess.run(
             command,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=args.zvec_timeout,
             env=command_env_offline(),
@@ -250,7 +252,15 @@ def rg_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
         return [], []
     command = ["rg", "--line-number", "--ignore-case", "--fixed-strings", "--", args.query, str(VAULT_ROOT)]
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=args.rg_timeout, check=False)
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=args.rg_timeout,
+            check=False,
+        )
     except FileNotFoundError:
         return [], ["rg not found"]
     except subprocess.TimeoutExpired:

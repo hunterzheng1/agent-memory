@@ -85,6 +85,8 @@ def run_command(command: list[str], timeout: int = 180) -> dict[str, Any]:
         completed = subprocess.run(
             command,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             env=env,

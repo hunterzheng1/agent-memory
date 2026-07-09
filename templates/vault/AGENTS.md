@@ -1,6 +1,8 @@
-# Codex Memory Instructions
+# Agent Memory Instructions
 
 这是本地长期记忆库。遇到既有项目、仓库、路径、人物、历史结论、继续上次任务、报告、调研、较长排查时，默认先使用这个记忆库；简单翻译、改一句话、查时间等一次性小任务可以跳过。
+
+Codex、Claude Code、Cursor 等 agent 可以共用本 vault；写入时在 frontmatter 用自己的 `agent_id`（如 `codex` / `claude` / `cursor`）。
 
 读取顺序：
 

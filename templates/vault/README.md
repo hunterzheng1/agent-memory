@@ -4,7 +4,7 @@
 
 建议读取顺序：
 
-1. `AGENTS.md`（Codex）/ `CLAUDE.md`（Claude Code）
+1. `AGENTS.md`（Codex/通用）/ `CLAUDE.md`（Claude Code）/ `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule（Cursor）
 2. `INDEX.md`
 3. 根据任务关键词读取最相关的 1-3 个文件
 

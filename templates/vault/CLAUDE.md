@@ -4,7 +4,7 @@
 
 本 vault 是项目级长期记忆层，与 Claude 全局记忆（`~/.claude/`）互补不替代：全局记忆管跨项目偏好与技能，本 vault 管本项目的稳定事实与状态。
 
-> Codex 用户看 `AGENTS.md`，规则等价。
+> Codex 用户看 `AGENTS.md`，Cursor 用户看项目 `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule，规则等价。
 
 读取顺序：
 

@@ -6,7 +6,7 @@
 
 ## 它解决什么问题
 
-- 让 Codex、Claude Code 等 Agent 每次开始重要任务时，先读最相关的长期记忆。
+- 让 Codex、Claude Code、Cursor 等 Agent 每次开始重要任务时，先读最相关的长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -46,6 +46,9 @@ scripts/
   agent_evolution.py
   agent_memory_check.py
   codex_memory_*.py       # 兼容包装，转发到 agent_memory_*.py
+
+.cursor/rules/
+  agent-memory.mdc       # Cursor 项目规则：读取/写入共享记忆库
 ```
 
 ## 快速开始
@@ -95,6 +98,12 @@ python3 scripts/agent_memory_audit_autorun.py --reason manual --json
 ```
 
 可选的 Stop hook 提醒和 macOS `launchd` 周期兜底见 [docs/automation.md](docs/automation.md)。
+
+## Cursor 支持
+
+仓库内置 `.cursor/rules/agent-memory.mdc` 项目规则。Cursor 打开本仓库时，会按 `AGENT_MEMORY_ROOT`（回退 `CODEX_MEMORY_ROOT`）读取共享记忆库；未配置真实 vault 时，规则会退回 `templates/vault/` 作为模板示例。
+
+如果希望 Cursor 在任意项目里都能使用同一个记忆库，可参考 [docs/cursor-user-rule.md](docs/cursor-user-rule.md) 生成 Cursor User Rule。公开模板不要写入真实 vault 路径；真实路径只放在本机私有规则或私有 vault 文档中。
 
 ## 可选：语义检索
 
