@@ -57,7 +57,7 @@ PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", os.environ.get("CODEX_MEMORY_PYTH
 ZVEC_PYTHON = os.environ.get("AGENT_MEMORY_ZVEC_PYTHON", os.environ.get("CODEX_MEMORY_ZVEC_PYTHON", PYTHON))
 
 MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
-TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "INDEX.md", "README.md", "STRUCTURE.md"}
+TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "CLAUDE.md", "INDEX.md", "README.md", "STRUCTURE.md"}
 RECONCILE_ACTIONS = {
     "ADD",
     "UPDATE",
@@ -107,6 +107,11 @@ class GitEntry:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def env_truthy(name: str) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def command_env_offline() -> dict[str, str]:
@@ -703,15 +708,22 @@ def print_human(payload: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    auto_commit_default = env_truthy("AGENT_MEMORY_AUTO_COMMIT") or env_truthy("CODEX_MEMORY_AUTO_COMMIT")
     parser = argparse.ArgumentParser(
-        description="Unified closeout for the local Codex memory system."
+        description="Unified closeout for the local Agent memory system."
     )
     parser.add_argument("--prewrite", help="Run reconcile before writing a new memory; does not modify files.")
     parser.add_argument("--changed-file", action="append", default=[], help="Explicit changed memory file. Repeatable.")
     parser.add_argument("--limit", type=int, default=8, help="Search candidates for reconcile.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Inspect only; do not refresh indexes, write logs, or commit.")
-    parser.add_argument("--commit", action="store_true", help="After successful closeout, commit only processed memory files.")
+    parser.add_argument(
+        "--commit",
+        action="store_true",
+        default=auto_commit_default,
+        help="After successful closeout, commit only processed memory files. Can default on via AGENT_MEMORY_AUTO_COMMIT=1.",
+    )
+    parser.add_argument("--no-commit", action="store_true", help="Disable commit even when AGENT_MEMORY_AUTO_COMMIT=1.")
     parser.add_argument("--commit-warnings", action="store_true", help="Allow commit when non-blocking warnings exist.")
     parser.add_argument("--message", default="", help="Custom scoped commit message.")
     parser.add_argument("--skip-zvec", action="store_true", help="Skip Zvec refresh.")
@@ -731,6 +743,8 @@ def parse_args() -> argparse.Namespace:
     args.audit_limit = max(args.audit_limit, 1)
     args.audit_stale_days = max(args.audit_stale_days, 1)
     args.audit_open_loop_threshold = max(args.audit_open_loop_threshold, 1)
+    if args.no_commit:
+        args.commit = False
     if args.prewrite:
         args.dry_run = True
     return args

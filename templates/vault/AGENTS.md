@@ -42,9 +42,10 @@ python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要
 重要任务结束前执行 memory closeout：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --dry-run
 python3 scripts/agent_memory_closeout.py --commit
 ```
+
+只检查不提交时才使用 `--dry-run`。当 `AGENT_MEMORY_AUTO_COMMIT=1` 时，非 dry-run closeout 可以默认提交本轮处理过的记忆文件。
 
 closeout 会自动发现记忆库变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本轮处理过的记忆文件。
 

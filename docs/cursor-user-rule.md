@@ -1,6 +1,6 @@
 # Cursor User Rule Template
 
-Use this as a Cursor User Rule when you want Cursor to use the same Agent Memory vault across projects. Replace paths for your machine before saving it in Cursor settings.
+Use this as a Cursor User Rule when you want Cursor to use the same Agent Memory vault across projects. You can paste it into Cursor Settings, or save it as a file-backed rule at `~/.cursor/rules/agent-memory.mdc`. Replace paths for your machine before saving.
 
 ```text
 You have access to a shared long-term Agent Memory vault.
@@ -29,9 +29,9 @@ python "<agent-memory repo>/scripts/agent_memory_closeout.py" --prewrite "summar
 
 When writing memory, use agent_id: cursor. After writing, run:
 
-python "<agent-memory repo>/scripts/agent_memory_closeout.py" --dry-run
+python "<agent-memory repo>/scripts/agent_memory_closeout.py" --commit
 
-Only run --commit when the user explicitly asks to commit memory changes.
+If AGENT_MEMORY_AUTO_COMMIT=1 is enabled, a non-dry-run closeout may commit processed memory files by default. --dry-run never commits. Stop and ask the user on MERGE_REQUIRED, ASK_USER, deleted files, or warnings.
 
 Never write API keys, tokens, cookies, passwords, private raw chat transcripts, SQLite databases, vector stores, or model caches into Markdown or a public repository.
 ```

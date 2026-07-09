@@ -47,10 +47,10 @@ When Cursor writes a new or rewritten memory, set frontmatter `agent_id: cursor`
 After writing, run closeout:
 
 ```powershell
-python scripts/agent_memory_closeout.py --dry-run
+python scripts/agent_memory_closeout.py --commit
 ```
 
-Only run `--commit` when the user explicitly wants memory changes committed.
+`AGENT_MEMORY_AUTO_COMMIT=1` can make a non-dry-run closeout commit by default. `--dry-run` never commits. If closeout reports `MERGE_REQUIRED`, `ASK_USER`, deleted files, or warnings, stop and ask the user instead of forcing a commit.
 
 ## Safety
 

@@ -84,6 +84,8 @@ python3 scripts/agent_memory_closeout.py --dry-run
 python3 scripts/agent_memory_closeout.py --commit
 ```
 
+设置 `AGENT_MEMORY_AUTO_COMMIT=1` 后，非 dry-run closeout 会默认尝试提交本轮处理过的记忆文件；`--dry-run` 永远不会提交，`--no-commit` 可临时关闭自动提交。
+
 写入正式记忆前，可以先让脚本做一次对账，判断应该新建、更新旧文件、跳过、还是需要人工合并：
 
 ```bash
