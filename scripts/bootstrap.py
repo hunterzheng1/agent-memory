@@ -80,16 +80,16 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Create a local agent memory vault from the public template.")
+    parser = argparse.ArgumentParser(description="Create a local Agent memory vault from the public template.")
     parser.add_argument("--memory-root", required=True, help="Target local memory vault path.")
     parser.add_argument(
         "--state-db",
-        default="~/.config/agent-memory/state.sqlite",
+        default="$HOME/.config/codex-memory/state.sqlite",
         help="SQLite state database path.",
     )
     parser.add_argument(
         "--config-root",
-        default="~/.config/agent-memory",
+        default="$HOME/.config/codex-memory",
         help="Local config/state directory for logs, audit decisions, and derived indexes.",
     )
     parser.add_argument(
@@ -127,13 +127,15 @@ def main() -> int:
 
     print("next_commands:")
     print("  source .env")
+    print("  git -C \"$AGENT_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
     print("  python3 scripts/agent_evolution.py --init --scan --report")
     print("  python3 scripts/agent_memory_index.py --init --scan --report")
     print("  python3 scripts/agent_memory_closeout.py --dry-run")
     print("  python3 scripts/agent_memory_check.py")
+    print("  python3 scripts/agent_memory_doctor.py")
     print("optional_semantic_retrieval:")
     print("  python3 -m pip install -r requirements-vector.txt")
-    print("  python3 scripts/agent_memory_zvec_index.py --init --scan")
+    print("  python3 scripts/agent_memory_zvec_index.py --init --scan --prune")
     return 0
 
 

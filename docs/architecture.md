@@ -29,6 +29,8 @@ SQLite 只负责索引，不负责成为唯一事实源。
 
 向量层不替代 SQLite。SQLite 继续负责路径、字段、FTS、open-loop 和正交过滤；Zvec 只负责“意思相近”的候选召回。
 
+统一搜索会并行查询 SQLite/FTS 与 Zvec，合并去重后再统一执行 `track`、`memory_type`、`project_id`、`status` 等筛选。语义距离超过阈值的结果直接丢弃，因此向量库不会为了凑足数量而返回明显无关的记忆。
+
 ## 3. User memory and Agent memory
 
 用户记忆和 Agent 记忆分开：
@@ -87,11 +89,15 @@ closeout 是每次任务结束后的自动整理员。它不替 Agent 判断“�
 - 检查是否有敏感内容、结构问题或膨胀文件。
 - 对新文件做写入后查重，发现重复时输出 `MERGE_REQUIRED`。
 - 刷新 SQLite 和可选 Zvec。
+- Zvec 全量扫描会补齐漏项，并清理已删除、重命名或不再合格的旧向量；“已过时信息/旧方案”等历史段落默认不进入当前事实向量。
 - 必要时刷新 Agent evolution。
 - 检查 audit 是否超过间隔，超过则捎带运行。
 - 记录 closeout 日志，并在允许时只提交本轮记忆文件。
+- 日志保存 `git_observed_through` 基线；即使其他备份工具先提交，下一次 closeout 也会从 Git 历史找回尚未处理的记忆变更。
 
 audit 是定期体检。它只产出 findings 和裁决记录，不直接改写 Markdown 事实层。这样可以自动发现问题，又保留人工审计边界。
+
+`codex_memory_doctor.py` 是统一体检入口，核对 Markdown、SQLite、FTS、INDEX、Zvec、Git 基线、验证日期来源、日志隐私与自动化新鲜度。默认只读；`--repair-derived` 也只重建可再生索引。
 
 ## 7. Self evolution
 

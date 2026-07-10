@@ -2,13 +2,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+    import msvcrt
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,21 +25,39 @@ SCRIPT_ROOT = Path(__file__).resolve().parent
 TEMPLATE_REPO_ROOT = SCRIPT_ROOT.parent
 DEFAULT_VAULT_ROOT = TEMPLATE_REPO_ROOT / "templates" / "vault"
 VAULT_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", os.environ.get("CODEX_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT))))
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT)))
 ).expanduser().resolve()
 CONFIG_ROOT = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_CONFIG_ROOT", os.environ.get("CODEX_MEMORY_CONFIG_ROOT", "~/.config/agent-memory"))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "$HOME/.config/codex-memory"))
 ).expanduser().resolve()
 STATE_DB = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", str(CONFIG_ROOT / "state.sqlite"))))
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
 ).expanduser().resolve()
 LOG_PATH = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_CLOSEOUT_LOG", os.environ.get("CODEX_MEMORY_CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
 ).expanduser().resolve()
+
+
+def env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
+
+
+def lock_file(handle: Any, blocking: bool) -> None:
+    if fcntl is not None:
+        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), flags)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+
+
+def unlock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def find_default_git_root() -> Path:
@@ -43,9 +68,8 @@ def find_default_git_root() -> Path:
 
 
 REPO_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_GIT_ROOT", os.environ.get("CODEX_MEMORY_GIT_ROOT", str(find_default_git_root()))))
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_GIT_ROOT", str(find_default_git_root())))
 ).expanduser().resolve()
-GIT_AVAILABLE = (REPO_ROOT / ".git").exists()
 
 CHECK_SCRIPT = SCRIPT_ROOT / "agent_memory_check.py"
 INDEX_SCRIPT = SCRIPT_ROOT / "agent_memory_index.py"
@@ -53,8 +77,8 @@ SEARCH_SCRIPT = SCRIPT_ROOT / "agent_memory_search.py"
 ZVEC_SCRIPT = SCRIPT_ROOT / "agent_memory_zvec_index.py"
 AGENT_EVOLUTION_SCRIPT = SCRIPT_ROOT / "agent_evolution.py"
 AUDIT_AUTORUN_SCRIPT = SCRIPT_ROOT / "agent_memory_audit_autorun.py"
-PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", os.environ.get("CODEX_MEMORY_PYTHON", sys.executable))
-ZVEC_PYTHON = os.environ.get("AGENT_MEMORY_ZVEC_PYTHON", os.environ.get("CODEX_MEMORY_ZVEC_PYTHON", PYTHON))
+PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", sys.executable)
+ZVEC_PYTHON = os.environ.get("AGENT_MEMORY_ZVEC_PYTHON", PYTHON)
 
 MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
 TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "CLAUDE.md", "INDEX.md", "README.md", "STRUCTURE.md"}
@@ -67,10 +91,12 @@ RECONCILE_ACTIONS = {
     "ASK_USER",
 }
 ASK_USER_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|token|secret|password|cookie|credential)"),
     re.compile(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}"),
-    re.compile(r"(操控|操作|打开|登录|读取|导出|发送|回复|群发).{0,12}微信|微信.{0,12}(操控|操作|打开|登录|读取|导出|发送|回复|群发)"),
-    re.compile(r"(删除|删掉|移到废纸篓|移入废纸篓|永久删除|清空).{0,12}(文件|目录|记忆|仓库|vault)|rm\s+-rf|unlink"),
+    re.compile(r"(?i)gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(
+        r"(?im)^\s*(?:api[_-]?key|access[_-]?token|secret|password|cookie|credential)\s*[:=]\s*"
+        r"[\"']?(?!redacted\b|example\b|placeholder\b|your[_-]|<)[A-Za-z0-9_./+=-]{20,}"
+    ),
 ]
 
 
@@ -109,11 +135,6 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def env_truthy(name: str) -> bool:
-    value = os.environ.get(name, "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
 def command_env_offline() -> dict[str, str]:
     env = os.environ.copy()
     for key in (
@@ -136,6 +157,7 @@ def run_command(
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started_at = utc_now()
+    started = time.monotonic()
     try:
         completed = subprocess.run(
             command,
@@ -154,6 +176,7 @@ def run_command(
             "stderr": completed.stderr,
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": completed.returncode == 0,
         }
     except subprocess.TimeoutExpired as exc:
@@ -164,6 +187,7 @@ def run_command(
             "stderr": f"timeout after {timeout}s",
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": False,
         }
     except OSError as exc:
@@ -174,8 +198,28 @@ def run_command(
             "stderr": str(exc),
             "started_at": started_at,
             "finished_at": utc_now(),
+            "duration_ms": round((time.monotonic() - started) * 1000),
             "ok": False,
         }
+
+
+@contextlib.contextmanager
+def closeout_lock(timeout: float = 15.0):
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            try:
+                lock_file(handle, blocking=False)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
+                time.sleep(0.1)
+        try:
+            yield
+        finally:
+            unlock_file(handle)
 
 
 def decode_status_line(line: str) -> GitEntry | None:
@@ -190,8 +234,6 @@ def decode_status_line(line: str) -> GitEntry | None:
 
 
 def git_status_entries() -> tuple[list[GitEntry], list[str]]:
-    if not GIT_AVAILABLE:
-        return [], []
     try:
         target = str(VAULT_ROOT.relative_to(REPO_ROOT))
     except ValueError:
@@ -228,6 +270,71 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     return entries, []
 
 
+def current_git_head() -> tuple[str, list[str]]:
+    result = run_command(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], timeout=30)
+    if not result["ok"]:
+        return "", [f"git rev-parse failed: {str(result['stderr']).strip()}"]
+    return str(result["stdout"]).strip(), []
+
+
+def last_observed_git_head() -> str:
+    if not LOG_PATH.exists():
+        return ""
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if item.get("status") != "ok":
+            continue
+        for key in ("git_observed_through", "git_head_after", "commit"):
+            value = str(item.get(key, ""))
+            if value and value != "skipped" and re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+                return value
+    return ""
+
+
+def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[str]]:
+    if not baseline or not head or baseline == head:
+        return [], []
+    ancestor = run_command(["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", baseline, head], timeout=30)
+    if ancestor["returncode"] != 0:
+        return [], [f"closeout git baseline is not an ancestor of HEAD: baseline={baseline[:12]} head={head[:12]}"]
+    try:
+        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
+    except ValueError:
+        target = str(VAULT_ROOT)
+    result = run_command(
+        ["git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false", "diff", "--name-status", "-z", f"{baseline}..{head}", "--", target],
+        timeout=60,
+    )
+    if not result["ok"]:
+        return [], [f"git history diff failed: {str(result['stderr']).strip()}"]
+    items = [item for item in str(result["stdout"]).split("\0") if item]
+    entries: list[GitEntry] = []
+    index = 0
+    while index < len(items):
+        status = items[index]
+        index += 1
+        if index >= len(items):
+            break
+        if status.startswith(("R", "C")):
+            if index + 1 >= len(items):
+                break
+            index += 1
+            repo_path = items[index]
+            index += 1
+        else:
+            repo_path = items[index]
+            index += 1
+        entries.append(GitEntry(status=status, repo_path=repo_path, path=(REPO_ROOT / repo_path).resolve()))
+    return entries, []
+
+
 def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
     entries: list[GitEntry] = []
     warnings: list[str] = []
@@ -237,18 +344,11 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
             path = (Path.cwd() / path).resolve()
         else:
             path = path.resolve()
-        if GIT_AVAILABLE:
-            try:
-                repo_path = str(path.relative_to(REPO_ROOT))
-            except ValueError:
-                warnings.append(f"changed file outside repo skipped: {path}")
-                continue
-        else:
-            try:
-                repo_path = str(path.relative_to(VAULT_ROOT))
-            except ValueError:
-                warnings.append(f"changed file outside vault skipped: {path}")
-                continue
+        try:
+            repo_path = str(path.relative_to(REPO_ROOT))
+        except ValueError:
+            warnings.append(f"changed file outside repo skipped: {path}")
+            continue
         status = "??" if path.exists() else "D"
         entries.append(GitEntry(status=status, repo_path=repo_path, path=path))
     return entries, warnings
@@ -344,14 +444,33 @@ def search_memory(query: str, limit: int = 8, no_zvec: bool = True) -> tuple[lis
     return rows, [str(item) for item in warnings]
 
 
-def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, float]]:
+def semantic_distance(row: dict[str, Any]) -> float | None:
+    details = row.get("source_details")
+    if not isinstance(details, dict):
+        return None
+    try:
+        return float(details.get("zvec_score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def raw_semantic_distance(row: dict[str, Any]) -> float | None:
+    details = row.get("source_details")
+    if not isinstance(details, dict):
+        return None
+    try:
+        return float(details.get("zvec_raw_distance"))
+    except (TypeError, ValueError):
+        return None
+
+
+def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     if any(pattern.search(text) for pattern in ASK_USER_PATTERNS):
-        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0}
+        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
     if not rows:
-        return "ADD", None, {"similarity": 0.0, "coverage": 0.0}
-    best_similarity = 0.0
-    best_coverage = 0.0
-    best_row: dict[str, Any] | None = None
+        return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
+    candidates: list[tuple[int, float, float, float, str, dict[str, Any]]] = []
+    action_priority = {"NOOP": 4, "UPDATE": 3, "MERGE_REQUIRED": 2, "ADD": 1}
     for row in rows:
         comparison = " ".join(
             str(row.get(key, ""))
@@ -359,15 +478,21 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         )
         similarity = jaccard(text, comparison)
         row_coverage = coverage(text, comparison)
-        if (row_coverage, similarity) > (best_coverage, best_similarity):
-            best_similarity = similarity
-            best_coverage = row_coverage
-            best_row = row
-    if best_similarity >= 0.45 or best_coverage >= 0.55:
-        return "UPDATE", best_row, {"similarity": best_similarity, "coverage": best_coverage}
-    if best_similarity >= 0.28 or best_coverage >= 0.35:
-        return "MERGE_REQUIRED", best_row, {"similarity": best_similarity, "coverage": best_coverage}
-    return "ADD", best_row, {"similarity": best_similarity, "coverage": best_coverage}
+        distance = semantic_distance(row)
+        if similarity >= 0.80 or row_coverage >= 0.90:
+            action = "NOOP"
+        elif similarity >= 0.45 or row_coverage >= 0.55 or (distance is not None and distance <= 0.32):
+            action = "UPDATE"
+        elif similarity >= 0.28 or row_coverage >= 0.35 or (distance is not None and distance <= 0.55):
+            action = "MERGE_REQUIRED"
+        else:
+            action = "ADD"
+        semantic_quality = 1.0 - distance if distance is not None else -1.0
+        candidates.append((action_priority[action], semantic_quality, row_coverage, similarity, action, row))
+    _, _, best_coverage, best_similarity, action, best_row = max(candidates, key=lambda item: item[:4])
+    distance = semantic_distance(best_row)
+    raw_distance = raw_semantic_distance(best_row)
+    return action, best_row, {"similarity": best_similarity, "coverage": best_coverage, "semantic_distance": distance, "raw_semantic_distance": raw_distance}
 
 
 def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
@@ -382,6 +507,8 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
         "recommendation_metrics": {
             "similarity": round(metrics["similarity"], 4),
             "coverage": round(metrics["coverage"], 4),
+            "semantic_distance": round(metrics["semantic_distance"], 4) if metrics["semantic_distance"] is not None else None,
+            "raw_semantic_distance": round(metrics["raw_semantic_distance"], 4) if metrics["raw_semantic_distance"] is not None else None,
         },
         "allowed_actions": sorted(RECONCILE_ACTIONS),
         "candidates": rows,
@@ -410,12 +537,20 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
                 for key in ("title", "rel_path", "summary", "hit")
             )
             similarity = jaccard(source_text, comparison)
-            if similarity >= args.merge_threshold:
+            row_coverage = coverage(source_text, comparison)
+            distance = semantic_distance(row)
+            raw_distance = raw_semantic_distance(row)
+            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or (
+                distance is not None and distance <= args.semantic_merge_threshold
+            ):
                 candidates.append(
                     {
                         "rel_path": row.get("rel_path", ""),
                         "title": row.get("title", ""),
                         "similarity": round(similarity, 4),
+                        "coverage": round(row_coverage, 4),
+                        "semantic_distance": round(distance, 4) if distance is not None else None,
+                        "raw_semantic_distance": round(raw_distance, 4) if raw_distance is not None else None,
                         "sources": row.get("sources", []),
                         "path": row.get("path", ""),
                     }
@@ -434,12 +569,19 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
 
 
 def run_check(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
-    command = [PYTHON, str(CHECK_SCRIPT)]
+    command = [PYTHON, str(CHECK_SCRIPT), "--json"]
     for path in files:
         command.extend(["--changed-file", str(path)])
-    if args.dry_run:
-        return {"ok": True, "skipped": False, "detail": "dry_run_check_still_executed", **run_command(command, timeout=180)}
-    return run_command(command, timeout=180)
+    result = run_command(command, timeout=180)
+    try:
+        payload = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        result["detail"] = "check_returned_non_json"
+        return result
+    result["check_payload"] = payload
+    result["advisories"] = payload.get("advisories", []) if isinstance(payload, dict) else []
+    result["detail"] = str(payload.get("status", "")) if isinstance(payload, dict) else ""
+    return result
 
 
 def run_index(args: argparse.Namespace) -> dict[str, Any]:
@@ -453,7 +595,7 @@ def run_zvec(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "detail": "skip_zvec"}
     if args.dry_run:
         return {"ok": True, "skipped": True, "detail": "dry_run"}
-    command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--json"]
+    command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--prune", "--json"]
     for path in files:
         command.extend(["--changed-file", str(path)])
     if len(command) == 2:
@@ -563,6 +705,8 @@ def short_step(step: dict[str, Any]) -> dict[str, Any]:
         "skipped": bool(step.get("skipped", False)),
         "returncode": step.get("returncode"),
         "detail": step.get("detail", ""),
+        "duration_ms": step.get("duration_ms"),
+        "advisory_count": len(step.get("advisories", [])) if isinstance(step.get("advisories"), list) else 0,
         "stderr": str(step.get("stderr", "")).strip()[:500],
     }
 
@@ -572,14 +716,19 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     info: list[str] = []
     git_entries, git_warnings = git_status_entries()
     warnings.extend(git_warnings)
-    if not GIT_AVAILABLE:
-        info.append("memory vault is not inside a Git repo; automatic dirty-file discovery and scoped commit are disabled")
-        if args.commit:
-            warnings.append("commit requested but memory vault has no Git repo")
+    git_head_before, head_warnings = current_git_head()
+    warnings.extend(head_warnings)
+    previous_observed_head = last_observed_git_head()
+    history_entries, history_warnings = git_history_entries(previous_observed_head, git_head_before)
+    warnings.extend(history_warnings)
+    if history_entries:
+        info.append(f"recovered {len(history_entries)} memory file changes from Git history after an external/automatic commit")
     explicit, explicit_warnings = explicit_entries(args.changed_file)
     warnings.extend(explicit_warnings)
 
-    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in git_entries}
+    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in history_entries}
+    for entry in git_entries:
+        by_path[entry.path] = entry
     for entry in explicit:
         by_path[entry.path] = entry
     all_entries = list(by_path.values())
@@ -596,13 +745,14 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     process_files = [entry.path for entry in process_entries]
 
     if args.dry_run:
-        info.append("dry_run: no index refresh, zvec refresh, or commit will be written")
-    if all_entries:
+        warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
+    if git_entries:
         info.append(
             "git reports dirty Agent memory files; if some are historical, review dry-run output before committing"
         )
 
     check_step = run_check(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
+    advisories = list(check_step.get("advisories", [])) if isinstance(check_step.get("advisories"), list) else []
     reconcile_findings, reconcile_warnings = postwrite_reconcile(process_entries, args)
     warnings.extend(reconcile_warnings)
     index_step = run_index(args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
@@ -648,16 +798,35 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         if not commit_step.get("ok"):
             status = "error"
 
+    git_head_after, after_warnings = current_git_head()
+    warnings.extend(after_warnings)
+    dirty_paths = {entry.path for entry in git_entries}
+    can_advance_baseline = (
+        not step_failed and not blocking_reconcile and not deleted_entries and bool(git_head_before)
+        and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
+    )
+    would_observe_through = (
+        str(commit_step.get("commit")) if can_advance_baseline and commit_step.get("commit")
+        else (git_head_before if can_advance_baseline else previous_observed_head)
+    )
+    git_observed_through = previous_observed_head if args.dry_run else would_observe_through
+
     payload = {
         "time": utc_now(),
         "cwd": str(Path.cwd()),
         "mode": "closeout",
+        "git_previous_observed_head": previous_observed_head,
+        "git_head_before": git_head_before,
+        "git_head_after": git_head_after,
+        "git_observed_through": git_observed_through,
+        "git_would_observe_through": would_observe_through,
         "changed_files": [entry.repo_path for entry in all_entries],
         "processed_files": [relative_to_vault(path) for path in process_files],
         "deleted_files_skipped": [entry.repo_path for entry in deleted_entries],
         "reconcile_findings": reconcile_findings,
         "info": info,
         "warnings": warnings,
+        "advisories": advisories,
         "steps": {
             "check": short_step(check_step),
             "sqlite": short_step(index_step),
@@ -708,7 +877,6 @@ def print_human(payload: dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    auto_commit_default = env_truthy("AGENT_MEMORY_AUTO_COMMIT") or env_truthy("CODEX_MEMORY_AUTO_COMMIT")
     parser = argparse.ArgumentParser(
         description="Unified closeout for the local Agent memory system."
     )
@@ -717,13 +885,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8, help="Search candidates for reconcile.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Inspect only; do not refresh indexes, write logs, or commit.")
+    auto_commit_default = env_truthy("AGENT_MEMORY_AUTO_COMMIT") or env_truthy("CODEX_MEMORY_AUTO_COMMIT")
     parser.add_argument(
         "--commit",
         action="store_true",
         default=auto_commit_default,
-        help="After successful closeout, commit only processed memory files. Can default on via AGENT_MEMORY_AUTO_COMMIT=1.",
+        help="After successful closeout, commit processed memory files; enabled by AGENT_MEMORY_AUTO_COMMIT=1.",
     )
-    parser.add_argument("--no-commit", action="store_true", help="Disable commit even when AGENT_MEMORY_AUTO_COMMIT=1.")
+    parser.add_argument("--no-commit", action="store_true", help="Disable automatic commit for this run.")
     parser.add_argument("--commit-warnings", action="store_true", help="Allow commit when non-blocking warnings exist.")
     parser.add_argument("--message", default="", help="Custom scoped commit message.")
     parser.add_argument("--skip-zvec", action="store_true", help="Skip Zvec refresh.")
@@ -731,6 +900,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zvec-timeout", type=int, default=240, help="Seconds before Zvec refresh times out.")
     parser.add_argument("--reconcile-all", action="store_true", help="Run postwrite reconcile on all changed files, not only new files.")
     parser.add_argument("--merge-threshold", type=float, default=0.42, help="Similarity threshold for MERGE_REQUIRED.")
+    parser.add_argument("--merge-coverage-threshold", type=float, default=0.35, help="Coverage threshold for MERGE_REQUIRED.")
+    parser.add_argument("--semantic-merge-threshold", type=float, default=0.32, help="Semantic distance threshold for postwrite MERGE_REQUIRED.")
+    parser.add_argument("--lock-timeout", type=float, default=15.0, help="Seconds to wait for another closeout process.")
     parser.add_argument("--skip-audit", action="store_true", help="Skip the weekly audit piggyback check.")
     parser.add_argument("--audit-interval-days", type=int, default=7, help="Run audit from closeout when the last successful audit is older than this.")
     parser.add_argument("--audit-limit", type=int, default=50, help="Maximum audit findings stored by closeout piggyback.")
@@ -738,13 +910,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-open-loop-threshold", type=int, default=4, help="Forwarded open-loop threshold for closeout piggyback audit.")
     parser.add_argument("--audit-timeout", type=int, default=180, help="Seconds before closeout piggyback audit times out.")
     args = parser.parse_args()
+    if args.no_commit:
+        args.commit = False
     args.limit = max(args.limit, 1)
     args.audit_interval_days = max(args.audit_interval_days, 1)
     args.audit_limit = max(args.audit_limit, 1)
     args.audit_stale_days = max(args.audit_stale_days, 1)
     args.audit_open_loop_threshold = max(args.audit_open_loop_threshold, 1)
-    if args.no_commit:
-        args.commit = False
     if args.prewrite:
         args.dry_run = True
     return args
@@ -752,7 +924,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    payload = run_prewrite(args) if args.prewrite else run_closeout(args)
+    if args.prewrite:
+        payload = run_prewrite(args)
+    else:
+        try:
+            with closeout_lock(args.lock_timeout):
+                payload = run_closeout(args)
+        except TimeoutError as exc:
+            payload = {
+                "time": utc_now(), "mode": "closeout", "status": "error",
+                "warnings": [], "advisories": [], "error": str(exc), "steps": {},
+            }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

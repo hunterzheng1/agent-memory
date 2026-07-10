@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,13 +14,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", os.environ.get("CODEX_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT))))
-).expanduser().resolve()
+VAULT_ROOT = Path(os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT)))).expanduser().resolve()
 STATE_DB = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_STATE_DB", os.environ.get("CODEX_MEMORY_STATE_DB", "~/.config/agent-memory/state.sqlite"))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", "$HOME/.config/codex-memory/state.sqlite"))
 ).expanduser().resolve()
 
 
@@ -63,10 +61,8 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_audit_autorun.py",
     SCRIPT_ROOT / "agent_memory_zvec_index.py",
     SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
-    SCRIPT_ROOT / "codex_memory_search.py",
-    SCRIPT_ROOT / "codex_memory_closeout.py",
-    SCRIPT_ROOT / "codex_memory_audit.py",
-    SCRIPT_ROOT / "codex_memory_audit_autorun.py",
+    SCRIPT_ROOT / "agent_memory_doctor.py",
+    SCRIPT_ROOT / "agent_memory_stop_hook.py",
 ]
 
 REQUIRED_STATE_TABLES = {
@@ -95,7 +91,11 @@ SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"(?i)DEEPSEEK_API_KEY\s*=\s*sk-"),
     re.compile(r"(?i)OPENAI_API_KEY\s*=\s*sk-"),
-    re.compile(r"/Users/[A-Za-z0-9._-]+/"),
+    re.compile(r"(?<!:)/Users/[A-Za-z0-9._-]+/"),
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}"),
+    re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    re.compile(r"(?<![A-Za-z0-9])(?:sk|rk)_live_[A-Za-z0-9]{16,}"),
 ]
 
 SECRET_ENV_NAMES = [
@@ -118,7 +118,7 @@ def exact_secret_values() -> list[str]:
 def iter_text_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache", ".harness", ".codegraph", ".claude"}
+    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
     files: list[Path] = []
     for path in root.rglob("*"):
         if any(part in ignored_dirs for part in path.parts):
@@ -164,6 +164,7 @@ def check_state_db() -> tuple[bool, str]:
         return False, "missing"
     try:
         with sqlite3.connect(STATE_DB) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
             rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')").fetchall()
     except sqlite3.Error as exc:
         return False, str(exc)
@@ -199,8 +200,9 @@ def changed_file_compaction_warnings(
     raw_paths: list[str],
     line_limit: int,
     byte_limit: int,
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
+    infos: list[str] = []
     seen: set[Path] = set()
     for raw_path in raw_paths:
         path = normalize_path(raw_path)
@@ -209,10 +211,10 @@ def changed_file_compaction_warnings(
         seen.add(path)
 
         if not path.exists():
-            print(f"SKIP compaction_missing_changed_file {path}")
+            infos.append(f"SKIP compaction_missing_changed_file {path}")
             continue
         if not is_vault_markdown(path):
-            print(f"SKIP compaction_not_memory_doc {path}")
+            infos.append(f"SKIP compaction_not_memory_doc {path}")
             continue
 
         byte_count = path.stat().st_size
@@ -226,16 +228,37 @@ def changed_file_compaction_warnings(
                 f"line_limit={line_limit} byte_limit={byte_limit}"
             )
         else:
-            print(f"OK compaction {detail}")
-    return warnings
+            infos.append(f"OK compaction {detail}")
+    return warnings, infos
+
+
+def git_remote_has_embedded_credential() -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "config", "--get-regexp", r"^remote\..*\.url$"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"git_remote_check_failed={type(exc).__name__}"
+    if completed.returncode not in {0, 1}:
+        return False, f"git_remote_check_failed=returncode_{completed.returncode}"
+    for line in completed.stdout.splitlines():
+        _, _, url = line.partition(" ")
+        if re.search(r"https?://[^/@\s]+:[^/@\s]+@", url) or re.search(r"gh[pousr]_[A-Za-z0-9]{20,}", url):
+            return True, "embedded_credential_detected"
+    return False, "clean"
 
 
 def check_public_repo_files() -> list[str]:
     failures: list[str] = []
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
+    ignored_dirs = {".git", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
     for path in REPO_ROOT.rglob("*"):
-        if any(part in {".git", ".harness", ".codegraph", ".claude"} for part in path.parts):
+        if any(part in ignored_dirs for part in path.parts):
             continue
         if path.is_file() and path.name in forbidden_names:
             failures.append(f"FORBIDDEN public_file {path}")
@@ -245,7 +268,7 @@ def check_public_repo_files() -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check the local agent memory system.")
+    parser = argparse.ArgumentParser(description="Check the local Agent memory system.")
     parser.add_argument(
         "--changed-file",
         action="append",
@@ -269,6 +292,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip SQLite schema checks. Useful before the first index build.",
     )
+    parser.add_argument("--json", action="store_true", help="Print structured JSON output.")
     return parser.parse_args()
 
 
@@ -276,25 +300,23 @@ def main() -> int:
     args = parse_args()
     failures: list[str] = []
     warnings: list[str] = []
-
-    print(f"vault_root={VAULT_ROOT}")
-    print(f"state_db={STATE_DB}")
+    checks: list[str] = [f"vault_root={VAULT_ROOT}", f"state_db={STATE_DB}"]
 
     for path in REQUIRED_DIRS:
         if path.is_dir():
-            print(f"OK dir {path}")
+            checks.append(f"OK dir {path}")
         else:
             failures.append(f"MISSING dir {path}")
 
     for path in REQUIRED_FILES:
         if path.is_file():
-            print(f"OK file {path}")
+            checks.append(f"OK file {path}")
         else:
             failures.append(f"MISSING file {path}")
 
     for path in REQUIRED_LOCAL_FILES:
         if path.is_file():
-            print(f"OK local_file {path}")
+            checks.append(f"OK local_file {path}")
         else:
             failures.append(f"MISSING local_file {path}")
 
@@ -306,7 +328,7 @@ def main() -> int:
     frontmatter_targets.extend(path for path in REQUIRED_FILES if path.name.startswith("_模板"))
     for path in frontmatter_targets:
         if path.exists() and file_has_frontmatter(path):
-            print(f"OK frontmatter {path}")
+            checks.append(f"OK frontmatter {path}")
         elif path.exists():
             failures.append(f"BAD frontmatter {path}")
 
@@ -315,35 +337,52 @@ def main() -> int:
         for path in leaked:
             failures.append(f"SECRET_OR_PRIVATE_PATH leak {path}")
     else:
-        print("OK no_secret_or_private_path_leak")
+        checks.append("OK no_secret_or_private_path_leak")
+
+    remote_leak, remote_detail = git_remote_has_embedded_credential()
+    if remote_leak:
+        failures.append("SECRET git_remote_embedded_credential")
+    elif remote_detail == "clean":
+        checks.append("OK git_remote_no_embedded_credential")
+    else:
+        warnings.append(remote_detail)
 
     failures.extend(check_public_repo_files())
 
     if not args.skip_state_db:
         state_ok, state_detail = check_state_db()
         if state_ok:
-            print(f"OK state_db {STATE_DB} {state_detail}")
+            checks.append(f"OK state_db {STATE_DB} {state_detail}")
         else:
             failures.append(f"BAD state_db {STATE_DB} {state_detail}")
 
     if args.changed_file:
-        warnings.extend(
-            changed_file_compaction_warnings(
-                args.changed_file,
-                args.compaction_line_limit,
-                args.compaction_byte_limit,
-            )
+        compaction_warnings, compaction_infos = changed_file_compaction_warnings(
+            args.changed_file, args.compaction_line_limit, args.compaction_byte_limit,
         )
+        warnings.extend(compaction_warnings)
+        checks.extend(compaction_infos)
 
-    for item in warnings:
-        print(item)
-
-    if failures:
-        for item in failures:
-            print(item, file=sys.stderr)
-        return 1
-    print("agent_memory_check=ok")
-    return 0
+    payload = {
+        "ok": not failures,
+        "failures": failures,
+        "advisories": warnings,
+        "checks": checks,
+        "status": "error" if failures else ("advisory" if warnings else "ok"),
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        for item in checks:
+            print(item)
+        for item in warnings:
+            print(item)
+        if failures:
+            for item in failures:
+                print(item, file=sys.stderr)
+        else:
+            print("agent_memory_check=ok")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

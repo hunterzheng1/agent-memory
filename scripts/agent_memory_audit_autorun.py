@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+    import msvcrt
 import json
 import os
 import subprocess
@@ -13,22 +19,33 @@ from typing import Any
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 CONFIG_ROOT = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_CONFIG_ROOT", os.environ.get("CODEX_MEMORY_CONFIG_ROOT", "~/.config/agent-memory"))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "$HOME/.config/codex-memory"))
 ).expanduser().resolve()
 AUDIT_SCRIPT = SCRIPT_ROOT / "agent_memory_audit.py"
-PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", os.environ.get("CODEX_MEMORY_PYTHON", sys.executable))
+PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", sys.executable)
 RUN_LOG = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_AUDIT_RUN_LOG", os.environ.get("CODEX_MEMORY_AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
 ).expanduser().resolve()
 LATEST_REPORT = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_AUDIT_REPORT", os.environ.get("CODEX_MEMORY_AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json")))
-    )
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json")))
 ).expanduser().resolve()
+LOCK_PATH = CONFIG_ROOT / "locks" / "audit.lock"
+
+
+def lock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def unlock_file(handle: Any) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def utc_now_dt() -> dt.datetime:
@@ -37,6 +54,21 @@ def utc_now_dt() -> dt.datetime:
 
 def utc_now() -> str:
     return utc_now_dt().isoformat()
+
+
+@contextlib.contextmanager
+def audit_lock():
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        try:
+            lock_file(handle)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            unlock_file(handle)
 
 
 def parse_time(value: str) -> dt.datetime | None:
@@ -140,7 +172,9 @@ def append_run_log(payload: dict[str, Any]) -> None:
 
 def write_report(payload: dict[str, Any]) -> None:
     LATEST_REPORT.parent.mkdir(parents=True, exist_ok=True)
-    LATEST_REPORT.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = LATEST_REPORT.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, LATEST_REPORT)
 
 
 def notify(title: str, message: str) -> None:
@@ -217,7 +251,7 @@ def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[st
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Auto-run Codex memory audit with interval gating and optional notification.")
+    parser = argparse.ArgumentParser(description="Auto-run Agent memory audit with interval gating and optional notification.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--reason", default="manual", help="Trigger source: closeout, launchd, hook, or manual.")
     parser.add_argument("--force", action="store_true", help="Run even when the last audit is still recent.")
@@ -239,35 +273,35 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    last_run = read_last_successful_run()
-    now = utc_now_dt()
-    due = last_run is None or (now - last_run) >= dt.timedelta(days=args.min_interval_days)
-    if args.dry_run:
-        payload = {
-            "time": utc_now(),
-            "reason": args.reason,
-            "status": "dry_run_due" if due or args.force else "dry_run_recent",
-            "ok": True,
-            "would_run": bool(due or args.force),
-            "last_successful_audit": last_run.isoformat() if last_run else "",
-            "min_interval_days": args.min_interval_days,
-            "report_path": str(LATEST_REPORT),
-            "run_log": str(RUN_LOG),
-        }
-    elif args.force or due:
-        payload = run_audit(args, last_run)
-    else:
-        payload = {
-            "time": utc_now(),
-            "reason": args.reason,
-            "status": "skipped_recent",
-            "ok": True,
-            "findings_count": 0,
-            "last_successful_audit": last_run.isoformat() if last_run else "",
-            "min_interval_days": args.min_interval_days,
-            "report_path": str(LATEST_REPORT),
-            "run_log": str(RUN_LOG),
-        }
+    with audit_lock() as acquired:
+        if not acquired:
+            payload = {
+                "time": utc_now(), "reason": args.reason, "status": "skipped_locked",
+                "ok": True, "findings_count": 0, "report_path": str(LATEST_REPORT), "run_log": str(RUN_LOG),
+            }
+        else:
+            last_run = read_last_successful_run()
+            now = utc_now_dt()
+            due = last_run is None or (now - last_run) >= dt.timedelta(days=args.min_interval_days)
+            if args.dry_run:
+                payload = {
+                    "time": utc_now(), "reason": args.reason,
+                    "status": "dry_run_due" if due or args.force else "dry_run_recent",
+                    "ok": True, "would_run": bool(due or args.force),
+                    "last_successful_audit": last_run.isoformat() if last_run else "",
+                    "min_interval_days": args.min_interval_days,
+                    "report_path": str(LATEST_REPORT), "run_log": str(RUN_LOG),
+                }
+            elif args.force or due:
+                payload = run_audit(args, last_run)
+            else:
+                payload = {
+                    "time": utc_now(), "reason": args.reason, "status": "skipped_recent",
+                    "ok": True, "findings_count": 0,
+                    "last_successful_audit": last_run.isoformat() if last_run else "",
+                    "min_interval_days": args.min_interval_days,
+                    "report_path": str(LATEST_REPORT), "run_log": str(RUN_LOG),
+                }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
