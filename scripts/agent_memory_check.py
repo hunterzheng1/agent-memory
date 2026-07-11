@@ -118,7 +118,7 @@ def exact_secret_values() -> list[str]:
 def iter_text_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
+    ignored_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
     files: list[Path] = []
     for path in root.rglob("*"):
         if any(part in ignored_dirs for part in path.parts):
@@ -256,7 +256,7 @@ def check_public_repo_files() -> list[str]:
     failures: list[str] = []
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
-    ignored_dirs = {".git", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
+    ignored_dirs = {".git", ".venv", "venv", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
     for path in REPO_ROOT.rglob("*"):
         if any(part in ignored_dirs for part in path.parts):
             continue

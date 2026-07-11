@@ -25,6 +25,7 @@ STATE_DB = Path(
     os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", "$HOME/.config/codex-memory/state.sqlite"))
 ).expanduser().resolve()
 ZVEC_SCRIPT = SCRIPT_ROOT / "agent_memory_zvec_index.py"
+ZVEC_PYTHON = os.environ.get("AGENT_MEMORY_ZVEC_PYTHON", sys.executable)
 
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
@@ -222,7 +223,7 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
         return [], []
     if not ZVEC_SCRIPT.exists():
         return [], [f"zvec script missing: {ZVEC_SCRIPT}"]
-    command = [str(ZVEC_SCRIPT), "--search", args.query, "--limit", str(max(args.limit * 2, args.limit)), "--json"]
+    command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--search", args.query, "--limit", str(max(args.limit * 2, args.limit)), "--json"]
     try:
         completed = subprocess.run(
             command,
