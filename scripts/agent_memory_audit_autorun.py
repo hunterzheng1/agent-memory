@@ -19,7 +19,7 @@ from typing import Any
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 CONFIG_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "$HOME/.config/codex-memory"))
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "~/.config/codex-memory"))
 ).expanduser().resolve()
 AUDIT_SCRIPT = SCRIPT_ROOT / "agent_memory_audit.py"
 PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", sys.executable)

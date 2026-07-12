@@ -6,13 +6,15 @@ import os
 import shutil
 from pathlib import Path
 
+from agent_memory_paths import resolve_path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_ROOT = REPO_ROOT / "templates" / "vault"
 
 
 def expand_path(raw: str) -> Path:
-    return Path(os.path.expandvars(raw)).expanduser().resolve()
+    return resolve_path(raw)
 
 
 def replacements(args: argparse.Namespace) -> dict[str, str]:

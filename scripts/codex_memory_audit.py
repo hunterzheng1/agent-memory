@@ -13,7 +13,7 @@ from typing import Any
 
 
 CONFIG_ROOT = Path(
-    os.path.expandvars(os.environ.get("CODEX_MEMORY_CONFIG_ROOT", "$HOME/.config/codex-memory"))
+    os.path.expandvars(os.environ.get("CODEX_MEMORY_CONFIG_ROOT", "~/.config/codex-memory"))
 ).expanduser().resolve()
 STATE_DB = Path(
     os.path.expandvars(os.environ.get("CODEX_MEMORY_STATE_DB", str(CONFIG_ROOT / "state.sqlite")))

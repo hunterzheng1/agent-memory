@@ -28,7 +28,7 @@ VAULT_ROOT = Path(
     os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT)))
 ).expanduser().resolve()
 CONFIG_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "$HOME/.config/codex-memory"))
+    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "~/.config/codex-memory"))
 ).expanduser().resolve()
 STATE_DB = Path(
     os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
