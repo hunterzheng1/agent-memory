@@ -29,7 +29,11 @@ model-cache/
 /.claude/
 /.agents/
 /.codex/
+/.codebuddy/
 /.harness/
 /.codegraph/
+/.cursor/skills/
+/.cursor/rules/harness-general.mdc
 /CLAUDE.md
 /AGENTS.md
+/CODEBUDDY.md
