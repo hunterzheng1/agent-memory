@@ -12,4 +12,12 @@ def resolve_path(raw: str) -> Path:
         home = str(Path.home())
         expanded = re.sub(r"^\$\{HOME\}(?=[/\\]|$)", lambda _match: home, expanded)
         expanded = re.sub(r"^\$HOME(?=[/\\]|$)", lambda _match: home, expanded)
-    return Path(os.path.expandvars(expanded)).expanduser().resolve()
+    expanded = os.path.expandvars(expanded)
+    # os.path.expandvars only expands Windows %VAR% syntax on Windows; do it
+    # explicitly so configs authored with %VAR% resolve the same on any host.
+    expanded = re.sub(
+        r"%([^%]+)%",
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        expanded,
+    )
+    return Path(expanded).expanduser().resolve()

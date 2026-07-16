@@ -201,7 +201,7 @@ def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
 
 def unlock_file(handle) -> None:
     if fcntl is not None:
-        unlock_file(handle)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return
     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
