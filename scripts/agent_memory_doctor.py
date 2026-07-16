@@ -74,6 +74,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def text_sha256(path: Path) -> str:
+    # Must match agent_memory_index.py, which hashes the decoded text after
+    # universal-newline translation (CRLF -> LF), not the raw bytes.
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def offline_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
@@ -527,7 +534,7 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     db_by_path = {str(row["path"]): row for row in docs}
     missing_db = sorted(path.relative_to(VAULT_ROOT).as_posix() for raw, path in actual_by_path.items() if raw not in db_by_path)
     stale_db = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw not in actual_by_path)
-    mismatch = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw in actual_by_path and file_sha256(actual_by_path[raw]) != str(row["sha256"]))
+    mismatch = sorted(str(row["rel_path"]) for raw, row in db_by_path.items() if raw in actual_by_path and text_sha256(actual_by_path[raw]) != str(row["sha256"]))
     add(checks, "markdown_sqlite_parity", "pass" if not (missing_db or stale_db or mismatch) else "fail", f"Markdown={len(actual)}, SQLite={len(docs)}.", {"missing": missing_db, "stale": stale_db, "hash_mismatch": mismatch})
     fts = {str(row[0]) for row in conn.execute("SELECT DISTINCT path FROM memory_fts")}
     add(checks, "sqlite_fts_parity", "pass" if fts == set(db_by_path) else "fail", f"FTS covers {len(fts)}/{len(docs)} docs.")
