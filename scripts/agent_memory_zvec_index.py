@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+    import msvcrt
 import hashlib
 import importlib.util
 import json
@@ -11,24 +17,30 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_memory_env import env_value, resolve_config_path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-STATE_DB = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", "$HOME/.config/codex-memory/state.sqlite"))
-).expanduser().resolve()
-DEFAULT_COLLECTION_PATH = Path(
-    os.path.expandvars(
-        os.environ.get("AGENT_MEMORY_VECTOR_DIR", "$HOME/.config/codex-memory/zvec/memory_chunks_embeddinggemma_768")
+STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+DEFAULT_COLLECTION_PATH = resolve_config_path(
+        env_value("VECTOR_DIR", "$HOME/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768")
     )
-).expanduser().resolve()
-DEFAULT_MODEL = os.environ.get("AGENT_MEMORY_EMBEDDING_MODEL", "google/embeddinggemma-300m")
-DEFAULT_EMBEDDING_DIM = int(os.environ.get("AGENT_MEMORY_EMBEDDING_DIM", "768"))
-DEFAULT_DEVICE = os.environ.get("AGENT_MEMORY_EMBEDDING_DEVICE", "cpu")
+DEFAULT_LOCK_PATH = resolve_config_path(env_value("ZVEC_LOCK", "$HOME/.config/agent-memory/locks/zvec.lock"))
+DEFAULT_MODEL = env_value("EMBEDDING_MODEL", "google/embeddinggemma-300m")
+DEFAULT_EMBEDDING_DIM = int(env_value("EMBEDDING_DIM", "768"))
+DEFAULT_DEVICE = env_value("EMBEDDING_DEVICE", "cpu")
+DEFAULT_REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 DEFAULT_LIMIT = 5
 CHUNK_MAX_CHARS = 1400
 CHUNK_OVERLAP_CHARS = 160
@@ -89,6 +101,43 @@ def load_sqlite_index() -> Any:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+
+def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
+    if fcntl is not None:
+        base = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        flags = base if blocking else base | fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), flags)
+        return
+    # Windows: shared locks are approximated with exclusive byte locks.
+    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+    msvcrt.locking(handle.fileno(), mode, 1)
+
+
+def unlock_file(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+@contextlib.contextmanager
+def zvec_lock(exclusive: bool, timeout: float):
+    DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEFAULT_LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            try:
+                lock_file(handle, blocking=False, exclusive=exclusive)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            unlock_file(handle)
 
 
 def sha256_text(text: str) -> str:
@@ -358,7 +407,7 @@ def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root
     docs: list[IndexedDoc] = []
     errors: list[str] = []
     for raw_path in raw_paths:
-        path = Path(os.path.expandvars(raw_path)).expanduser()
+        path = resolve_config_path(raw_path)
         if not path.is_absolute():
             path = Path.cwd() / path
         path = path.resolve()
@@ -383,11 +432,19 @@ def load_changed_docs(conn: sqlite3.Connection, raw_paths: list[str], vault_root
 
 
 class EmbeddingGemmaEmbedder:
-    def __init__(self, model_name: str, embedding_dim: int, device: str = "cpu", cache_folder: str = "") -> None:
+    def __init__(
+        self,
+        model_name: str,
+        embedding_dim: int,
+        device: str = "cpu",
+        cache_folder: str = "",
+        require_local_model: bool = False,
+    ) -> None:
         self.model_name = model_name
         self.embedding_dim = embedding_dim
         self.device = device
         self.cache_folder = cache_folder
+        self.require_local_model = require_local_model
         self._model: Any | None = None
 
     def _load_model(self) -> Any:
@@ -405,6 +462,11 @@ class EmbeddingGemmaEmbedder:
             kwargs["device"] = self.device
         if self.cache_folder:
             kwargs["cache_folder"] = self.cache_folder
+        if self.require_local_model:
+            model_path = Path(self.model_name).expanduser().resolve()
+            if not model_path.is_dir():
+                raise EmbedderError(f"managed_local_model_missing path={model_path}")
+            kwargs["local_files_only"] = True
         try:
             self._model = SentenceTransformer(self.model_name, **kwargs)
         except Exception as exc:
@@ -847,7 +909,13 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
         errors.extend(changed_errors)
 
     deduped: dict[str, IndexedDoc] = {str(doc.path): doc for doc in docs}
-    embedder = EmbeddingGemmaEmbedder(args.model, args.embedding_dim, args.device, args.cache_folder)
+    embedder = EmbeddingGemmaEmbedder(
+        args.model,
+        args.embedding_dim,
+        args.device,
+        args.cache_folder,
+        args.require_local_model,
+    )
     stats = {
         "status": "ok",
         "docs_seen": len(deduped),
@@ -899,7 +967,13 @@ def run_indexing(args: argparse.Namespace, sqlite_index: Any, conn: sqlite3.Conn
 def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecStore) -> int:
     init_db(conn)
     store.init()
-    embedder = EmbeddingGemmaEmbedder(args.model, args.embedding_dim, args.device, args.cache_folder)
+    embedder = EmbeddingGemmaEmbedder(
+        args.model,
+        args.embedding_dim,
+        args.device,
+        args.cache_folder,
+        args.require_local_model,
+    )
     try:
         query_embedding = embedder.embed_query(args.search)
     except Exception as exc:
@@ -913,7 +987,7 @@ def run_search(args: argparse.Namespace, conn: sqlite3.Connection, store: ZvecSt
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build and query the optional Zvec semantic index for Agent memory.")
+    parser = argparse.ArgumentParser(description="Build and query the optional Zvec semantic index for Agent Memory.")
     parser.add_argument("--init", action="store_true", help="Create SQLite vector tables and Zvec collection.")
     parser.add_argument("--scan", action="store_true", help="Incrementally index eligible Markdown docs from the SQLite memory index.")
     parser.add_argument("--prune", action="store_true", help="Remove deleted, renamed, or no-longer-eligible vector rows.")
@@ -925,17 +999,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Embedding model name or local path.")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="Device for SentenceTransformer, default: cpu.")
     parser.add_argument("--cache-folder", default="", help="Optional Hugging Face/SentenceTransformers cache folder.")
+    parser.add_argument(
+        "--require-local-model",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_REQUIRE_LOCAL_MODEL,
+        help="Require an existing local model directory and disable remote model resolution.",
+    )
     parser.add_argument("--embedding-dim", type=int, default=DEFAULT_EMBEDDING_DIM, help="Expected embedding dimension.")
     parser.add_argument("--state-db", default=str(STATE_DB), help=argparse.SUPPRESS)
     parser.add_argument("--collection-path", default=str(DEFAULT_COLLECTION_PATH), help=argparse.SUPPRESS)
     parser.add_argument("--force", action="store_true", help="Re-index even when doc hashes are unchanged.")
+    parser.add_argument("--lock-timeout", type=float, default=60.0, help="Seconds to wait for concurrent Zvec readers or writers.")
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
-        args.init = True
+def run_locked(args: argparse.Namespace) -> int:
     sqlite_index = load_sqlite_index()
     state_db = Path(args.state_db).expanduser().resolve()
     collection_path = Path(args.collection_path).expanduser().resolve()
@@ -965,6 +1043,22 @@ def main() -> int:
                 exit_code = max(exit_code, run_search(args, conn, store))
             return exit_code
     except Exception as exc:
+        if args.json:
+            print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"vector_index=error\nerror: {exc}", file=sys.stderr)
+        return 2
+
+
+def main() -> int:
+    args = parse_args()
+    if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
+        args.init = True
+    exclusive = bool(args.init or args.scan or args.prune or args.changed_file)
+    try:
+        with zvec_lock(exclusive=exclusive, timeout=args.lock_timeout):
+            return run_locked(args)
+    except TimeoutError as exc:
         if args.json:
             print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False, indent=2))
         else:

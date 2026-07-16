@@ -1,7 +1,11 @@
 ---
 memory_type: workflow
 track: workflow
+<<<<<<<< HEAD:templates/vault/工作流/记忆字段规范.md
 project_id: agent-memory-fields
+========
+project_id: agent-memory-vault-fields
+>>>>>>>> upstream/main:templates/vault/工作流/Agent记忆字段规范.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}

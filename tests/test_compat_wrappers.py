@@ -41,7 +41,7 @@ class TestCompatWrappers(unittest.TestCase):
     def test_agent_evolution_initializes_required_state_tables(self):
         """The canonical entrypoint must not be a wrapper that imports itself."""
         script = SCRIPT_DIR / "agent_evolution.py"
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             root = Path(temp_dir)
             vault = root / "vault"
             (vault / "agent" / "cases").mkdir(parents=True)

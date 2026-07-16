@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Backward-compat wrapper. Real implementation in agent_memory_retrieval_benchmark.py."""
-import importlib.util
+"""Compatibility wrapper — delegates to agent_memory_retrieval_benchmark.py."""
+from __future__ import annotations
+
+import runpy
 import sys
 from pathlib import Path
 
-_real = Path(__file__).resolve().parent / "agent_memory_retrieval_benchmark.py"
-spec = importlib.util.spec_from_file_location("agent_memory_retrieval_benchmark_module", _real)
-if not spec or not spec.loader:
-    raise RuntimeError(f"cannot_load_wrapper {_real}")
-_mod = importlib.util.module_from_spec(spec)
-sys.modules["agent_memory_retrieval_benchmark_module"] = _mod
-spec.loader.exec_module(_mod)
-globals().update({k: v for k, v in vars(_mod).items() if not k.startswith("__")})
+TARGET = Path(__file__).with_name("agent_memory_retrieval_benchmark.py")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    sys.argv = [str(TARGET), *args]
+    runpy.run_path(str(TARGET), run_name="__main__")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(_mod.main())
+    raise SystemExit(main())

@@ -1,6 +1,25 @@
 # Migration Guide
 
-这份指南用于把一个已经在使用的私人 agent/Codex 记忆系统，整理成可复用模板。
+## 平台中立命名
+
+Agent Memory Vault 使用平台中立命名：
+
+- 新环境变量：`AGENT_MEMORY_*`。
+- 新脚本：`agent_memory_*`。
+- 统一命令：`memoryctl`。
+- 默认本地状态目录：`$HOME/.config/agent-memory`。
+
+当前版本只接受上述新名称，不提供旧环境变量回退或转发包装。升级现有安装时，必须同步修改环境变量、Hook、定时任务和自定义脚本；升级完成后执行测试和 `doctor`，确认没有旧入口消费者。
+
+核心脚本应只从这个 Git 仓库维护，再用 `scripts/install_runtime.py` 安装到本机固定 Runtime。`runtime-manifest.json` 记录源码提交和每个核心文件 hash；私人 `agent-memory.toml`、模型、数据库和宿主适配器不会进入公开仓库。
+
+这份指南用于把一个已经在使用的私人 Agent 记忆系统，整理成可复用模板。
+
+## 接入 Claude Code 而不复制 vault
+
+保留现有 Markdown、Git 基线、SQLite、Zvec、closeout 日志和 audit 调度器。新增一个薄的 `~/.claude/CLAUDE.md`，通过绝对路径导入 vault 的 `AGENTS.md`，再让 Claude 使用 `memoryctl --actor claude` 搜索、认领和收尾。
+
+关闭 Claude Code auto-memory，或明确把它限定为非正式草稿；不要把 auto-memory 目录重定向到正式 vault。旧文件缺少 `agent_scope` 时按 `shared` 处理，只有宿主特有 Agent case 才标 `codex` 或 `claude`。
 
 ## 1. 不要直接复制真实 vault
 
@@ -46,14 +65,10 @@ python3 scripts/bootstrap.py --memory-root "$HOME/agent-memory-vault" --write-en
 
 ```bash
 source .env
-python3 scripts/agent_evolution.py --init --scan --report
+python3 scripts/agent_memory_evolution.py --init --scan --report
 python3 scripts/agent_memory_index.py --init --scan --report
 python3 scripts/agent_memory_closeout.py --dry-run
 python3 scripts/agent_memory_check.py
 ```
 
 检查通过后，就可以开始在本地使用这个模板。
-
-## 5. 工作流文档命名（模板侧）
-
-模板的 `工作流/` 下文档已去掉 "Codex" 前缀（如 `记忆字段规范.md`、`记忆收尾决策规则.md` 等），改为 agent 中性命名。**已有私有 vault 里的旧文件名不受影响**——模板改名只影响新 bootstrap 出来的 vault；你已有的 vault 无需改动，继续用旧名即可。

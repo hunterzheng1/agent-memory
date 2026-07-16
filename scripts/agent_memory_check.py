@@ -10,38 +10,39 @@ import subprocess
 import sys
 from pathlib import Path
 
+from agent_memory_env import env_value, resolve_config_path
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT)))).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", "$HOME/.config/codex-memory/state.sqlite"))
-).expanduser().resolve()
+VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
+GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
+STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+PUBLIC_TEMPLATE_MODE = DEFAULT_VAULT_ROOT.is_dir() and VAULT_ROOT == DEFAULT_VAULT_ROOT.resolve()
 
 
-REQUIRED_DIRS = [
+COMMON_REQUIRED_DIRS = [
     VAULT_ROOT / "用户记忆",
-    VAULT_ROOT / "项目",
-    VAULT_ROOT / "工作流",
-    VAULT_ROOT / "决策",
     VAULT_ROOT / "agent" / "case-candidates",
     VAULT_ROOT / "agent" / "cases",
     VAULT_ROOT / "agent" / "skill-candidates",
 ]
 
+PUBLIC_REQUIRED_DIRS = [
+    VAULT_ROOT / "项目",
+    VAULT_ROOT / "工作流",
+    VAULT_ROOT / "决策",
+]
 
-REQUIRED_FILES = [
+
+COMMON_REQUIRED_FILES = [
     VAULT_ROOT / "AGENTS.md",
     VAULT_ROOT / "INDEX.md",
     VAULT_ROOT / "用户记忆" / "README.md",
     VAULT_ROOT / "用户记忆" / "偏好与边界.md",
     VAULT_ROOT / "用户记忆" / "长期画像.md",
-    VAULT_ROOT / "工作流" / "记忆字段规范.md",
-    VAULT_ROOT / "工作流" / "记忆收尾决策规则.md",
-    VAULT_ROOT / "工作流" / "记忆SQLite全库索引设计.md",
-    VAULT_ROOT / "工作流" / "记忆语义检索设计.md",
-    VAULT_ROOT / "agent" / "README.md",
+    VAULT_ROOT / "工作流" / "Agent记忆字段规范.md",
     VAULT_ROOT / "agent" / "case-candidates" / "README.md",
     VAULT_ROOT / "agent" / "case-candidates" / "_模板-AgentCase候选.md",
     VAULT_ROOT / "agent" / "cases" / "README.md",
@@ -50,10 +51,17 @@ REQUIRED_FILES = [
     VAULT_ROOT / "agent" / "skill-candidates" / "_模板-Skill候选.md",
 ]
 
+PUBLIC_REQUIRED_FILES = [
+    VAULT_ROOT / "工作流" / "Agent记忆收尾决策规则.md",
+    VAULT_ROOT / "工作流" / "Agent记忆SQLite全库索引设计.md",
+    VAULT_ROOT / "工作流" / "Agent记忆语义检索设计.md",
+    VAULT_ROOT / "agent" / "README.md",
+]
+
 REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "bootstrap.py",
     SCRIPT_ROOT / "agent_memory_check.py",
-    SCRIPT_ROOT / "agent_evolution.py",
+    SCRIPT_ROOT / "agent_memory_evolution.py",
     SCRIPT_ROOT / "agent_memory_index.py",
     SCRIPT_ROOT / "agent_memory_search.py",
     SCRIPT_ROOT / "agent_memory_closeout.py",
@@ -62,7 +70,11 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_zvec_index.py",
     SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
     SCRIPT_ROOT / "agent_memory_doctor.py",
+    SCRIPT_ROOT / "agent_memory_session_hook.py",
     SCRIPT_ROOT / "agent_memory_stop_hook.py",
+    SCRIPT_ROOT / "agent_memory_env.py",
+    SCRIPT_ROOT / "install_runtime.py",
+    SCRIPT_ROOT / "memoryctl",
 ]
 
 REQUIRED_STATE_TABLES = {
@@ -73,6 +85,8 @@ REQUIRED_STATE_TABLES = {
     "memory_docs",
     "memory_fts",
     "memory_open_loops",
+    "memory_session_claims",
+    "memory_file_observations",
 }
 
 OPTIONAL_STATE_TABLES = {
@@ -91,12 +105,12 @@ SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"(?i)DEEPSEEK_API_KEY\s*=\s*sk-"),
     re.compile(r"(?i)OPENAI_API_KEY\s*=\s*sk-"),
-    re.compile(r"(?<!:)/Users/[A-Za-z0-9._-]+/"),
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}"),
     re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
     re.compile(r"(?<![A-Za-z0-9])(?:sk|rk)_live_[A-Za-z0-9]{16,}"),
 ]
+PRIVATE_PATH_PATTERN = re.compile(r"/Users/[A-Za-z0-9._-]+/")
 
 SECRET_ENV_NAMES = [
     "DEEPSEEK_API_KEY",
@@ -118,7 +132,7 @@ def exact_secret_values() -> list[str]:
 def iter_text_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
-    ignored_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".pytest_cache", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
+    ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache"}
     files: list[Path] = []
     for path in root.rglob("*"):
         if any(part in ignored_dirs for part in path.parts):
@@ -133,8 +147,8 @@ def iter_text_files(root: Path) -> list[Path]:
     return files
 
 
-def scan_for_secrets(roots: list[Path]) -> list[Path]:
-    leaked: list[Path] = []
+def scan_for_secrets(roots: list[Path], include_private_paths: bool) -> list[tuple[Path, str]]:
+    leaked: list[tuple[Path, str]] = []
     exact_values = exact_secret_values()
     seen: set[Path] = set()
     for root in roots:
@@ -147,10 +161,13 @@ def scan_for_secrets(roots: list[Path]) -> list[Path]:
             except OSError:
                 continue
             if any(value and value in text for value in exact_values):
-                leaked.append(path)
+                leaked.append((path, "configured_exact_secret"))
                 continue
             if any(pattern.search(text) for pattern in SECRET_PATTERNS):
-                leaked.append(path)
+                leaked.append((path, "credential_pattern"))
+                continue
+            if include_private_paths and PRIVATE_PATH_PATTERN.search(text):
+                leaked.append((path, "private_absolute_path"))
     return leaked
 
 
@@ -178,7 +195,7 @@ def check_state_db() -> tuple[bool, str]:
 
 
 def normalize_path(raw_path: str) -> Path:
-    path = Path(os.path.expandvars(raw_path)).expanduser()
+    path = resolve_config_path(raw_path)
     if not path.is_absolute():
         path = Path.cwd() / path
     return path.resolve()
@@ -235,7 +252,7 @@ def changed_file_compaction_warnings(
 def git_remote_has_embedded_credential() -> tuple[bool, str]:
     try:
         completed = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "config", "--get-regexp", r"^remote\..*\.url$"],
+            ["git", "-C", str(GIT_ROOT), "config", "--get-regexp", r"^remote\..*\.url$"],
             text=True,
             capture_output=True,
             timeout=15,
@@ -256,9 +273,8 @@ def check_public_repo_files() -> list[str]:
     failures: list[str] = []
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
-    ignored_dirs = {".git", ".venv", "venv", ".codegraph", ".harness", ".agents", ".claude", ".cursor", ".codex"}
     for path in REPO_ROOT.rglob("*"):
-        if any(part in ignored_dirs for part in path.parts):
+        if ".git" in path.parts:
             continue
         if path.is_file() and path.name in forbidden_names:
             failures.append(f"FORBIDDEN public_file {path}")
@@ -268,7 +284,7 @@ def check_public_repo_files() -> list[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check the local Agent memory system.")
+    parser = argparse.ArgumentParser(description="Check the local Agent Memory system.")
     parser.add_argument(
         "--changed-file",
         action="append",
@@ -300,15 +316,19 @@ def main() -> int:
     args = parse_args()
     failures: list[str] = []
     warnings: list[str] = []
-    checks: list[str] = [f"vault_root={VAULT_ROOT}", f"state_db={STATE_DB}"]
+    mode = "public_template" if PUBLIC_TEMPLATE_MODE else "private_runtime"
+    checks: list[str] = [f"mode={mode}", f"vault_root={VAULT_ROOT}", f"state_db={STATE_DB}"]
 
-    for path in REQUIRED_DIRS:
+    required_dirs = COMMON_REQUIRED_DIRS + (PUBLIC_REQUIRED_DIRS if PUBLIC_TEMPLATE_MODE else [])
+    required_files = COMMON_REQUIRED_FILES + (PUBLIC_REQUIRED_FILES if PUBLIC_TEMPLATE_MODE else [])
+
+    for path in required_dirs:
         if path.is_dir():
             checks.append(f"OK dir {path}")
         else:
             failures.append(f"MISSING dir {path}")
 
-    for path in REQUIRED_FILES:
+    for path in required_files:
         if path.is_file():
             checks.append(f"OK file {path}")
         else:
@@ -322,20 +342,29 @@ def main() -> int:
 
     frontmatter_targets = [
         path
-        for path in REQUIRED_FILES
-        if path.suffix.lower() == ".md" and path.name not in {"README.md", "AGENTS.md"} and not path.name.startswith("_模板")
+        for path in required_files
+        if path.name.startswith("_模板") or path.name in {"偏好与边界.md", "长期画像.md"}
     ]
-    frontmatter_targets.extend(path for path in REQUIRED_FILES if path.name.startswith("_模板"))
+    if PUBLIC_TEMPLATE_MODE:
+        frontmatter_targets.extend(
+            path
+            for path in required_files
+            if path.suffix.lower() == ".md"
+            and path.name not in {"README.md", "AGENTS.md", "INDEX.md"}
+            and not path.name.startswith("_模板")
+            and path not in frontmatter_targets
+        )
     for path in frontmatter_targets:
         if path.exists() and file_has_frontmatter(path):
             checks.append(f"OK frontmatter {path}")
         elif path.exists():
             failures.append(f"BAD frontmatter {path}")
 
-    leaked = scan_for_secrets([REPO_ROOT, VAULT_ROOT])
+    scan_roots = [REPO_ROOT] if PUBLIC_TEMPLATE_MODE else [VAULT_ROOT]
+    leaked = scan_for_secrets(scan_roots, include_private_paths=PUBLIC_TEMPLATE_MODE)
     if leaked:
-        for path in leaked:
-            failures.append(f"SECRET_OR_PRIVATE_PATH leak {path}")
+        for path, reason in leaked:
+            failures.append(f"SECRET_OR_PRIVATE_PATH leak reason={reason} path={path}")
     else:
         checks.append("OK no_secret_or_private_path_leak")
 
@@ -347,7 +376,8 @@ def main() -> int:
     else:
         warnings.append(remote_detail)
 
-    failures.extend(check_public_repo_files())
+    if PUBLIC_TEMPLATE_MODE:
+        failures.extend(check_public_repo_files())
 
     if not args.skip_state_db:
         state_ok, state_detail = check_state_db()
