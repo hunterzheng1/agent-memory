@@ -9,6 +9,7 @@ try:
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
     import msvcrt
+import hashlib
 import json
 import os
 import re
@@ -16,48 +17,23 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from agent_memory_env import env_value, resolve_config_path
+from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
 TEMPLATE_REPO_ROOT = SCRIPT_ROOT.parent
 DEFAULT_VAULT_ROOT = TEMPLATE_REPO_ROOT / "templates" / "vault"
-VAULT_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_ROOT", str(DEFAULT_VAULT_ROOT)))
-).expanduser().resolve()
-CONFIG_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "~/.config/codex-memory"))
-).expanduser().resolve()
-STATE_DB = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
-).expanduser().resolve()
-LOG_PATH = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
-).expanduser().resolve()
-
-
-def env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
+CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
+STATE_DB = resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
+LOG_PATH = resolve_config_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
 LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
-
-
-def lock_file(handle: Any, blocking: bool) -> None:
-    if fcntl is not None:
-        flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
-        fcntl.flock(handle.fileno(), flags)
-        return
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
-
-
-def unlock_file(handle: Any) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def find_default_git_root() -> Path:
@@ -67,21 +43,19 @@ def find_default_git_root() -> Path:
     return VAULT_ROOT.parent.resolve()
 
 
-REPO_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_GIT_ROOT", str(find_default_git_root())))
-).expanduser().resolve()
+REPO_ROOT = resolve_config_path(env_value("GIT_ROOT", str(find_default_git_root())))
 
 CHECK_SCRIPT = SCRIPT_ROOT / "agent_memory_check.py"
 INDEX_SCRIPT = SCRIPT_ROOT / "agent_memory_index.py"
 SEARCH_SCRIPT = SCRIPT_ROOT / "agent_memory_search.py"
 ZVEC_SCRIPT = SCRIPT_ROOT / "agent_memory_zvec_index.py"
-AGENT_EVOLUTION_SCRIPT = SCRIPT_ROOT / "agent_evolution.py"
+AGENT_EVOLUTION_SCRIPT = SCRIPT_ROOT / "agent_memory_evolution.py"
 AUDIT_AUTORUN_SCRIPT = SCRIPT_ROOT / "agent_memory_audit_autorun.py"
-PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", sys.executable)
-ZVEC_PYTHON = os.environ.get("AGENT_MEMORY_ZVEC_PYTHON", PYTHON)
+PYTHON = env_value("PYTHON", sys.executable)
+ZVEC_PYTHON = env_value("ZVEC_PYTHON", PYTHON)
 
 MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
-TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "CLAUDE.md", "INDEX.md", "README.md", "STRUCTURE.md"}
+TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "INDEX.md", "README.md", "STRUCTURE.md"}
 RECONCILE_ACTIONS = {
     "ADD",
     "UPDATE",
@@ -98,6 +72,8 @@ ASK_USER_PATTERNS = [
         r"[\"']?(?!redacted\b|example\b|placeholder\b|your[_-]|<)[A-Za-z0-9_./+=-]{20,}"
     ),
 ]
+NONCURRENT_RECONCILE_STATUSES = {"archived", "outdated", "superseded", "deleted"}
+NONFACT_RECONCILE_TYPES = {"directory_index", "routing", "template", "open_loop"}
 
 
 @dataclass
@@ -105,6 +81,7 @@ class GitEntry:
     status: str
     repo_path: str
     path: Path
+    previous_repo_path: str = ""
 
     @property
     def exists(self) -> bool:
@@ -116,7 +93,7 @@ class GitEntry:
 
     @property
     def is_new(self) -> bool:
-        return self.status == "??" or "A" in self.status
+        return self.status == "??" or "A" in self.status or self.status.startswith("C")
 
     @property
     def is_memory_markdown(self) -> bool:
@@ -133,6 +110,15 @@ class GitEntry:
 
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def normalized_actor(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower()).strip("-")
+    return cleaned or "unknown"
+
+
+def session_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 
 def command_env_offline() -> dict[str, str]:
@@ -162,8 +148,6 @@ def run_command(
         completed = subprocess.run(
             command,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             capture_output=True,
             timeout=timeout,
             env=env,
@@ -203,6 +187,24 @@ def run_command(
         }
 
 
+
+def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
+    if fcntl is not None:
+        base = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        flags = base if blocking else base | fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), flags)
+        return
+    # Windows: shared locks are approximated with exclusive byte locks.
+    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+    msvcrt.locking(handle.fileno(), mode, 1)
+
+
+def unlock_file(handle) -> None:
+    if fcntl is not None:
+        unlock_file(handle)
+        return
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
 @contextlib.contextmanager
 def closeout_lock(timeout: float = 15.0):
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -210,9 +212,9 @@ def closeout_lock(timeout: float = 15.0):
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
-                lock_file(handle, blocking=False)
+                lock_file(handle, blocking=False, exclusive=True)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
                 time.sleep(0.1)
@@ -233,11 +235,18 @@ def decode_status_line(line: str) -> GitEntry | None:
     return GitEntry(status=status, repo_path=repo_path, path=path)
 
 
-def git_status_entries() -> tuple[list[GitEntry], list[str]]:
+def repo_path_in_vault(repo_path: str) -> bool:
     try:
-        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
+        vault_repo_path = VAULT_ROOT.relative_to(REPO_ROOT).as_posix().rstrip("/")
     except ValueError:
-        target = str(VAULT_ROOT)
+        return False
+    candidate = Path(repo_path).as_posix().lstrip("./")
+    if vault_repo_path in {"", "."}:
+        return True
+    return candidate == vault_repo_path or candidate.startswith(f"{vault_repo_path}/")
+
+
+def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     result = run_command(
         [
             "git",
@@ -249,8 +258,6 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
             "--porcelain=v1",
             "-z",
             "--untracked-files=all",
-            "--",
-            target,
         ],
         timeout=30,
     )
@@ -262,10 +269,17 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     while index < len(items):
         item = items[index]
         entry = decode_status_line(item)
+        previous_repo_path = ""
+        if entry and entry.status.startswith(("R", "C")) and index + 1 < len(items):
+            previous_repo_path = items[index + 1]
+            index += 1
         if entry:
-            entries.append(entry)
-            if entry.status.startswith(("R", "C")):
-                index += 1
+            if repo_path_in_vault(entry.repo_path):
+                entry.previous_repo_path = previous_repo_path
+                entries.append(entry)
+            elif entry.status.startswith("R") and repo_path_in_vault(previous_repo_path):
+                old_path = (REPO_ROOT / previous_repo_path).resolve()
+                entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
         index += 1
     return entries, []
 
@@ -304,12 +318,11 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
     ancestor = run_command(["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", baseline, head], timeout=30)
     if ancestor["returncode"] != 0:
         return [], [f"closeout git baseline is not an ancestor of HEAD: baseline={baseline[:12]} head={head[:12]}"]
-    try:
-        target = str(VAULT_ROOT.relative_to(REPO_ROOT))
-    except ValueError:
-        target = str(VAULT_ROOT)
     result = run_command(
-        ["git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false", "diff", "--name-status", "-z", f"{baseline}..{head}", "--", target],
+        [
+            "git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false",
+            "diff", "--find-renames", "--name-status", "-z", f"{baseline}..{head}",
+        ],
         timeout=60,
     )
     if not result["ok"]:
@@ -325,13 +338,26 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
         if status.startswith(("R", "C")):
             if index + 1 >= len(items):
                 break
+            previous_repo_path = items[index]
             index += 1
             repo_path = items[index]
             index += 1
         else:
+            previous_repo_path = ""
             repo_path = items[index]
             index += 1
-        entries.append(GitEntry(status=status, repo_path=repo_path, path=(REPO_ROOT / repo_path).resolve()))
+        if repo_path_in_vault(repo_path):
+            entries.append(
+                GitEntry(
+                    status=status,
+                    repo_path=repo_path,
+                    path=(REPO_ROOT / repo_path).resolve(),
+                    previous_repo_path=previous_repo_path,
+                )
+            )
+        elif status.startswith("R") and repo_path_in_vault(previous_repo_path):
+            old_path = (REPO_ROOT / previous_repo_path).resolve()
+            entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
     return entries, []
 
 
@@ -356,9 +382,9 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
 
 def relative_to_vault(path: Path) -> str:
     try:
-        return str(path.relative_to(VAULT_ROOT))
+        return path.relative_to(VAULT_ROOT).as_posix()
     except ValueError:
-        return str(path)
+        return Path(path).as_posix()
 
 
 def read_text(path: Path, limit: int = 12000) -> str:
@@ -376,6 +402,15 @@ def title_from_text(text: str, path: Path) -> str:
     return path.stem
 
 
+def without_frontmatter(text: str) -> str:
+    if not text.startswith("---"):
+        return text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    return text[end + 4 :].lstrip("\r\n")
+
+
 def summary_from_text(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -384,8 +419,36 @@ def summary_from_text(text: str) -> str:
     current_summary = text.find("## 当前有效摘要")
     if current_summary != -1:
         return text[current_summary : current_summary + 500].replace("\n", " ")
-    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("---")]
+    body = without_frontmatter(text)
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
     return " ".join(lines[:8])[:700]
+
+
+def frontmatter_list(path: Path, key: str) -> set[str]:
+    text = read_text(path)
+    if not text.startswith("---"):
+        return set()
+    end = text.find("\n---", 3)
+    if end == -1:
+        return set()
+    values: list[str] = []
+    current_key = ""
+    for line in text[3:end].splitlines():
+        if re.match(r"^\s+-\s+", line) and current_key == key:
+            values.append(re.sub(r"^\s+-\s+", "", line).strip())
+            continue
+        if line.startswith(" ") or ":" not in line:
+            continue
+        current_key, raw_value = line.split(":", 1)
+        current_key = current_key.strip()
+        if current_key != key:
+            continue
+        raw_value = raw_value.strip()
+        if raw_value.startswith("[") and raw_value.endswith("]"):
+            values.extend(item.strip() for item in raw_value[1:-1].split(","))
+        elif raw_value:
+            values.append(raw_value)
+    return {value.strip().strip("'\"`") for value in values if value.strip()}
 
 
 def reconcile_query_for_file(path: Path) -> str:
@@ -394,6 +457,11 @@ def reconcile_query_for_file(path: Path) -> str:
     summary = summary_from_text(text)
     query = f"{title} {summary}".strip()
     return query[:900]
+
+
+def is_current_reconcile_target(path: Path) -> bool:
+    statuses = {value.lower() for value in frontmatter_list(path, "status")}
+    return not bool(statuses & NONCURRENT_RECONCILE_STATUSES)
 
 
 def tokenize(text: str) -> set[str]:
@@ -500,6 +568,10 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
     action, target, metrics = prewrite_recommendation(args.prewrite, rows)
     return {
         "time": utc_now(),
+        "run_id": uuid.uuid4().hex,
+        "actor": args.actor,
+        "trigger": args.trigger,
+        "session_hash": session_hash(args.session_id),
         "mode": "prewrite",
         "input_preview": args.prewrite[:500],
         "recommended_action": action,
@@ -520,8 +592,16 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
 def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[str]]:
     warnings: list[str] = []
     findings: list[dict[str, Any]] = []
-    targets = [entry for entry in entries if entry.exists and entry.is_memory_markdown and (entry.is_new or args.reconcile_all)]
+    targets = [
+        entry
+        for entry in entries
+        if entry.exists
+        and entry.is_memory_markdown
+        and (entry.is_new or args.reconcile_all)
+        and is_current_reconcile_target(entry.path)
+    ]
     for entry in targets:
+        declared_relations = frontmatter_list(entry.path, "related_workflows")
         query = reconcile_query_for_file(entry.path)
         if not query:
             continue
@@ -532,6 +612,10 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
         for row in rows:
             if row.get("path") == str(entry.path) or row.get("rel_path") == relative_to_vault(entry.path):
                 continue
+            if str(row.get("rel_path") or "") in declared_relations:
+                continue
+            if str(row.get("memory_type") or "").lower() in NONFACT_RECONCILE_TYPES:
+                continue
             comparison = " ".join(
                 str(row.get(key, ""))
                 for key in ("title", "rel_path", "summary", "hit")
@@ -540,9 +624,12 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
             row_coverage = coverage(source_text, comparison)
             distance = semantic_distance(row)
             raw_distance = raw_semantic_distance(row)
-            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or (
-                distance is not None and distance <= args.semantic_merge_threshold
-            ):
+            semantic_duplicate = (
+                raw_distance <= args.semantic_merge_threshold
+                if raw_distance is not None
+                else distance is not None and distance <= args.semantic_merge_threshold
+            )
+            if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or semantic_duplicate:
                 candidates.append(
                     {
                         "rel_path": row.get("rel_path", ""),
@@ -679,7 +766,7 @@ def commit_files(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
     if diff_result["returncode"] == 0:
         return {"ok": True, "skipped": True, "detail": "nothing_staged"}
 
-    message = args.message or f"codex memory closeout: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    message = args.message or f"memory closeout[{args.actor}]: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
     commit_result = run_command(["git", "-C", str(REPO_ROOT), "commit", "-m", message, "--", *repo_paths], timeout=120)
     if not commit_result["ok"]:
         return {"ok": False, "stage": "commit", "detail": commit_result}
@@ -697,6 +784,28 @@ def append_log(payload: dict[str, Any]) -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
+    if not entries or not STATE_DB.exists():
+        return entries
+    try:
+        with sqlite3.connect(STATE_DB, timeout=5) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+    except sqlite3.Error:
+        return entries
+    observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    pending: list[GitEntry] = []
+    for entry in entries:
+        try:
+            digest = hashlib.sha256(entry.path.read_bytes()).hexdigest()
+        except OSError:
+            pending.append(entry)
+            continue
+        if observed.get(str(entry.path.resolve())) != digest:
+            pending.append(entry)
+    return pending
 
 
 def short_step(step: dict[str, Any]) -> dict[str, Any]:
@@ -731,7 +840,35 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         by_path[entry.path] = entry
     for entry in explicit:
         by_path[entry.path] = entry
-    all_entries = list(by_path.values())
+    discovered_entries = list(by_path.values())
+    claim_rows = active_claim_rows(args.session_id, args.actor) if args.claimed_only else []
+    claimed_paths = {Path(row["path"]).resolve() for row in claim_rows}
+    unclaimed_entries: list[GitEntry] = []
+    ownership_error = ""
+    if args.claimed_only:
+        if not args.session_id:
+            ownership_error = "claimed-only closeout requires --session-id"
+        elif not claimed_paths:
+            ownership_error = (
+                "no active memory claims for this session; claim each changed file with "
+                f"memoryctl --actor {args.actor} claim --file <path>"
+            )
+        unclaimed_entries = [entry for entry in discovered_entries if entry.path not in claimed_paths]
+        selected = {entry.path: entry for entry in discovered_entries if entry.path in claimed_paths}
+        for path in claimed_paths:
+            try:
+                repo_path = path.relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                continue
+            selected.setdefault(
+                path,
+                GitEntry(status="M" if path.exists() else "D", repo_path=repo_path, path=path),
+            )
+        all_entries = list(selected.values())
+        if unclaimed_entries:
+            info.append(f"excluded {len(unclaimed_entries)} files owned by other or unclaimed sessions")
+    else:
+        all_entries = discovered_entries
 
     deleted_entries = [entry for entry in all_entries if entry.is_deleted]
     for entry in deleted_entries:
@@ -748,17 +885,23 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
     if git_entries:
         info.append(
-            "git reports dirty Agent memory files; if some are historical, review dry-run output before committing"
+            "git reports dirty Agent Memory files; if some are historical, review dry-run output before committing"
         )
 
-    check_step = run_check(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
+    check_step = run_check(process_files, args) if process_files and not ownership_error else {
+        "ok": not bool(ownership_error),
+        "skipped": True,
+        "detail": ownership_error or "no_changed_files",
+    }
     advisories = list(check_step.get("advisories", [])) if isinstance(check_step.get("advisories"), list) else []
-    reconcile_findings, reconcile_warnings = postwrite_reconcile(process_entries, args)
+    reconcile_findings, reconcile_warnings = (
+        postwrite_reconcile(process_entries, args) if not ownership_error else ([], [])
+    )
     warnings.extend(reconcile_warnings)
-    index_step = run_index(args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    zvec_step = run_zvec(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    agent_step = run_agent_evolution(process_files, args) if process_files else {"ok": True, "skipped": True, "detail": "no_changed_files"}
-    audit_step = run_audit_autorun(args)
+    index_step = run_index(args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    zvec_step = run_zvec(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    agent_step = run_agent_evolution(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
+    audit_step = run_audit_autorun(args) if not ownership_error else {"ok": False, "skipped": True, "detail": ownership_error}
     audit_payload = audit_step.get("audit_payload") if isinstance(audit_step.get("audit_payload"), dict) else {}
     if audit_payload:
         audit_status = str(audit_payload.get("status", ""))
@@ -776,7 +919,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         info.append(f"audit autorun failed: {str(audit_step.get('stderr', '')).strip()[:300]}")
 
     blocking_reconcile = bool(reconcile_findings)
-    step_failed = not all(
+    step_failed = bool(ownership_error) or not all(
         bool(step.get("ok"))
         for step in (check_step, index_step, zvec_step, agent_step)
     )
@@ -798,11 +941,30 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         if not commit_step.get("ok"):
             status = "error"
 
+    claim_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "ownership_not_enabled"}
+    observation_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "not_completed"}
+    if status == "ok" and not args.dry_run and commit_step.get("ok"):
+        try:
+            observed = record_file_observations(args.session_id, args.actor, process_files)
+            observation_step = {"ok": True, "skipped": False, "detail": f"recorded={observed}"}
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            observation_step = {"ok": False, "skipped": False, "detail": str(exc)}
+            status = "error"
+    if args.claimed_only:
+        claim_step = {"ok": True, "skipped": True, "detail": "claims_retained"}
+        if status == "ok" and not args.dry_run and commit_step.get("ok"):
+            completed = complete_claim_paths(args.session_id, args.actor, process_files)
+            claim_step = {"ok": True, "skipped": False, "detail": f"completed={completed}"}
+
     git_head_after, after_warnings = current_git_head()
     warnings.extend(after_warnings)
     dirty_paths = {entry.path for entry in git_entries}
+    unclaimed_history = unobserved_history_entries(
+        [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
+    )
     can_advance_baseline = (
-        not step_failed and not blocking_reconcile and not deleted_entries and bool(git_head_before)
+        not step_failed and observation_step.get("ok") and not blocking_reconcile
+        and not deleted_entries and not unclaimed_history and bool(git_head_before)
         and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
     )
     would_observe_through = (
@@ -813,6 +975,12 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
 
     payload = {
         "time": utc_now(),
+        "run_id": uuid.uuid4().hex,
+        "actor": args.actor,
+        "trigger": args.trigger,
+        "session_hash": session_hash(args.session_id),
+        "ownership_mode": "claimed_only" if args.claimed_only else "global",
+        "ownership_error": ownership_error,
         "cwd": str(Path.cwd()),
         "mode": "closeout",
         "git_previous_observed_head": previous_observed_head,
@@ -821,6 +989,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "git_observed_through": git_observed_through,
         "git_would_observe_through": would_observe_through,
         "changed_files": [entry.repo_path for entry in all_entries],
+        "claimed_files": sorted(row["rel_path"] for row in claim_rows),
+        "unclaimed_files": sorted(entry.repo_path for entry in unclaimed_entries),
         "processed_files": [relative_to_vault(path) for path in process_files],
         "deleted_files_skipped": [entry.repo_path for entry in deleted_entries],
         "reconcile_findings": reconcile_findings,
@@ -834,6 +1004,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "agent_evolution": short_step(agent_step),
             "audit": short_step(audit_step),
             "commit": short_step(commit_step),
+            "observations": short_step(observation_step),
+            "claims": short_step(claim_step),
         },
         "commit": commit_step.get("commit", "skipped"),
         "status": status,
@@ -878,23 +1050,29 @@ def print_human(payload: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unified closeout for the local Agent memory system."
+        description="Unified closeout for the local Agent Memory system."
     )
     parser.add_argument("--prewrite", help="Run reconcile before writing a new memory; does not modify files.")
     parser.add_argument("--changed-file", action="append", default=[], help="Explicit changed memory file. Repeatable.")
     parser.add_argument("--limit", type=int, default=8, help="Search candidates for reconcile.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Inspect only; do not refresh indexes, write logs, or commit.")
-    auto_commit_default = env_truthy("AGENT_MEMORY_AUTO_COMMIT") or env_truthy("CODEX_MEMORY_AUTO_COMMIT")
-    parser.add_argument(
-        "--commit",
-        action="store_true",
-        default=auto_commit_default,
-        help="After successful closeout, commit processed memory files; enabled by AGENT_MEMORY_AUTO_COMMIT=1.",
-    )
-    parser.add_argument("--no-commit", action="store_true", help="Disable automatic commit for this run.")
+    parser.add_argument("--commit", action="store_true", help="After successful closeout, commit only processed memory files.")
     parser.add_argument("--commit-warnings", action="store_true", help="Allow commit when non-blocking warnings exist.")
     parser.add_argument("--message", default="", help="Custom scoped commit message.")
+    parser.add_argument("--actor", default=os.environ.get("MEMORY_ACTOR", "codex"), help="Agent that initiated closeout.")
+    parser.add_argument(
+        "--trigger",
+        default="manual",
+        choices=("manual", "stop-hook", "session-end", "launchd", "migration", "test"),
+        help="How this closeout run was triggered.",
+    )
+    parser.add_argument("--session-id", default="", help="Optional session id; only a one-way hash is logged.")
+    parser.add_argument(
+        "--claimed-only",
+        action="store_true",
+        help="Process only files actively claimed by this actor and session.",
+    )
     parser.add_argument("--skip-zvec", action="store_true", help="Skip Zvec refresh.")
     parser.add_argument("--no-zvec", action="store_true", help="Skip Zvec during prewrite/postwrite reconcile search.")
     parser.add_argument("--zvec-timeout", type=int, default=240, help="Seconds before Zvec refresh times out.")
@@ -910,8 +1088,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audit-open-loop-threshold", type=int, default=4, help="Forwarded open-loop threshold for closeout piggyback audit.")
     parser.add_argument("--audit-timeout", type=int, default=180, help="Seconds before closeout piggyback audit times out.")
     args = parser.parse_args()
-    if args.no_commit:
-        args.commit = False
+    args.actor = normalized_actor(args.actor)
     args.limit = max(args.limit, 1)
     args.audit_interval_days = max(args.audit_interval_days, 1)
     args.audit_limit = max(args.audit_limit, 1)

@@ -1,7 +1,11 @@
 ---
 memory_type: workflow
 track: workflow
+<<<<<<<< HEAD:templates/vault/工作流/记忆SQLite全库索引设计.md
 project_id: agent-memory-sqlite-index
+========
+project_id: agent-memory-vault-sqlite-index
+>>>>>>>> upstream/main:templates/vault/工作流/Agent记忆SQLite全库索引设计.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}

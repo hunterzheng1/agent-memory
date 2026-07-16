@@ -1,71 +1,80 @@
-# Agent Memory Instructions
+# Shared Claude Code and Agent Memory Vault Instructions
 
-杩欐槸鏈湴闀挎湡璁板繂搴撱€傞亣鍒版棦鏈夐」鐩€佷粨搴撱€佽矾寰勩€佷汉鐗┿€佸巻鍙茬粨璁恒€佺户缁笂娆′换鍔°€佹姤鍛娿€佽皟鐮斻€佽緝闀挎帓鏌ユ椂锛岄粯璁ゅ厛浣跨敤杩欎釜璁板繂搴擄紱绠€鍗曠炕璇戙€佹敼涓€鍙ヨ瘽銆佹煡鏃堕棿绛変竴娆℃€у皬浠诲姟鍙互璺宠繃銆?
+这是 Claude Code 与 Codex 可共用的本地长期记忆库。Markdown 是唯一正式事实源；两个 Agent 不各自维护第二套正式事实。
 
-璇诲彇椤哄簭锛?
+读取顺序：
 
-1. 鍏堣鏈枃浠躲€?
-2. 鍐嶈 `INDEX.md`銆?
-3. 鏍规嵁浠诲姟鍏抽敭璇嶏紝鍙鏈€鐩稿叧鐨?1-3 涓枃浠躲€?
+1. 先读本文件。
+2. 再读 `INDEX.md`。
+3. 根据任务关键词，只读最相关的 1-3 个文件。
 
-涓嶈榛樿璇诲彇鏁翠釜璁板繂搴撱€?
+不要默认读取整个记忆库。
 
-## 妫€绱㈣鍒?
+## 检索规则
 
-浼樺厛浣跨敤缁熶竴鎼滅储鑴氭湰锛岃€屼笉鏄墜宸ョ寽璇ヨ鍝釜鏂囦欢锛?
-
-```bash
-python3 scripts/agent_memory_search.py "鏌ヨ璇? --limit 5
-```
-
-瀹冧細鍏堟煡 SQLite/FTS锛涘惎鐢ㄨ涔夌储寮曟椂锛屼篃鍙互骞惰鏌?Zvec銆俍vec 鍛戒腑鍙兘褰撲綔鍊欓€夌嚎绱紝鏈€缁堝洖绛斿墠蹇呴』鍥炶 Markdown 鍘熸枃銆?
-
-## 鍐欏叆瑙勫垯
-
-姝ｅ紡鍐欏叆鍓嶅厛鍋氬璐︼紝閬垮厤閲嶅璁板繂瓒婂啓瓒婂锛?
+优先使用统一搜索脚本，而不是手工猜该读哪个文件：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --prewrite "鍑嗗鍐欏叆鐨勮蹇嗘憳瑕?
+python3 scripts/memoryctl --actor codex search "查询词" --limit 5
+python3 scripts/memoryctl --actor claude search "查询词" --limit 5
 ```
 
-瀵硅处鍔ㄤ綔鍙厑璁歌繖 6 绉嶏細
+它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
 
-- `ADD`锛氭柊寤鸿蹇嗐€?
-- `UPDATE`锛氭洿鏂板凡鏈夎蹇嗐€?
-- `NOOP`锛氫笉鍐欍€?
-- `MARK_OUTDATED`锛氭棫淇℃伅杩囨椂锛屼絾涓嶅垹闄ゃ€?
-- `MERGE_REQUIRED`锛氱枒浼奸噸澶嶆垨鍐茬獊锛岄渶瑕佷汉宸ュ悎骞躲€?
-- `ASK_USER`锛氭秹鍙婃晱鎰熴€佸垹闄ゃ€佽垂鐢ㄣ€佽处鍙枫€佸嚟璇佹垨涓嶇‘瀹氬垽鏂椂鍏堥棶鐢ㄦ埛銆?
+## 写入规则
 
-閲嶈浠诲姟缁撴潫鍓嶆墽琛?memory closeout锛?
+正式写入前先做对账，避免重复记忆越写越多：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --dry-run
-python3 scripts/agent_memory_closeout.py --commit
+python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆摘要"
 ```
 
-closeout 浼氳嚜鍔ㄥ彂鐜拌蹇嗗簱鍙樻洿鏂囦欢锛屾墽琛岀粨鏋勬鏌ャ€佸啓鍏ュ悗瀵硅处銆丼QLite 鍒锋柊銆佸彲閫?Zvec 鍒锋柊銆丄gent evolution 鍒锋柊銆乤udit 鎹庡甫瑙﹀彂銆乧loseout 鏃ュ織鍐欏叆锛屽苟鍙彁浜ゆ湰杞鐞嗚繃鐨勮蹇嗘枃浠躲€?
+对账动作只允许这 6 种：
 
-濡傛灉 closeout 杈撳嚭 `MERGE_REQUIRED`銆乣ASK_USER`銆佸垹闄ゆ枃浠剁姸鎬併€佺枒浼煎巻鍙茶剰鍙樻洿锛屽厛鍋滀笅璁╃敤鎴风‘璁ゃ€?
+- `ADD`：新建记忆。
+- `UPDATE`：更新已有记忆。
+- `NOOP`：不写。
+- `MARK_OUTDATED`：旧信息过时，但不删除。
+- `MERGE_REQUIRED`：疑似重复或冲突，需要人工合并。
+- `ASK_USER`：涉及敏感、删除、费用、账号、凭证或不确定判断时先问用户。
 
-鏅€氳蹇嗙洿鎺ュ啓鍏ユ寮忕洰褰曪細`鐢ㄦ埛璁板繂/`銆乣椤圭洰/`銆乣宸ヤ綔娴?`銆乣鍐崇瓥/`銆侫gent 澶嶇敤缁忛獙鍐欏叆 `agent/cases/` 鎴?`agent/case-candidates/`銆傚娆″鐢ㄣ€佸彲鎶借薄鎴愭祦绋嬬殑缁忛獙锛屽啓鍏?`agent/skill-candidates/`锛屾寮忓崌绾?skill 鍓嶉渶瑕佺敤鎴风‘璁ゃ€?
+每次新建或修改正式记忆后，立即把文件认领到当前 Agent 会话：
 
-## Audit 瑙勫垯
+```bash
+python3 scripts/memoryctl --actor <codex|claude> claim --file "/absolute/path/to/memory.md"
+```
 
-audit 鐢ㄦ潵鍙戠幇闇€瑕佸鏍搞€佸悎骞舵垨蹇界暐鐨勮蹇嗭紝涓嶇洿鎺ユ敼鍐?Markdown 浜嬪疄灞傘€?
+Codex 会自动使用 `CODEX_THREAD_ID`；Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`，供后续 Bash 命令使用。Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除；成功 closeout 会另存文件内容 hash，只有匹配这份完成指纹的历史内容才视为已处理。
+
+重要任务结束前执行 memory closeout：
+
+```bash
+python3 scripts/memoryctl --actor <codex|claude> closeout --dry-run
+python3 scripts/memoryctl --actor <codex|claude> closeout
+```
+
+在 Agent 会话内，`memoryctl closeout` 会按当前会话的认领账本执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本会话认领的文件。只有人工维护时才使用 `--global` 做全库收尾。
+
+如果 closeout 输出 `MERGE_REQUIRED`、`ASK_USER`、删除文件状态、疑似历史脏变更，先停下让用户确认。
+
+普通记忆直接写入正式目录：`用户记忆/`、`项目/`、`工作流/`、`决策/`。Agent 复用经验写入 `agent/cases/` 或 `agent/case-candidates/`。多次复用、可抽象成流程的经验，写入 `agent/skill-candidates/`，正式升级 skill 前需要用户确认。
+
+## Audit 规则
+
+audit 用来发现需要复核、合并或忽略的记忆，不直接改写 Markdown 事实层。
 
 ```bash
 python3 scripts/agent_memory_audit.py
-python3 scripts/agent_memory_audit.py --ignore FINDING_ID --note "淇濈暀鍘熷洜"
+python3 scripts/agent_memory_audit.py --ignore FINDING_ID --note "保留原因"
 python3 scripts/agent_memory_audit_autorun.py --reason closeout --min-interval-days 7
 python3 scripts/agent_memory_doctor.py
 ```
 
-鎺ㄨ崘璁?closeout 姣?7 澶╂崕甯︽鏌ヤ竴娆?audit 鏄惁璇ヨ繍琛屻€俛udit findings 搴旇鐢辩敤鎴锋垨 Agent 鏄庣‘瑁佸喅锛岄伩鍏嶆姤鍛婃湰韬彉鎴愭柊鐨?open-loop 鍣０銆?
+推荐让 closeout 每 7 天捎带检查一次 audit 是否该运行。audit findings 应该由用户或 Agent 明确裁决，避免报告本身变成新的 open-loop 噪声。
 
-## 瀛楁瑕佹眰
+## 字段要求
 
-鏂板缓鎴栭噸鍐欐寮忚蹇嗘椂锛屽敖閲忓寘鍚笅闈㈠瓧娈碉細
+新建或重写正式记忆时，尽量包含下面字段：
 
 ```yaml
 ---
@@ -75,6 +84,9 @@ project_id: example-app
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
+created_by: human | codex | claude
+last_updated_by: human | codex | claude
 session_id: ""
 status: active
 sensitivity: normal
@@ -85,10 +97,11 @@ keywords:
 ---
 ```
 
-## 瀹夊叏杈圭晫
+## 安全边界
 
-- 涓嶈鎶?API key銆乼oken銆乧ookie銆佸瘑鐮佸啓鍏?Markdown銆?
-- 涓嶈鎶婄瀵嗗師濮嬭亰澶╁叏鏂囧啓鍏ュ叕寮€浠撳簱銆?
-- 涓嶈鎶?SQLite 鏁版嵁搴撴彁浜ゅ埌 Git銆?
-- 鎼滅储鏃ュ織鍙繚瀛樻煡璇㈠搱甯屻€侀暱搴︺€佹潵婧愬拰鑰楁椂锛屼笉淇濆瓨鏂扮殑鏌ヨ鍘熸枃銆?
-- 瀵瑰鍒嗕韩鍓嶅繀椤昏劚鏁忋€?
+- 不要把 API key、token、cookie、密码写入 Markdown。
+- 不要把私密原始聊天全文写入公开仓库。
+- 不要把 SQLite 数据库提交到 Git。
+- 搜索日志只保存查询哈希、长度、来源和耗时，不保存新的查询原文。
+- 对外分享前必须脱敏。
+- Claude Code 原生 auto-memory 不应直接指向正式 vault；可停用，或只把它当作非正式草稿层。

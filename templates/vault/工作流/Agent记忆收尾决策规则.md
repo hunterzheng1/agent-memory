@@ -1,7 +1,11 @@
 ---
 memory_type: workflow
 track: workflow
+<<<<<<<< HEAD:templates/vault/工作流/记忆收尾决策规则.md
 project_id: agent-memory-closeout
+========
+project_id: agent-memory-vault-closeout
+>>>>>>>> upstream/main:templates/vault/工作流/Agent记忆收尾决策规则.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}

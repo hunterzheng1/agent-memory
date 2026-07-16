@@ -1,7 +1,7 @@
 ---
 memory_type: routing
 track: routing
-project_id: agent-memory-index
+project_id: agent-memory-vault-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -14,18 +14,18 @@ keywords:
   - routing
 ---
 
-# 记忆索引
+# Agent 记忆索引
 
 ## 读取入口
 
-- 全局规则：`AGENTS.md`（Codex/通用）/ `CLAUDE.md`（Claude Code）/ `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule（Cursor）
+- 全局规则：`AGENTS.md`
 - 用户偏好：`用户记忆/偏好与边界.md`
 - 用户画像：`用户记忆/长期画像.md`
-- 字段规范：`工作流/记忆字段规范.md`
-- 收尾规则：`工作流/记忆收尾决策规则.md`
-- 本地脚本：`工作流/记忆本地脚本.md`
-- SQLite 索引：`工作流/记忆SQLite全库索引设计.md`
-- 语义检索：`工作流/记忆语义检索设计.md`
+- 字段规范：`工作流/Agent记忆字段规范.md`
+- 收尾规则：`工作流/Agent记忆收尾决策规则.md`
+- 本地脚本：`工作流/Agent记忆本地脚本.md`
+- SQLite 索引：`工作流/Agent记忆SQLite全库索引设计.md`
+- 语义检索：`工作流/Agent记忆语义检索设计.md`
 - Agent 记忆：`agent/README.md`
 
 ## 目录职责

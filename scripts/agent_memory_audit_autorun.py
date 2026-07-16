@@ -16,36 +16,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from agent_memory_env import env_value, resolve_config_path
+
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
-CONFIG_ROOT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "~/.config/codex-memory"))
-).expanduser().resolve()
+CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
 AUDIT_SCRIPT = SCRIPT_ROOT / "agent_memory_audit.py"
-PYTHON = os.environ.get("AGENT_MEMORY_PYTHON", sys.executable)
-RUN_LOG = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
-).expanduser().resolve()
-LATEST_REPORT = Path(
-    os.path.expandvars(os.environ.get("AGENT_MEMORY_AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json")))
-).expanduser().resolve()
+DOCTOR_SCRIPT = SCRIPT_ROOT / "agent_memory_doctor.py"
+PYTHON = env_value("PYTHON", sys.executable)
+RUN_LOG = resolve_config_path(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
+LATEST_REPORT = resolve_config_path(env_value("AUDIT_REPORT", str(CONFIG_ROOT / "reports" / "latest-audit.json")))
+LATEST_DOCTOR_REPORT = CONFIG_ROOT / "reports" / "latest-doctor.json"
 LOCK_PATH = CONFIG_ROOT / "locks" / "audit.lock"
-
-
-def lock_file(handle: Any) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-
-
-def unlock_file(handle: Any) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return
-    handle.seek(0)
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def utc_now_dt() -> dt.datetime:
@@ -56,13 +38,31 @@ def utc_now() -> str:
     return utc_now_dt().isoformat()
 
 
+
+def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
+    if fcntl is not None:
+        base = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        flags = base if blocking else base | fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), flags)
+        return
+    # Windows: shared locks are approximated with exclusive byte locks.
+    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+    msvcrt.locking(handle.fileno(), mode, 1)
+
+
+def unlock_file(handle) -> None:
+    if fcntl is not None:
+        unlock_file(handle)
+        return
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
 @contextlib.contextmanager
 def audit_lock():
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOCK_PATH.open("a+", encoding="utf-8") as handle:
         try:
-            lock_file(handle)
-        except BlockingIOError:
+            lock_file(handle, blocking=False, exclusive=True)
+        except (BlockingIOError, OSError):
             yield False
             return
         try:
@@ -117,8 +117,6 @@ def run_command(command: list[str], timeout: int = 180) -> dict[str, Any]:
         completed = subprocess.run(
             command,
             text=True,
-            encoding="utf-8",
-            errors="replace",
             capture_output=True,
             timeout=timeout,
             env=env,
@@ -163,6 +161,9 @@ def append_run_log(payload: dict[str, Any]) -> None:
         "status": payload.get("status"),
         "ok": payload.get("ok"),
         "findings_count": payload.get("findings_count", 0),
+        "doctor_status": payload.get("doctor_status", "skipped"),
+        "doctor_summary": payload.get("doctor_summary", {}),
+        "doctor_report_path": payload.get("doctor_report_path", ""),
         "report_path": payload.get("report_path", ""),
         "detail": payload.get("detail", ""),
     }
@@ -177,6 +178,13 @@ def write_report(payload: dict[str, Any]) -> None:
     os.replace(temporary, LATEST_REPORT)
 
 
+def write_doctor_report(payload: dict[str, Any]) -> None:
+    LATEST_DOCTOR_REPORT.parent.mkdir(parents=True, exist_ok=True)
+    temporary = LATEST_DOCTOR_REPORT.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, LATEST_DOCTOR_REPORT)
+
+
 def notify(title: str, message: str) -> None:
     safe_title = title.replace("\\", "\\\\").replace('"', '\\"')
     safe_message = message.replace("\\", "\\\\").replace('"', '\\"')
@@ -189,6 +197,38 @@ def notify(title: str, message: str) -> None:
         timeout=5,
         check=False,
     )
+
+
+def run_doctor(timeout: int, allow_dirty_memory: bool = False) -> dict[str, Any]:
+    command = [PYTHON, str(DOCTOR_SCRIPT), "--json"]
+    if allow_dirty_memory:
+        command.append("--allow-dirty-memory")
+    result = run_command(command, timeout=timeout)
+    doctor_payload: dict[str, Any] = {}
+    parse_error = ""
+    try:
+        parsed = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        parse_error = "doctor returned non-json output"
+    else:
+        if isinstance(parsed, dict):
+            doctor_payload = parsed
+        else:
+            parse_error = "doctor returned a non-object payload"
+    status = str(doctor_payload.get("status", "error")) if doctor_payload else "error"
+    summary = doctor_payload.get("summary") if isinstance(doctor_payload.get("summary"), dict) else {}
+    report = {
+        "time": utc_now(),
+        "status": status,
+        "summary": summary,
+        "ok": bool(result.get("ok") and status in {"ok", "warning"} and not parse_error),
+        "returncode": result.get("returncode"),
+        "stderr": str(result.get("stderr", "")).strip()[:1000],
+        "detail": parse_error,
+        "doctor_payload": doctor_payload,
+    }
+    write_doctor_report(report)
+    return report
 
 
 def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[str, Any]:
@@ -217,6 +257,9 @@ def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[st
         "stderr": str(result.get("stderr", "")).strip()[:1000],
         "findings_count": 0,
         "audit_payload": {},
+        "doctor_status": "skipped",
+        "doctor_summary": {},
+        "doctor_report_path": str(LATEST_DOCTOR_REPORT),
     }
     if result["ok"]:
         try:
@@ -235,39 +278,57 @@ def run_audit(args: argparse.Namespace, last_run: dt.datetime | None) -> dict[st
     else:
         payload["detail"] = "audit command failed"
 
+    if not args.skip_doctor:
+        doctor_report = run_doctor(args.doctor_timeout, allow_dirty_memory=args.reason == "closeout")
+        payload["doctor_status"] = doctor_report["status"]
+        payload["doctor_summary"] = doctor_report["summary"]
+        payload["doctor_ok"] = doctor_report["ok"]
+        if doctor_report.get("detail"):
+            payload["doctor_detail"] = doctor_report["detail"]
+
     write_report(payload)
     append_run_log(payload)
 
-    if args.notify and payload["ok"] and payload["findings_count"]:
-        notify(
-            "Agent 记忆体检",
-            f"发现 {payload['findings_count']} 个待看项，报告已写入 latest-audit.json。",
-        )
+    doctor_status = str(payload.get("doctor_status", "skipped"))
+    if args.notify and payload["ok"] and (payload["findings_count"] or doctor_status in {"warning", "error"}):
+        parts = []
+        if payload["findings_count"]:
+            parts.append(f"内容 audit 有 {payload['findings_count']} 个待看项")
+        if doctor_status in {"warning", "error"}:
+            summary = payload.get("doctor_summary", {})
+            parts.append(
+                f"基础设施 Doctor={doctor_status}"
+                f"（warn={summary.get('warn', 0)}, fail={summary.get('fail', 0)}）"
+            )
+        notify("Agent 记忆体检", "；".join(parts) + "。请查看 latest-audit.json / latest-doctor.json。")
     elif args.notify_ok and payload["ok"]:
-        notify("Agent 记忆体检", "本次 audit 已完成，未发现新的待看项。")
+        notify("Agent 记忆体检", "本次 audit 与 Doctor 均已完成，未发现新的待看项。")
     elif args.notify and not payload["ok"]:
         notify("Agent 记忆体检失败", "audit 自动运行失败，请查看 audit-launchd.err.log。")
     return payload
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Auto-run Agent memory audit with interval gating and optional notification.")
+    parser = argparse.ArgumentParser(description="Auto-run Agent Memory audit with interval gating and optional notification.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--reason", default="manual", help="Trigger source: closeout, launchd, hook, or manual.")
     parser.add_argument("--force", action="store_true", help="Run even when the last audit is still recent.")
     parser.add_argument("--dry-run", action="store_true", help="Only report whether audit would run; do not write report/log.")
     parser.add_argument("--notify", action="store_true", help="Show a macOS notification when findings exist or audit fails.")
     parser.add_argument("--notify-ok", action="store_true", help="Also notify when audit succeeds with zero findings.")
+    parser.add_argument("--skip-doctor", action="store_true", help="Skip the read-only infrastructure Doctor for this run.")
     parser.add_argument("--min-interval-days", type=int, default=7, help="Run only when the last successful audit is older than this.")
     parser.add_argument("--limit", type=int, default=50, help="Maximum visible findings to store in the report.")
     parser.add_argument("--stale-days", type=int, default=120, help="Forwarded stale threshold for agent_memory_audit.py.")
     parser.add_argument("--open-loop-threshold", type=int, default=4, help="Forwarded open-loop threshold for agent_memory_audit.py.")
     parser.add_argument("--timeout", type=int, default=180, help="Seconds before audit command times out.")
+    parser.add_argument("--doctor-timeout", type=int, default=120, help="Seconds before the read-only Doctor times out.")
     args = parser.parse_args()
     args.min_interval_days = max(args.min_interval_days, 1)
     args.limit = max(args.limit, 1)
     args.stale_days = max(args.stale_days, 1)
     args.open_loop_threshold = max(args.open_loop_threshold, 1)
+    args.doctor_timeout = max(args.doctor_timeout, 1)
     return args
 
 
@@ -288,6 +349,7 @@ def main() -> int:
                     "time": utc_now(), "reason": args.reason,
                     "status": "dry_run_due" if due or args.force else "dry_run_recent",
                     "ok": True, "would_run": bool(due or args.force),
+                    "doctor_would_run": bool((due or args.force) and not args.skip_doctor),
                     "last_successful_audit": last_run.isoformat() if last_run else "",
                     "min_interval_days": args.min_interval_days,
                     "report_path": str(LATEST_REPORT), "run_log": str(RUN_LOG),
@@ -309,7 +371,8 @@ def main() -> int:
         print(f"last_successful_audit={payload.get('last_successful_audit', '')}")
         print(f"findings_count={payload.get('findings_count', 0)}")
         print(f"report_path={payload.get('report_path', '')}")
-    return 0 if payload.get("ok") else 2
+    doctor_failed = payload.get("doctor_status") == "error"
+    return 0 if payload.get("ok") and not doctor_failed else 2
 
 
 if __name__ == "__main__":

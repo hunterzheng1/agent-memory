@@ -20,6 +20,7 @@ private/
 secrets/
 tmp/
 local-vault/
+.agent-memory/
 memory/
 zvec/
 vector-store/

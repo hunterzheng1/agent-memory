@@ -1,7 +1,11 @@
 ---
 memory_type: workflow
 track: workflow
+<<<<<<<< HEAD:templates/vault/工作流/记忆语义检索设计.md
 project_id: agent-memory-semantic-retrieval
+========
+project_id: agent-memory-vault-semantic-retrieval
+>>>>>>>> upstream/main:templates/vault/工作流/Agent记忆语义检索设计.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -40,7 +44,12 @@ keywords:
 ```bash
 python3 scripts/agent_memory_index.py --init --scan --report
 python3 scripts/agent_memory_zvec_index.py --init
+<<<<<<<< HEAD:templates/vault/工作流/记忆语义检索设计.md
 python3 scripts/agent_memory_zvec_index.py --scan
+========
+python3 scripts/agent_memory_zvec_index.py --scan --prune
+python3 scripts/agent_memory_zvec_index.py --report
+>>>>>>>> upstream/main:templates/vault/工作流/Agent记忆语义检索设计.md
 python3 scripts/agent_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
 python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
 ```
