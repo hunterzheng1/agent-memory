@@ -80,6 +80,33 @@ class StopHookProtocolTests(unittest.TestCase):
         self.assertIn("Continue this turn", stderr.getvalue())
         self.assertIn("synthetic failure", stderr.getvalue())
 
+    def test_codebuddy_stop_uses_claude_protocol_on_failure(self) -> None:
+        """CodeBuddy hooks configure --actor codebuddy --protocol claude (UT-021)."""
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "notify"),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.report_failure(
+                "claude", {"status": "error", "error": "codebuddy closeout failed"}
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(returncode, 0)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("codebuddy closeout failed", payload["reason"])
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_codebuddy_session_key_uses_native_env(self) -> None:
+        with mock.patch.dict(
+            "os.environ",
+            {"CODEBUDDY_SESSION_ID": "cb-stop-session", "CLAUDE_SESSION_ID": "claude-x"},
+            clear=True,
+        ):
+            self.assertEqual(self.module.session_key({}, "codebuddy"), "cb-stop-session")
+
 
 class StopHookGitBaselineTests(unittest.TestCase):
     def setUp(self) -> None:

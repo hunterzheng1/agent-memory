@@ -142,6 +142,31 @@ class DurabilityGuardTests(unittest.TestCase):
         self.assertFalse(strict[2]["allowed_precommit"])
         self.assertTrue(closeout[2]["allowed_precommit"])
 
+    def test_codebuddy_stop_hook_requires_actor_flag_in_settings(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp).resolve()
+            settings = tmp / "settings.json"
+            settings.write_text(
+                '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python agent_memory_stop_hook.py --actor codebuddy --protocol claude"}]}]}}',
+                encoding="utf-8",
+            )
+            weak = tmp / "weak.json"
+            weak.write_text(
+                '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python agent_memory_stop_hook.py --actor claude"}]}]}}',
+                encoding="utf-8",
+            )
+            host = {"codebuddy_settings_json": str(settings)}
+            with mock.patch.object(doctor, "HOST_CONFIG", host):
+                checks = doctor.collect_checks(allow_dirty_memory=True)
+            by_name = {c["name"]: c for c in checks}
+            self.assertEqual(by_name["codebuddy_stop_hook"]["status"], "pass")
+
+            host_weak = {"codebuddy_settings_json": str(weak)}
+            with mock.patch.object(doctor, "HOST_CONFIG", host_weak):
+                checks_weak = doctor.collect_checks(allow_dirty_memory=True)
+            by_weak = {c["name"]: c for c in checks_weak}
+            self.assertEqual(by_weak["codebuddy_stop_hook"]["status"], "warn")
+
     def test_stale_claim_preview_and_expiry_are_explicit(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
             tmp = Path(raw_tmp).resolve()

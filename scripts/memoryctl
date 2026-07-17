@@ -31,6 +31,7 @@ def host_session_id(actor: str) -> str:
     keys = {
         "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
         "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
+        "codebuddy": ("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
     }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
     for key in keys:
         value = os.environ.get(key, "").strip()
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Platform-neutral Agent Memory Vault entrypoint.")
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "human", "migration", "test"),
+        choices=("codex", "claude", "codebuddy", "human", "migration", "test"),
         default=os.environ.get("MEMORY_ACTOR", "codex"),
     )
     parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite", "version"))
@@ -107,7 +108,11 @@ def main() -> int:
             flag in forwarded for flag in ("--commit", "--dry-run", "--prewrite")
         ):
             forwarded.append("--commit")
-    elif command_name == "search" and args.actor in {"codex", "claude"} and "--agent-scope" not in forwarded:
+    elif (
+        command_name == "search"
+        and args.actor in {"codex", "claude", "codebuddy"}
+        and "--agent-scope" not in forwarded
+    ):
         forwarded.extend(["--agent-scope", args.actor])
     env = os.environ.copy()
     env["MEMORY_ACTOR"] = args.actor

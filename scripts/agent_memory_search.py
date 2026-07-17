@@ -492,7 +492,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-id", default="", help="Filter all results by agent_id.")
     parser.add_argument(
         "--agent-scope",
-        choices=("codex", "claude", "shared"),
+        choices=("codex", "claude", "codebuddy", "shared"),
         default="",
         help="Return shared memories plus memories scoped to this Agent.",
     )

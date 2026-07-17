@@ -294,7 +294,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             user_id=as_text(meta.get("user_id"), DEFAULT_USER_ID),
             agent_id=as_text(meta.get("agent_id"), DEFAULT_AGENT_ID),
             agent_scope=as_text(meta.get("agent_scope"), "shared")
-            if as_text(meta.get("agent_scope"), "shared") in {"shared", "codex", "claude"}
+            if as_text(meta.get("agent_scope"), "shared") in {"shared", "codex", "claude", "codebuddy"}
             else "shared",
             session_id=as_text(meta.get("session_id")),
             status=status,

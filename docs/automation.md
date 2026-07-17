@@ -33,7 +33,7 @@ If another tool auto-commits the vault before closeout runs, closeout compares t
 
 ## Stop Hook Modes
 
-Stop is turn-scoped in both Claude Code and Codex, so the hook must stay quiet and idempotent.
+Stop is turn-scoped in Claude Code, Codex, and CodeBuddy, so the hook must stay quiet and idempotent.
 
 Reminder mode:
 
@@ -45,16 +45,17 @@ Reminder mode:
 Automatic closeout mode is appropriate when the Agent has already written and claimed formal memory before stopping:
 
 - Claude must run `agent_memory_session_hook.py` from `SessionStart`. It writes the hook payload's real `session_id` to `CLAUDE_ENV_FILE`, so later Bash calls to `memoryctl claim` and the Stop payload use the same ownership key. It also clears an inherited `CODEX_THREAD_ID` inside Claude Bash commands.
-- After each formal write, run `memoryctl --actor codex|claude claim --file <path>`.
+- CodeBuddy Bash already exports `CODEBUDDY_SESSION_ID`; **default: no SessionStart bridge**. Use `memoryctl --actor codebuddy` and Stop with `--actor codebuddy --protocol claude` (JSON `decision: block` on failure).
+- After each formal write, run `memoryctl --actor codex|claude|codebuddy claim --file <path>`.
 - Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
 - Treat claims older than 24 hours as abandoned for Stop-hook ownership checks. `doctor` reports them, and `memoryctl --actor human claims-expire` previews them before an explicit `--apply` changes only the SQLite ledger.
 - Treat a historical file as complete only when its current content hash matches `memory_file_observations`; a full SQLite scan alone is not closeout evidence.
 - If dirty memory is not claimed by any session, block silent completion and ask the Agent to claim or resolve it.
-- Pass `--actor codex` or `--actor claude` so logs and commits remain attributable.
-- Claude Stop may return `decision: block` when closeout fails. Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
-- Claude SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.
+- Pass `--actor codex`, `--actor claude`, or `--actor codebuddy` so logs and commits remain attributable.
+- Claude and CodeBuddy Stop may return `decision: block` when closeout fails (`--protocol claude`). Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
+- Claude / CodeBuddy SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.
 - Set the outer hook timeout slightly above the closeout timeout. For a 300-second closeout, use at least 320 seconds outside.
-- Keep one global closeout lock and one Git baseline across both hosts.
+- Keep one global closeout lock and one Git baseline across all hosts.
 
 Pseudo-flow:
 
@@ -97,7 +98,51 @@ Claude SessionStart example:
 
 This uses Claude Code's official `CLAUDE_ENV_FILE` mechanism. Merge it with existing `SessionStart` groups instead of replacing unrelated hooks.
 
-Automatic closeout example:
+## CodeBuddy Code (CLI)
+
+CodeBuddy Code (`codebuddy` / `cbc`) stores settings in `~/.codebuddy/settings.json` (or project `.codebuddy/settings.json`). Hooks receive stdin JSON with `session_id`, and Bash already exports `CODEBUDDY_SESSION_ID` / `CODEBUDDY_PROJECT_DIR`.
+
+- Prefer `memoryctl --actor codebuddy` for search / prewrite / claim / closeout.
+- **Default: no SessionStart bridge** (unlike Claude). Only add a SessionStart hook if nested shells lose `CODEBUDDY_SESSION_ID` or inherit foreign host IDs.
+- Stop uses the Claude-compatible block protocol: `--protocol claude` emits `{"decision":"block","reason":...}` on failure.
+- On Windows, hooks run under Git Bash; invoke `python` with an absolute path to the runtime scripts.
+
+### CodeBuddy automatic closeout example
+
+Merge into existing hooks; do not overwrite unrelated entries:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_stop_hook.py --actor codebuddy --protocol claude --auto-closeout --timeout 300",
+            "timeout": 320
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_stop_hook.py --actor codebuddy --protocol claude --timeout 30",
+            "timeout": 40
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Keep a managed hooks fragment for Doctor comparison (`codebuddy_hooks_fragment` in toml). If the IDE/sandbox denies writes to `~/.codebuddy/settings.json`, merge via a writable path or temporarily adjust sandbox `denyWrite`.
+
+### Claude Code CLI automatic closeout example
 
 ```bash
 python3 scripts/agent_memory_stop_hook.py \

@@ -43,3 +43,11 @@ include_state_db = false
 include_env_file = false
 include_vector_db = false
 include_model_cache = false
+
+# Optional host hook health checks for agent_memory_doctor.py
+# [host]
+# codex_hooks_json = "~/.codex/hooks.json"
+# claude_settings_json = "~/.claude/settings.json"
+# claude_hooks_fragment = "~/.config/agent-memory/config/claude-hooks.json"
+# codebuddy_settings_json = "~/.codebuddy/settings.json"
+# codebuddy_hooks_fragment = "~/.config/agent-memory/config/codebuddy-hooks.json"

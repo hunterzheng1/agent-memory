@@ -719,6 +719,27 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
             claude_ok = bool(expected_hooks) and claude_settings.get("hooks") == expected_hooks
             add(checks, "claude_stop_hook", "pass" if claude_ok else "warn", "Claude Stop/SessionEnd hooks are configured." if claude_ok else "Claude hooks differ from the managed fragment.")
 
+        codebuddy_settings_path = configured_path("codebuddy_settings_json")
+        codebuddy_fragment_path = configured_path("codebuddy_hooks_fragment")
+        codebuddy_settings = read_json_object(codebuddy_settings_path) if codebuddy_settings_path else {}
+        codebuddy_expected = read_json_object(codebuddy_fragment_path) if codebuddy_fragment_path else {}
+        if codebuddy_settings_path or codebuddy_fragment_path:
+            hooks_blob = json.dumps(codebuddy_settings.get("hooks", {}), ensure_ascii=False)
+            fragment_ok = bool(codebuddy_expected) and codebuddy_settings.get("hooks") == codebuddy_expected
+            mention_ok = (
+                "agent_memory_stop_hook.py" in hooks_blob
+                and "--actor codebuddy" in hooks_blob
+            )
+            codebuddy_ok = fragment_ok or mention_ok
+            add(
+                checks,
+                "codebuddy_stop_hook",
+                "pass" if codebuddy_ok else "warn",
+                "CodeBuddy Stop/SessionEnd hooks are configured."
+                if codebuddy_ok
+                else "CodeBuddy hooks differ from the managed fragment or lack stop_hook --actor codebuddy.",
+            )
+
         cc_switch_path = configured_path("cc_switch_db")
         if cc_switch_path:
             cc_ok, cc_detail = cc_switch_hooks_match(cc_switch_path, expected_hooks)

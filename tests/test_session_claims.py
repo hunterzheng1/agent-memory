@@ -56,6 +56,38 @@ class ActorSessionIsolationTest(unittest.TestCase):
             self.assertEqual(session_value(actor="claude"), "")
             self.assertNotEqual(session_key({}, "claude"), "outer-codex-thread")
 
+    def test_codebuddy_reads_native_session_env(self) -> None:
+        env = {
+            "CODEBUDDY_SESSION_ID": "cb-session",
+            "CLAUDE_SESSION_ID": "claude-session",
+            "CODEX_THREAD_ID": "codex-thread",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(session_value(actor="codebuddy"), "cb-session")
+            self.assertEqual(session_key({}, "codebuddy"), "cb-session")
+
+    def test_codebuddy_never_falls_back_to_claude_or_codex(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"CLAUDE_SESSION_ID": "claude-session", "CODEX_THREAD_ID": "codex-thread"},
+            clear=True,
+        ):
+            self.assertEqual(session_value(actor="codebuddy"), "")
+            self.assertNotEqual(session_key({}, "codebuddy"), "claude-session")
+            self.assertNotEqual(session_key({}, "codebuddy"), "codex-thread")
+
+    def test_codebuddy_agent_memory_session_id_wins(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AGENT_MEMORY_SESSION_ID": "explicit-memory",
+                "CODEBUDDY_SESSION_ID": "cb-session",
+            },
+            clear=True,
+        ):
+            self.assertEqual(session_value(actor="codebuddy"), "explicit-memory")
+            self.assertEqual(session_key({}, "codebuddy"), "explicit-memory")
+
 
 class SessionClaimConcurrencyTest(unittest.TestCase):
     def test_two_sessions_commit_only_their_claimed_files(self) -> None:

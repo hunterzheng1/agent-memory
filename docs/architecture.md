@@ -35,7 +35,7 @@ SQLite 只负责索引，不负责成为唯一事实源。
 
 ## 3. Shared core and host adapters
 
-Claude Code 与 Codex 共用 Markdown、Git、SQLite、Zvec、closeout 和 audit。每个宿主只保留自己的规则入口与 Hook：Claude 使用 `CLAUDE.md` 导入共享 `AGENTS.md`，Codex 直接读取 `AGENTS.md`。
+Claude Code、Codex 与 CodeBuddy Code CLI 共用 Markdown、Git、SQLite、Zvec、closeout 和 audit。每个宿主只保留自己的规则入口与 Hook：Claude 使用 `CLAUDE.md` 导入共享 `AGENTS.md`，Codex 直接读取 `AGENTS.md`，CodeBuddy 使用 `CODEBUDDY.md` 并原生依赖 `CODEBUDDY_SESSION_ID`。
 
 普通事实默认 `agent_scope: shared`，这个字段决定可见范围；`agent_id` 只记录来源。`created_by` 和 `last_updated_by` 记录来源；closeout 日志另外记录 actor、trigger、session hash 和 run id。不要为每个 Agent 建独立 Git 基线或独立向量库。
 

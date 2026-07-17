@@ -37,8 +37,10 @@ GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(default_git_root())))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stop hook for Agent Memory shared by Claude Code and Codex.")
-    parser.add_argument("--actor", choices=("codex", "claude"), default="codex")
+    parser = argparse.ArgumentParser(
+        description="Stop hook for Agent Memory shared by Claude Code, Codex, and CodeBuddy."
+    )
+    parser.add_argument("--actor", choices=("codex", "claude", "codebuddy"), default="codex")
     parser.add_argument("--protocol", choices=("codex", "claude"), default="codex")
     parser.add_argument("--auto-closeout", action="store_true")
     parser.add_argument("--timeout", type=int, default=300)
@@ -70,6 +72,7 @@ def session_key(payload: dict[str, object], actor: str) -> str:
     keys = {
         "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
         "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
+        "codebuddy": ("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
     }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
     for key in keys:
         value = os.environ.get(key, "").strip()

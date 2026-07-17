@@ -1,6 +1,6 @@
-# Shared Claude Code and Agent Memory Vault Instructions
+# Shared Agent Memory Vault Instructions
 
-这是 Claude Code 与 Codex 可共用的本地长期记忆库。Markdown 是唯一正式事实源；两个 Agent 不各自维护第二套正式事实。
+这是 Codex、Claude Code 与 CodeBuddy 可共用的本地长期记忆库。Markdown 是唯一正式事实源；各 Agent 不各自维护第二套正式事实。
 
 读取顺序：
 
@@ -17,6 +17,7 @@
 ```bash
 python3 scripts/memoryctl --actor codex search "查询词" --limit 5
 python3 scripts/memoryctl --actor claude search "查询词" --limit 5
+python3 scripts/memoryctl --actor codebuddy search "查询词" --limit 5
 ```
 
 它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
@@ -26,7 +27,7 @@ python3 scripts/memoryctl --actor claude search "查询词" --limit 5
 正式写入前先做对账，避免重复记忆越写越多：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor <codex|claude|codebuddy> prewrite "准备写入的记忆摘要"
 ```
 
 对账动作只允许这 6 种：
@@ -41,16 +42,20 @@ python3 scripts/memoryctl --actor <codex|claude> prewrite "准备写入的记忆
 每次新建或修改正式记忆后，立即把文件认领到当前 Agent 会话：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude> claim --file "/absolute/path/to/memory.md"
+python3 scripts/memoryctl --actor <codex|claude|codebuddy> claim --file "/absolute/path/to/memory.md"
 ```
 
-Codex 会自动使用 `CODEX_THREAD_ID`；Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`，供后续 Bash 命令使用。Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除；成功 closeout 会另存文件内容 hash，只有匹配这份完成指纹的历史内容才视为已处理。
+- Codex 自动使用 `CODEX_THREAD_ID`。
+- Claude Code **必须**通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`。
+- CodeBuddy 原生透传 `CODEBUDDY_SESSION_ID`，**默认不需要** SessionStart 桥接。
+
+Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除；成功 closeout 会另存文件内容 hash，只有匹配这份完成指纹的历史内容才视为已处理。
 
 重要任务结束前执行 memory closeout：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude> closeout --dry-run
-python3 scripts/memoryctl --actor <codex|claude> closeout
+python3 scripts/memoryctl --actor <codex|claude|codebuddy> closeout --dry-run
+python3 scripts/memoryctl --actor <codex|claude|codebuddy> closeout
 ```
 
 在 Agent 会话内，`memoryctl closeout` 会按当前会话的认领账本执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本会话认领的文件。只有人工维护时才使用 `--global` 做全库收尾。
@@ -85,8 +90,8 @@ app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
 agent_scope: shared
-created_by: human | codex | claude
-last_updated_by: human | codex | claude
+created_by: human | codex | claude | codebuddy
+last_updated_by: human | codex | claude | codebuddy
 session_id: ""
 status: active
 sensitivity: normal

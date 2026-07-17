@@ -1,6 +1,6 @@
-# Agent Memory Vault: Shared Claude Code + Codex
+# Agent Memory Vault: Shared Claude Code + Codex + CodeBuddy
 
-这是一个可由 Claude Code 与 Codex 共用的长期记忆库模板。它把普通 Markdown 文件当作唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
+这是一个可由 Claude Code、Codex 与 CodeBuddy Code CLI 共用的长期记忆库模板。它把普通 Markdown 文件当作唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
@@ -8,7 +8,7 @@
 
 ## 它解决什么问题
 
-- 让 Claude Code 与 Codex 每次开始重要任务时，读取同一份相关长期记忆。
+- 让 Claude Code、Codex 与 CodeBuddy 每次开始重要任务时，读取同一份相关长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -38,7 +38,7 @@ scripts/
   bootstrap.py           # 从模板创建本地私有 vault
   agent_memory_index.py  # 全库 SQLite 索引和搜索
   agent_memory_search.py # 统一搜索入口：SQLite + 可选 Zvec + 手动 rg
-  agent_memory_claim.py  # 会话文件认领账本，防止 Claude/Codex 串提交
+  agent_memory_claim.py  # 会话文件认领账本，防止多宿主串提交
   agent_memory_closeout.py
                           # 任务结束收尾：检查、对账、刷新索引、审计、可选提交
   agent_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
@@ -47,10 +47,11 @@ scripts/
   agent_memory_doctor.py  # 全链路体检：Markdown/SQLite/FTS/Zvec/Git/自动化
   agent_memory_session_hook.py
                           # Claude SessionStart 会话 ID 桥接，防止与外层 Codex 串号
+                          # CodeBuddy 使用原生 CODEBUDDY_SESSION_ID（默认无需 SessionStart）
   agent_memory_stop_hook.py
-                          # 可选 Stop 自动 closeout + 到期 audit
+                          # 可选 Stop 自动 closeout + 到期 audit（Claude/Codex/CodeBuddy）
   install_runtime.py     # 把当前 Git 版本安装为可校验的本机 Runtime
-  memoryctl               # Claude/Codex 共用的平台中立命令入口
+  memoryctl               # Codex/Claude/CodeBuddy 共用的平台中立命令入口
   agent_memory_zvec_index.py
   agent_memory_retrieval_benchmark.py
   agent_memory_evolution.py
@@ -88,23 +89,25 @@ cp config/agent-memory.example.toml "$HOME/.config/agent-memory/config/agent-mem
   --config-root "$HOME/.config/agent-memory" --verify --json
 ```
 
-## Claude Code 与 Codex 共用
+## Claude Code、Codex 与 CodeBuddy 共用
 
-保持一个 Markdown vault、一个 Git 基线、一个 SQLite、一个 Zvec 和一个 audit 调度器。两个宿主只维护薄适配层：
+保持一个 Markdown vault、一个 Git 基线、一个 SQLite、一个 Zvec 和一个 audit 调度器。各宿主只维护薄适配层：
 
 - Codex 的 `AGENTS.md` 指向 vault 规则。
 - Claude Code 的 `CLAUDE.md` 使用 `@/absolute/path/to/AGENTS.md` 导入同一规则。
+- CodeBuddy 的 `CODEBUDDY.md` 指向同一 vault 规则；Bash 原生提供 `CODEBUDDY_SESSION_ID`。
 - Claude Code 原生 auto-memory 不要指向正式 vault；推荐关闭，或只把它当作非正式草稿层。
-- 两端通过 `memoryctl --actor codex|claude` 使用同一搜索和 closeout。
+- 通过 `memoryctl --actor codex|claude|codebuddy` 使用同一搜索和 closeout。
 
 ```bash
 python3 scripts/memoryctl --actor claude search "项目状态" --limit 5
+python3 scripts/memoryctl --actor codebuddy search "项目状态" --limit 5
 python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要"
 python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/changed-memory.md"
 python3 scripts/memoryctl --actor claude closeout
 ```
 
-写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容 hash，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex` 或 `claude`。
+写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容 hash，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude` 或 `codebuddy`。
 
 异常退出可能留下旧认领。Stop Hook 不会继续信任超过 24 小时的认领，Doctor 会把它列为警告。清理时先预览，再显式应用；这只把 SQLite 账本状态改为 `expired`，不会删除或改写 Markdown：
 

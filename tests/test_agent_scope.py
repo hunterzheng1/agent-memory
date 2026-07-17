@@ -53,6 +53,8 @@ class AgentScopeTests(unittest.TestCase):
             (workflow / "shared.md").write_text(memory("Shared", "codex"), encoding="utf-8")
             (workflow / "codex.md").write_text(memory("Codex", "codex", "codex"), encoding="utf-8")
             (workflow / "claude.md").write_text(memory("Claude", "claude", "claude"), encoding="utf-8")
+            (workflow / "codebuddy.md").write_text(memory("CodeBuddy", "codebuddy", "codebuddy"), encoding="utf-8")
+            (workflow / "junk-scope.md").write_text(memory("Junk", "codebuddy", "not-a-scope"), encoding="utf-8")
 
             state_db = root / "config" / "state.sqlite"
             env = os.environ.copy()
@@ -74,10 +76,14 @@ class AgentScopeTests(unittest.TestCase):
                 row = conn.execute(
                     "SELECT agent_id, agent_scope FROM memory_docs WHERE rel_path='工作流/shared.md'"
                 ).fetchone()
+                junk = conn.execute(
+                    "SELECT agent_scope FROM memory_docs WHERE rel_path='工作流/junk-scope.md'"
+                ).fetchone()
             self.assertEqual(row, ("codex", "shared"))
+            self.assertEqual(junk, ("shared",))
 
             visible: dict[str, set[str]] = {}
-            for actor in ("codex", "claude"):
+            for actor in ("codex", "claude", "codebuddy"):
                 result = run(
                     [
                         sys.executable,
@@ -95,10 +101,12 @@ class AgentScopeTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 payload = json.loads(result.stdout)
-                visible[actor] = {str(item["rel_path"]) for item in payload["results"]}
+                # Compare basenames so Windows console encoding cannot mojibake path assertions.
+                visible[actor] = {Path(str(item["rel_path"])).name for item in payload["results"]}
 
-            self.assertEqual(visible["codex"], {"工作流/shared.md", "工作流/codex.md"})
-            self.assertEqual(visible["claude"], {"工作流/shared.md", "工作流/claude.md"})
+            self.assertEqual(visible["codex"], {"shared.md", "codex.md", "junk-scope.md"})
+            self.assertEqual(visible["claude"], {"shared.md", "claude.md", "junk-scope.md"})
+            self.assertEqual(visible["codebuddy"], {"shared.md", "codebuddy.md", "junk-scope.md"})
 
 
 if __name__ == "__main__":
