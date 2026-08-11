@@ -23,6 +23,22 @@ run_sqlite_index_after_closeout = true
 run_audit_after_interval_days = 7
 commit_scoped_memory_files = true
 
+[write_intents]
+# Disabled by default for upgrades. Start with a few exact high-impact paths;
+# do not protect the entire vault or use broad wildcards as a first rollout.
+enabled = false
+enforcement = "off" # off | advisory | enforce
+ttl_hours = 24
+max_proposal_bytes = 2097152
+max_target_bytes = 8388608
+max_snapshot_bytes = 262144
+protected_paths = [
+  "AGENTS.md",
+  "用户记忆/偏好与边界.md",
+  "工作流/Agent记忆收尾决策规则.md",
+  "工作流/Agent记忆字段规范.md",
+]
+
 [semantic_retrieval]
 enabled = false
 vector_dir = "~/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768"

@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agent_memory_env import env_value, load_config, resolve_config_path
+from agent_memory_state import absolute_path, secure_sqlite_connect, sqlite_permission_report
 
 
 VERSION = "2.2"
@@ -22,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
 GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
 CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-STATE_DB = resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
+STATE_DB = absolute_path(resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))))
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 AUDIT_LOG = resolve_config_path(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
 CLOSEOUT_LOG = resolve_config_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
@@ -460,18 +461,29 @@ def repair_derived() -> list[dict[str, Any]]:
 def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     required = [
+        "agent_memory_claim.py",
         "agent_memory_index.py",
+        "agent_memory_intent.py",
         "agent_memory_search.py",
+        "agent_memory_safety.py",
         "agent_memory_closeout.py",
         "agent_memory_check.py",
         "agent_memory_audit.py",
         "agent_memory_audit_autorun.py",
         "agent_memory_zvec_index.py",
+        "agent_memory_policy_benchmark.py",
         "agent_memory_doctor.py",
+        "agent_memory_decision_outcomes.py",
+        "agent_memory_evolution.py",
+        "agent_memory_host.py",
+        "agent_memory_lock.py",
+        "agent_memory_paths.py",
+        "agent_memory_retrieval_benchmark.py",
         "agent_memory_session_hook.py",
+        "agent_memory_state.py",
         "agent_memory_stop_hook.py",
         "agent_memory_env.py",
-        "agent_memory_paths.py",
+        "bootstrap.py",
         "install_runtime.py",
         "memoryctl",
     ]
@@ -520,12 +532,43 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
                 "support_mismatched": support_mismatch,
             },
         )
-    if not STATE_DB.exists():
+    if not STATE_DB.exists() and not STATE_DB.is_symlink():
         add(checks, "state_db", "fail", "State database is missing.", {"path": str(STATE_DB)})
         return checks
-    conn = sqlite3.connect(STATE_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
+    permission_detail = sqlite_permission_report(STATE_DB)
+    permission_status = (
+        "fail"
+        if not permission_detail["ok"]
+        else "pass"
+        if permission_detail["mode_enforced"]
+        else "warn"
+    )
+    add(
+        checks,
+        "state_db_permissions",
+        permission_status,
+        (
+            "State database and SQLite sidecars are private (0600)."
+            if permission_status == "pass"
+            else "SQLite paths are regular and non-symlinked, but Windows ACL isolation was not verified."
+            if permission_status == "warn"
+            else "State database or SQLite sidecar permissions are unsafe."
+        ),
+        permission_detail,
+    )
+    unsafe_path_issue = any(
+        item.get("reason") in {"missing", "symlink", "not_regular"}
+        for item in permission_detail["issues"]
+    )
+    if unsafe_path_issue:
+        return checks
+    conn = secure_sqlite_connect(
+        STATE_DB,
+        create=False,
+        repair_permissions=False,
+        row_factory=sqlite3.Row,
+        pragmas=("PRAGMA busy_timeout=10000",),
+    )
     quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
     add(checks, "sqlite_integrity", "pass" if quick == "ok" else "fail", f"SQLite quick_check={quick}.")
     actual = sorted(VAULT_ROOT.rglob("*.md"))

@@ -11,13 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
 AGENT_ROOT = VAULT_ROOT / "agent"
-STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+STATE_DB = absolute_path(
+    resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+)
 
 CASE_CANDIDATE_DIR = AGENT_ROOT / "case-candidates"
 CASE_DIR = AGENT_ROOT / "cases"
@@ -152,11 +155,10 @@ def iter_agent_memories() -> list[AgentMemory]:
 
 
 def connect() -> sqlite3.Connection:
-    STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(STATE_DB)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return secure_sqlite_connect(
+        STATE_DB,
+        pragmas=("PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON"),
+    )
 
 
 def init_db(conn: sqlite3.Connection) -> None:

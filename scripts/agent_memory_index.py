@@ -13,12 +13,16 @@ from pathlib import Path
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_host import scope_names
+import agent_memory_intent
+from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VAULT_ROOT = REPO_ROOT / "templates" / "vault"
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
-STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+STATE_DB = absolute_path(
+    resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+)
 DEFAULT_USER_ID = env_value("USER_ID", "demo-user")
 DEFAULT_AGENT_ID = env_value("AGENT_ID", "shared")
 DEFAULT_APP_ID = env_value("APP_ID", "agent-memory")
@@ -44,6 +48,7 @@ class MemoryDoc:
     sensitivity: str
     verified_at: str
     verified_at_source: str
+    valid_until: str
     review_after_days: int
     mtime: float
     size_bytes: int
@@ -303,6 +308,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),
             verified_at=verified_at,
             verified_at_source=verified_at_source,
+            valid_until=as_text(meta.get("valid_until")),
             review_after_days=infer_review_after_days(path, title, memory_type, status, meta),
             mtime=stat.st_mtime,
             size_bytes=stat.st_size,
@@ -322,12 +328,14 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
 
 
 def connect() -> sqlite3.Connection:
-    STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(STATE_DB)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    return secure_sqlite_connect(
+        STATE_DB,
+        pragmas=(
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA busy_timeout=10000",
+        ),
+    )
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -361,6 +369,7 @@ def init_db(conn: sqlite3.Connection) -> None:
           sensitivity TEXT DEFAULT 'normal',
           verified_at TEXT,
           verified_at_source TEXT DEFAULT 'mtime_fallback',
+          valid_until TEXT DEFAULT '',
           review_after_days INTEGER DEFAULT 180,
           mtime REAL NOT NULL,
           size_bytes INTEGER NOT NULL,
@@ -407,6 +416,23 @@ def init_db(conn: sqlite3.Connection) -> None:
           created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS memory_safety_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL UNIQUE,
+          actor TEXT NOT NULL,
+          session_hash TEXT NOT NULL DEFAULT '',
+          trigger TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          source_class TEXT NOT NULL,
+          knowledge_kind TEXT NOT NULL,
+          asserted_by TEXT NOT NULL DEFAULT '',
+          input_sha256 TEXT NOT NULL,
+          input_length INTEGER NOT NULL,
+          evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS memory_session_claims (
           session_hash TEXT NOT NULL,
           actor TEXT NOT NULL,
@@ -416,6 +442,7 @@ def init_db(conn: sqlite3.Connection) -> None:
           claimed_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           completed_at TEXT,
+          intent_id TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (session_hash, path)
         );
 
@@ -435,6 +462,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "memory_docs", "verified_at_source", "TEXT DEFAULT 'mtime_fallback'")
+    ensure_column(conn, "memory_docs", "valid_until", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_docs", "review_after_days", "INTEGER DEFAULT 180")
     ensure_column(conn, "memory_docs", "agent_scope", "TEXT DEFAULT 'shared'")
     ensure_column(conn, "memory_docs", "session_id", "TEXT DEFAULT ''")
@@ -442,6 +470,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "memory_search_log", "query_length", "INTEGER")
     ensure_column(conn, "memory_search_log", "sources", "TEXT")
     ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
+    ensure_column(conn, "memory_session_claims", "intent_id", "TEXT NOT NULL DEFAULT ''")
+    agent_memory_intent.ensure_schema(conn)
     # Older databases do not have these columns until the migration above runs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_agent_scope ON memory_docs(agent_scope)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_session ON memory_docs(session_id)")
@@ -449,7 +479,11 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
         "ON memory_session_claims(status, actor, session_hash)"
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "5"))
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
+        "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
+    )
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "7"))
     conn.commit()
 
 
@@ -465,10 +499,10 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
         INSERT INTO memory_docs (
           path, rel_path, sha256, title, memory_type, track, project_id, app_id,
           user_id, agent_id, agent_scope, session_id, status, sensitivity, verified_at, verified_at_source,
-          review_after_days, mtime, size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
+          valid_until, review_after_days, mtime, size_bytes, line_count, summary, next_hint, stale_info, has_open_loop,
           open_loop_count, indexed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
           rel_path=excluded.rel_path,
           sha256=excluded.sha256,
@@ -485,6 +519,7 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
           sensitivity=excluded.sensitivity,
           verified_at=excluded.verified_at,
           verified_at_source=excluded.verified_at_source,
+          valid_until=excluded.valid_until,
           review_after_days=excluded.review_after_days,
           mtime=excluded.mtime,
           size_bytes=excluded.size_bytes,
@@ -513,6 +548,7 @@ def upsert_doc(conn: sqlite3.Connection, doc: MemoryDoc) -> None:
             doc.sensitivity,
             doc.verified_at,
             doc.verified_at_source,
+            doc.valid_until,
             doc.review_after_days,
             doc.mtime,
             doc.size_bytes,

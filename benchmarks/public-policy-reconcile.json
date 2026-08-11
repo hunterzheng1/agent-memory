@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "name": "agent-memory-public-reconcile-sample",
+  "privacy": "public_sample",
+  "kind": "reconcile",
+  "description": "Safe fake examples only. Production replay fixtures stay outside the repository.",
+  "cases": [
+    {
+      "id": "sample-add",
+      "input": "Record a new fake preference for compact sample reports.",
+      "source_class": "user_direct",
+      "knowledge_kind": "preference",
+      "rows": [],
+      "expected": "ADD"
+    },
+    {
+      "id": "sample-update",
+      "input": "The sample runtime now uses the revised local index.",
+      "source_class": "local_verified",
+      "knowledge_kind": "fact",
+      "evidence_ref": "fixture://runtime-check",
+      "rows": [
+        {
+          "title": "Earlier sample runtime index",
+          "rel_path": "项目/example-runtime.md",
+          "summary": "A harmless fake record.",
+          "source_details": {"zvec_raw_distance": 0.2}
+        }
+      ],
+      "expected": "UPDATE"
+    },
+    {
+      "id": "sample-merge-required",
+      "input": "The sample workflow has an overlapping but not identical boundary.",
+      "source_class": "user_direct",
+      "knowledge_kind": "rule",
+      "rows": [
+        {
+          "title": "Related sample workflow",
+          "rel_path": "工作流/example-boundary.md",
+          "summary": "Another harmless fake record.",
+          "source_details": {"zvec_raw_distance": 0.45}
+        }
+      ],
+      "expected": "MERGE_REQUIRED"
+    },
+    {
+      "id": "sample-noop",
+      "input": "Use one canonical fake vault for durable sample memory.",
+      "source_class": "manual_edit",
+      "knowledge_kind": "fact",
+      "rows": [
+        {
+          "title": "Use one canonical fake vault for durable sample memory.",
+          "rel_path": "工作流/example-canonical-vault.md",
+          "summary": "Use one canonical fake vault for durable sample memory."
+        }
+      ],
+      "expected": "NOOP"
+    },
+    {
+      "id": "sample-ask-user",
+      "input": "An unattributed sample claims the default policy changed.",
+      "source_class": "unknown",
+      "knowledge_kind": "fact",
+      "rows": [],
+      "expected": "ASK_USER"
+    },
+    {
+      "id": "sample-mark-outdated",
+      "input": "The older fake runtime decision has passed its explicit validity window.",
+      "source_class": "local_verified",
+      "knowledge_kind": "fact",
+      "evidence_ref": "fixture://expiry-review",
+      "current_status": "active",
+      "valid_until": "2025-12-31",
+      "as_of": "2026-01-02",
+      "explicit_action_context": "expiry_review",
+      "rows": [
+        {
+          "title": "Older fake runtime decision",
+          "rel_path": "决策/example-old-runtime.md",
+          "summary": "A harmless fake decision whose validity window ended."
+        }
+      ],
+      "expected": "MARK_OUTDATED"
+    }
+  ]
+}

@@ -130,6 +130,31 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(warnings, [])
 
+    def test_project_track_infers_current_project_for_postwrite_search(self) -> None:
+        project_note = self.vault / "项目" / "project-a.md"
+        project_note.write_text(
+            "---\n"
+            "memory_type: project\n"
+            "track: project\n"
+            "project_id: project-a\n"
+            "status: active\n"
+            "---\n\n"
+            "# Project A\n\nA scoped deployment rule.\n",
+            encoding="utf-8",
+        )
+        entry = self.module.GitEntry(
+            status="A",
+            repo_path="AgentMemory/项目/project-a.md",
+            path=project_note,
+        )
+        args = Namespace(reconcile_all=False, limit=8, no_zvec=True, current_project="")
+        with mock.patch.object(self.module, "search_memory", return_value=([], [])) as search:
+            findings, warnings = self.module.postwrite_reconcile([entry], args)
+
+        self.assertEqual(findings, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(search.call_args.kwargs["current_project"], "project-a")
+
     def test_frontmatter_boilerplate_is_not_used_as_fallback_summary(self) -> None:
         note = self.vault / "项目" / "new-project.md"
         note.write_text(
@@ -209,6 +234,122 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
 
         note.write_text("# Observed\n\nChanged.\n", encoding="utf-8")
         self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+
+
+class CloseoutCommitSnapshotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.module = load_closeout()
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name).resolve()
+        self.vault = self.root / "Agent记忆"
+        self.vault.mkdir()
+        self.note = self.vault / "AGENTS.md"
+        self.note.write_text("# Rules\n\nOriginal.\n", encoding="utf-8")
+        git(self.root, "init", "-q")
+        git(self.root, "config", "user.name", "Snapshot Test")
+        git(self.root, "config", "user.email", "snapshot@example.invalid")
+        git(self.root, "add", "Agent记忆/AGENTS.md")
+        git(self.root, "commit", "-qm", "baseline")
+        self.baseline = git(self.root, "rev-parse", "HEAD")
+        self.module.REPO_ROOT = self.root
+        self.module.VAULT_ROOT = self.vault
+        self.module.CONFIG_ROOT = self.root / "runtime"
+        self.args = Namespace(commit=True, dry_run=False, message="snapshot commit", actor="codex")
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_validated_content_changed_before_snapshot_is_not_committed(self) -> None:
+        expected_content = b"# Rules\n\nApproved.\n"
+        expected_hash = hashlib.sha256(expected_content).hexdigest()
+        self.note.write_bytes(b"# Rules\n\nRaced.\n")
+        result = self.module.commit_files(
+            [self.note],
+            self.args,
+            expected_raw_sha256={self.note: expected_hash},
+            expected_head=self.baseline,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "validated_snapshot_verify")
+        self.assertEqual(git(self.root, "rev-parse", "HEAD"), self.baseline)
+
+    def test_worktree_race_after_snapshot_cannot_change_commit_blob(self) -> None:
+        approved = b"# Rules\n\nApproved.\n"
+        raced = "# Rules\n\nRaced after snapshot.\n"
+        self.note.write_bytes(approved)
+        expected_hash = hashlib.sha256(approved).hexdigest()
+        original_builder = self.module._build_isolated_commit
+
+        def race_then_commit(snapshots, *, expected_head, message):
+            self.note.write_text(raced, encoding="utf-8")
+            return original_builder(snapshots, expected_head=expected_head, message=message)
+
+        with mock.patch.object(self.module, "_build_isolated_commit", side_effect=race_then_commit):
+            result = self.module.commit_files(
+                [self.note],
+                self.args,
+                expected_raw_sha256={self.note: expected_hash},
+                expected_head=self.baseline,
+            )
+        self.assertTrue(result["ok"], result)
+        committed = git(self.root, "show", f"{result['commit']}:Agent记忆/AGENTS.md")
+        self.assertEqual(committed, approved.decode("utf-8").strip())
+        self.assertEqual(self.note.read_text(encoding="utf-8"), raced)
+
+    def test_full_closeout_rejects_ordinary_file_changed_after_check(self) -> None:
+        checked = "# Rules\n\nChecked ordinary content.\n"
+        raced = "# Rules\n\nChanged after check.\n"
+        self.note.write_text(checked, encoding="utf-8")
+        self.module.STATE_DB = self.root / "runtime" / "state.sqlite"
+
+        argv = [
+            "agent_memory_closeout.py",
+            "--commit",
+            "--commit-warnings",
+            "--skip-zvec",
+            "--skip-audit",
+            "--no-zvec",
+            "--json",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = self.module.parse_args()
+
+        def check_then_race(_files, _args):
+            self.note.write_text(raced, encoding="utf-8")
+            return {"ok": True, "advisories": [], "detail": "ok"}
+
+        gate = {
+            "ok": True,
+            "enabled": True,
+            "requested_mode": "enforce",
+            "mode": "enforce",
+            "blocking": False,
+            "matched": [],
+            "violations": [],
+        }
+        ok_step = {"ok": True, "skipped": True, "detail": "test"}
+        with (
+            mock.patch.object(self.module, "run_check", side_effect=check_then_race),
+            mock.patch.object(self.module, "postwrite_reconcile", return_value=([], [])),
+            mock.patch.object(self.module, "run_index", return_value=ok_step),
+            mock.patch.object(self.module, "run_zvec", return_value=ok_step),
+            mock.patch.object(self.module, "run_agent_evolution", return_value=ok_step),
+            mock.patch.object(self.module, "run_audit_autorun", return_value=ok_step),
+            mock.patch.object(self.module, "append_log"),
+            mock.patch.object(
+                self.module.write_intent,
+                "enforce_protected_changes",
+                return_value=gate,
+            ),
+        ):
+            payload = self.module.run_closeout(args)
+
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(
+            payload["steps"]["commit"]["detail"],
+            "CONTENT_CHANGED_AFTER_CHECK",
+        )
+        self.assertEqual(git(self.root, "rev-parse", "HEAD"), self.baseline)
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,12 +13,19 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-STATE_DB = resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
-AUDIT_DB = resolve_config_path(env_value("AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite")))
-INVARIANTS_PATH = resolve_config_path(env_value("INVARIANTS", str(CONFIG_ROOT / "config" / "system-invariants.json")))
+STATE_DB = absolute_path(
+    resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
+)
+AUDIT_DB = absolute_path(
+    resolve_config_path(env_value("AUDIT_DB", str(CONFIG_ROOT / "audit_decisions.sqlite")))
+)
+INVARIANTS_PATH = resolve_config_path(
+    env_value("INVARIANTS", str(CONFIG_ROOT / "config" / "system-invariants.json"))
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
 
@@ -59,17 +66,20 @@ def stable_id(kind: str, *parts: object) -> str:
 
 
 def connect_state() -> sqlite3.Connection:
-    conn = sqlite3.connect(STATE_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    return secure_sqlite_connect(
+        STATE_DB,
+        create=False,
+        row_factory=sqlite3.Row,
+        pragmas=("PRAGMA busy_timeout=10000",),
+    )
 
 
 def connect_audit() -> sqlite3.Connection:
-    AUDIT_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(AUDIT_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
+    conn = secure_sqlite_connect(
+        AUDIT_DB,
+        row_factory=sqlite3.Row,
+        pragmas=("PRAGMA busy_timeout=10000",),
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS audit_decisions (

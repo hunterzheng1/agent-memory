@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -88,6 +91,43 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertEqual(json.loads(second.stdout)["changed"], [])
             self.assertEqual(local_adapter.read_text(encoding="utf-8"), "LOCAL = True\n")
+
+    def test_install_repairs_config_and_existing_sqlite_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            config_dir = root / "config"
+            config_dir.mkdir()
+            config_file = config_dir / "agent-memory.toml"
+            config_file.write_text("memory_root = '/tmp/example'\n", encoding="utf-8")
+            state_db = root / "state.sqlite"
+            connection = sqlite3.connect(state_db)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE sample(value TEXT)")
+            connection.execute("INSERT INTO sample VALUES ('ok')")
+            connection.commit()
+            for path in (root, config_file, state_db, Path(f"{state_db}-wal"), Path(f"{state_db}-shm")):
+                path.chmod(0o755 if path == root else 0o644)
+
+            installed = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            payload = json.loads(installed.stdout)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(config_file.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(state_db.stat().st_mode), 0o600)
+                for suffix in ("-wal", "-shm"):
+                    self.assertEqual(stat.S_IMODE(Path(f"{state_db}{suffix}").stat().st_mode), 0o600)
+            else:
+                self.assertEqual(payload["permissions"]["permission_model"], "windows_acl_unverified")
+                self.assertIn("windows_acl_unverified", payload["permissions"]["warnings"])
+            connection.close()
 
 
 if __name__ == "__main__":

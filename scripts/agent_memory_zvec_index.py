@@ -19,15 +19,20 @@ from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_lock import try_lock, unlock
+from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+STATE_DB = absolute_path(
+    resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+)
 DEFAULT_COLLECTION_PATH = resolve_config_path(
         env_value("VECTOR_DIR", "$HOME/.config/agent-memory/zvec/memory_chunks_embeddinggemma_768")
     )
-DEFAULT_LOCK_PATH = resolve_config_path(env_value("ZVEC_LOCK", "$HOME/.config/agent-memory/locks/zvec.lock"))
+DEFAULT_LOCK_PATH = resolve_config_path(
+    env_value("ZVEC_LOCK", "$HOME/.config/agent-memory/locks/zvec.lock")
+)
 DEFAULT_MODEL = env_value("EMBEDDING_MODEL", "google/embeddinggemma-300m")
 DEFAULT_EMBEDDING_DIM = int(env_value("EMBEDDING_DIM", "768"))
 DEFAULT_DEVICE = env_value("EMBEDDING_DEVICE", "cpu")
@@ -267,13 +272,15 @@ def build_chunks(sqlite_index: Any, doc: IndexedDoc) -> list[Chunk]:
 
 
 def connect(state_db: Path = STATE_DB) -> sqlite3.Connection:
-    state_db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(state_db)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    return secure_sqlite_connect(
+        state_db,
+        row_factory=sqlite3.Row,
+        pragmas=(
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA busy_timeout=10000",
+        ),
+    )
 
 
 def ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -773,7 +780,9 @@ def vector_rows(conn: sqlite3.Connection, scored_ids: list[tuple[str, float]], q
             {
                 "chunk_id": row["chunk_id"],
                 "score": rank_score,
+                "rank_distance": rank_score,
                 "vector_score": vector_score,
+                "raw_distance": vector_score,
                 "path": row["path"],
                 "rel_path": row["rel_path"],
                 "title": row["title"],

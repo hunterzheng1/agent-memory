@@ -25,6 +25,9 @@ COMMANDS = {
     "index": SCRIPT_ROOT / "agent_memory_index.py",
     "zvec": SCRIPT_ROOT / "agent_memory_zvec_index.py",
     "check": SCRIPT_ROOT / "agent_memory_check.py",
+    "decision-outcomes": SCRIPT_ROOT / "agent_memory_decision_outcomes.py",
+    "policy-benchmark": SCRIPT_ROOT / "agent_memory_policy_benchmark.py",
+    "intent": SCRIPT_ROOT / "agent_memory_intent.py",
 }
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +88,15 @@ def main() -> int:
                 action_options.append(item)
             index += 1
         forwarded = ["--actor", args.actor, *global_options, action, *action_options]
+    elif args.command == "intent":
+        current_session = host.session_id
+        global_options = ["--actor", args.actor]
+        if current_session and "--session-id" not in forwarded:
+            global_options.extend(["--session-id", current_session])
+        if "--json" in forwarded:
+            forwarded = [item for item in forwarded if item != "--json"]
+            global_options.append("--json")
+        forwarded = [*global_options, *forwarded]
     if command_name == "closeout":
         global_mode = "--global" in forwarded
         forwarded = [item for item in forwarded if item != "--global"]

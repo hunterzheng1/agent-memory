@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -18,8 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_host import actor_names
 from agent_memory_lock import try_lock, unlock
 from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
+from agent_memory_safety import KNOWLEDGE_KINDS, SOURCE_CLASSES, assess_source, record_assessment
+from agent_memory_state import secure_append_text, secure_sqlite_connect
+import agent_memory_intent as write_intent
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -28,7 +33,9 @@ DEFAULT_VAULT_ROOT = TEMPLATE_REPO_ROOT / "templates" / "vault"
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
 CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
 STATE_DB = resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
-LOG_PATH = resolve_config_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
+LOG_PATH = resolve_config_path(
+    env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))
+)
 LOCK_PATH = CONFIG_ROOT / "locks" / "closeout.lock"
 
 
@@ -60,14 +67,6 @@ RECONCILE_ACTIONS = {
     "MERGE_REQUIRED",
     "ASK_USER",
 }
-ASK_USER_PATTERNS = [
-    re.compile(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}"),
-    re.compile(r"(?i)gh[pousr]_[A-Za-z0-9]{30,}"),
-    re.compile(
-        r"(?im)^\s*(?:api[_-]?key|access[_-]?token|secret|password|cookie|credential)\s*[:=]\s*"
-        r"[\"']?(?!redacted\b|example\b|placeholder\b|your[_-]|<)[A-Za-z0-9_./+=-]{20,}"
-    ),
-]
 NONCURRENT_RECONCILE_STATUSES = {"archived", "outdated", "superseded", "deleted"}
 NONFACT_RECONCILE_TYPES = {"directory_index", "routing", "template", "open_loop"}
 
@@ -102,6 +101,15 @@ class GitEntry:
         if len(relative.parts) == 1:
             return relative.name in TOP_LEVEL_MEMORY_FILES
         return bool(relative.parts) and relative.parts[0] in MEMORY_TOP_LEVELS
+
+
+@dataclass(frozen=True)
+class CommitSnapshot:
+    path: Path
+    repo_path: str
+    raw_sha256: str
+    blob_oid: str
+    mode: str
 
 
 def utc_now() -> str:
@@ -443,6 +451,16 @@ def is_current_reconcile_target(path: Path) -> bool:
     return not bool(statuses & NONCURRENT_RECONCILE_STATUSES)
 
 
+def project_scope_for_file(path: Path, explicit_project: str = "") -> str:
+    if explicit_project.strip():
+        return explicit_project.strip()
+    tracks = {value.casefold() for value in frontmatter_list(path, "track")}
+    if "project" not in tracks:
+        return ""
+    project_ids = sorted(frontmatter_list(path, "project_id"))
+    return project_ids[0] if len(project_ids) == 1 else ""
+
+
 def tokenize(text: str) -> set[str]:
     tokens: set[str] = set()
     for word in re.findall(r"[A-Za-z0-9_]{2,}", text.lower()):
@@ -471,10 +489,20 @@ def coverage(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens)
 
 
-def search_memory(query: str, limit: int = 8, no_zvec: bool = True) -> tuple[list[dict[str, Any]], list[str]]:
+def search_memory(
+    query: str,
+    limit: int = 8,
+    no_zvec: bool = True,
+    current_project: str = "",
+    read_only: bool = False,
+) -> tuple[list[dict[str, Any]], list[str]]:
     command = [PYTHON, str(SEARCH_SCRIPT), query, "--limit", str(limit), "--json"]
     if no_zvec:
         command.append("--no-zvec")
+    if current_project.strip():
+        command.extend(["--current-project", current_project.strip()])
+    if read_only:
+        command.append("--no-log")
     result = run_command(command, timeout=80, env=command_env_offline())
     if not result["ok"]:
         return [], [f"search failed: {str(result['stderr']).strip() or result['returncode']}"]
@@ -492,16 +520,7 @@ def search_memory(query: str, limit: int = 8, no_zvec: bool = True) -> tuple[lis
 
 
 def semantic_distance(row: dict[str, Any]) -> float | None:
-    details = row.get("source_details")
-    if not isinstance(details, dict):
-        return None
-    try:
-        return float(details.get("zvec_score"))
-    except (TypeError, ValueError):
-        return None
-
-
-def raw_semantic_distance(row: dict[str, Any]) -> float | None:
+    """Return raw semantic distance only; adjusted rank scores are never evidence."""
     details = row.get("source_details")
     if not isinstance(details, dict):
         return None
@@ -511,9 +530,25 @@ def raw_semantic_distance(row: dict[str, Any]) -> float | None:
         return None
 
 
+def raw_semantic_distance(row: dict[str, Any]) -> float | None:
+    return semantic_distance(row)
+
+
+def rank_semantic_score(row: dict[str, Any]) -> float | None:
+    details = row.get("source_details")
+    if not isinstance(details, dict):
+        return None
+    for key in ("zvec_rank_distance", "zvec_rank_score", "zvec_score"):
+        try:
+            value = details.get(key)
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
-    if any(pattern.search(text) for pattern in ASK_USER_PATTERNS):
-        return "ASK_USER", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
     if not rows:
         return "ADD", None, {"similarity": 0.0, "coverage": 0.0, "semantic_distance": None, "raw_semantic_distance": None}
     candidates: list[tuple[int, float, float, float, str, dict[str, Any]]] = []
@@ -525,7 +560,7 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
         )
         similarity = jaccard(text, comparison)
         row_coverage = coverage(text, comparison)
-        distance = semantic_distance(row)
+        distance = raw_semantic_distance(row)
         if similarity >= 0.80 or row_coverage >= 0.90:
             action = "NOOP"
         elif similarity >= 0.45 or row_coverage >= 0.55 or (distance is not None and distance <= 0.32):
@@ -543,16 +578,114 @@ def prewrite_recommendation(text: str, rows: list[dict[str, Any]]) -> tuple[str,
 
 
 def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
-    rows, warnings = search_memory(args.prewrite, limit=args.limit, no_zvec=args.no_zvec)
+    run_id = uuid.uuid4().hex
+    hashed_session = session_hash(args.session_id)
+    safety = assess_source(
+        args.prewrite,
+        source_class=args.source_class,
+        knowledge_kind=args.knowledge_kind,
+        asserted_by=args.asserted_by or args.actor,
+        evidence_ref=args.evidence_ref,
+    )
+    try:
+        safety_audit_id = record_assessment(
+            STATE_DB,
+            safety,
+            run_id=run_id,
+            actor=args.actor,
+            session_hash=hashed_session,
+            trigger=args.trigger,
+        )
+        safety["audit_recorded"] = True
+        safety["audit_id"] = safety_audit_id
+    except (OSError, sqlite3.Error) as exc:
+        safety["audit_recorded"] = False
+        safety["audit_error"] = type(exc).__name__
+        safety["decision"] = "BLOCK"
+        safety["reason_code"] = "SAFETY_AUDIT_UNAVAILABLE"
+        safety["can_reconcile"] = False
+        safety["can_create_intent"] = False
+    if safety["decision"] != "ALLOW":
+        return {
+            "time": utc_now(),
+            "run_id": run_id,
+            "actor": args.actor,
+            "trigger": args.trigger,
+            "session_hash": hashed_session,
+            "mode": "prewrite",
+            "input_sha256": safety["input_sha256"],
+            "input_length": safety["input_length"],
+            "safety": safety,
+            "reconcile": {"status": "skipped", "reason_code": safety["reason_code"]},
+            "recommended_action": "ASK_USER" if safety["decision"] == "ASK_USER" else "BLOCK",
+            "recommended_target": None,
+            "recommendation_metrics": {
+                "similarity": 0.0,
+                "coverage": 0.0,
+                "semantic_distance": None,
+                "raw_semantic_distance": None,
+            },
+            "allowed_actions": sorted(RECONCILE_ACTIONS),
+            "candidates": [],
+            "warnings": [safety["reason_code"]],
+            "status": "warning" if safety["decision"] == "ASK_USER" else "blocked",
+        }
+    inferred_project = ""
+    if getattr(args, "proposal_file", ""):
+        inferred_project = project_scope_for_file(
+            Path(args.proposal_file).expanduser(),
+            getattr(args, "current_project", ""),
+        )
+    rows, warnings = search_memory(
+        args.prewrite,
+        limit=args.limit,
+        no_zvec=args.no_zvec,
+        current_project=inferred_project or getattr(args, "current_project", ""),
+    )
     action, target, metrics = prewrite_recommendation(args.prewrite, rows)
+    intent_payload: dict[str, Any] | None = None
+    intent_error = ""
+    if args.create_intent:
+        if action == "NOOP":
+            warnings.append("NOOP_REQUIRES_NO_WRITE_INTENT")
+        elif not args.target_file or not args.proposal_file:
+            intent_error = "INTENT_TARGET_AND_PROPOSAL_REQUIRED"
+        elif not args.session_id:
+            intent_error = "INTENT_SESSION_REQUIRED"
+        else:
+            try:
+                intent_payload = write_intent.create_intent(
+                    actor=args.actor,
+                    raw_session_id=args.session_id,
+                    target=args.target_file,
+                    proposal_file=args.proposal_file,
+                    approval_required=action in {"ASK_USER", "MERGE_REQUIRED"},
+                    source_class=args.source_class,
+                    knowledge_kind=args.knowledge_kind,
+                    asserted_by=args.asserted_by or args.actor,
+                    evidence_ref_sha256=str(safety.get("evidence_ref_sha256", "")),
+                    reconcile_action=action,
+                )
+            except (write_intent.IntentError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+                intent_error = str(getattr(exc, "reason_code", "INTENT_CREATE_FAILED"))
+                warnings.append(intent_error)
     return {
         "time": utc_now(),
-        "run_id": uuid.uuid4().hex,
+        "run_id": run_id,
         "actor": args.actor,
         "trigger": args.trigger,
-        "session_hash": session_hash(args.session_id),
+        "session_hash": hashed_session,
         "mode": "prewrite",
-        "input_preview": args.prewrite[:500],
+        "input_sha256": safety["input_sha256"],
+        "input_length": safety["input_length"],
+        "safety": safety,
+        "reconcile": {
+            "status": "completed",
+            "recommended_action": action,
+            "recommended_target": target.get("rel_path", "") if isinstance(target, dict) else "",
+        },
+        "write_intent": intent_payload,
+        "write_intent_error": intent_error,
         "recommended_action": action,
         "recommended_target": target,
         "recommendation_metrics": {
@@ -564,7 +697,7 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
         "allowed_actions": sorted(RECONCILE_ACTIONS),
         "candidates": rows,
         "warnings": warnings,
-        "status": "warning" if action in {"ASK_USER", "MERGE_REQUIRED"} else "ok",
+        "status": "blocked" if intent_error else ("warning" if action in {"ASK_USER", "MERGE_REQUIRED"} else "ok"),
     }
 
 
@@ -584,7 +717,16 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
         query = reconcile_query_for_file(entry.path)
         if not query:
             continue
-        rows, search_warnings = search_memory(query, limit=max(args.limit, 8), no_zvec=args.no_zvec)
+        rows, search_warnings = search_memory(
+            query,
+            limit=max(args.limit, 8),
+            no_zvec=args.no_zvec,
+            current_project=project_scope_for_file(
+                entry.path,
+                getattr(args, "current_project", ""),
+            ),
+            read_only=bool(getattr(args, "dry_run", False)),
+        )
         warnings.extend(search_warnings)
         source_text = query
         candidates: list[dict[str, Any]] = []
@@ -603,11 +745,7 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
             row_coverage = coverage(source_text, comparison)
             distance = semantic_distance(row)
             raw_distance = raw_semantic_distance(row)
-            semantic_duplicate = (
-                raw_distance <= args.semantic_merge_threshold
-                if raw_distance is not None
-                else distance is not None and distance <= args.semantic_merge_threshold
-            )
+            semantic_duplicate = raw_distance is not None and raw_distance <= args.semantic_merge_threshold
             if similarity >= args.merge_threshold or row_coverage >= args.merge_coverage_threshold or semantic_duplicate:
                 candidates.append(
                     {
@@ -723,56 +861,267 @@ def run_audit_autorun(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def commit_files(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
-    if not args.commit or args.dry_run:
-        return {"ok": True, "skipped": True, "detail": "commit_not_requested"}
-    repo_paths: list[str] = []
-    for path in files:
+def _hash_object_bytes(data: bytes) -> tuple[bool, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "hash-object", "-w", "--stdin"],
+            input=data,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, ""
+    object_id = completed.stdout.decode("ascii", errors="ignore").strip().lower()
+    return completed.returncode == 0 and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)), object_id
+
+
+def bind_checked_file_hashes(files: list[Path]) -> tuple[dict[Path, str], dict[str, str]]:
+    """Bind each closeout file to raw and canonical hashes from one read."""
+
+    bound: dict[Path, str] = {}
+    canonical_bound: dict[str, str] = {}
+    for raw_path in files:
+        candidate = raw_path.expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if candidate.is_symlink():
+            raise OSError(f"symlink target rejected: {candidate}")
+        path = candidate.resolve()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OSError(f"not a regular file: {path}")
+            digest = hashlib.sha256()
+            payload = bytearray()
+            while True:
+                block = os.read(descriptor, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                payload.extend(block)
+        finally:
+            os.close(descriptor)
+        bound[path] = digest.hexdigest()
+        canonical_bound[os.path.normcase(str(path))] = write_intent.content_hashes(
+            bytes(payload)
+        ).canonical_sha256
+    return bound, canonical_bound
+
+
+def _snapshot_commit_files(
+    files: list[Path],
+    expected_raw_sha256: dict[Path, str],
+) -> tuple[list[CommitSnapshot], dict[str, Any] | None]:
+    expected = {path.expanduser().resolve(): digest for path, digest in expected_raw_sha256.items()}
+    snapshots: list[CommitSnapshot] = []
+    seen: set[str] = set()
+    for raw_path in files:
+        candidate = raw_path.expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        if candidate.is_symlink():
+            return [], {"ok": False, "stage": "snapshot", "detail": "symlink_target_rejected"}
+        path = candidate.resolve()
         if not path.exists():
             continue
         try:
-            repo_paths.append(str(path.relative_to(REPO_ROOT)))
+            repo_path = path.relative_to(REPO_ROOT).as_posix()
         except ValueError:
             continue
-    if not repo_paths:
-        return {"ok": True, "skipped": True, "detail": "no_existing_files_to_commit"}
+        if repo_path in seen:
+            continue
+        seen.add(repo_path)
+        try:
+            data = path.read_bytes()
+            executable = bool(path.stat().st_mode & 0o100)
+        except OSError:
+            return [], {"ok": False, "stage": "snapshot", "detail": "file_read_failed", "file": repo_path}
+        raw_sha256 = hashlib.sha256(data).hexdigest()
+        expected_digest = str(expected.get(path, "")).strip().lower()
+        if expected_digest and raw_sha256 != expected_digest:
+            return [], {
+                "ok": False,
+                "stage": "validated_snapshot_verify",
+                "detail": "CONTENT_CHANGED_AFTER_CHECK",
+                "file": repo_path,
+            }
+        object_ok, blob_oid = _hash_object_bytes(data)
+        if not object_ok:
+            return [], {"ok": False, "stage": "hash_object", "detail": "git_blob_write_failed", "file": repo_path}
+        snapshots.append(
+            CommitSnapshot(
+                path=path,
+                repo_path=repo_path,
+                raw_sha256=raw_sha256,
+                blob_oid=blob_oid,
+                mode="100755" if executable else "100644",
+            )
+        )
+    return snapshots, None
 
-    add_result = run_command(["git", "-C", str(REPO_ROOT), "add", "--", *repo_paths], timeout=60)
-    if not add_result["ok"]:
-        return {"ok": False, "stage": "add", "detail": add_result}
 
-    diff_result = run_command(["git", "-C", str(REPO_ROOT), "diff", "--cached", "--quiet", "--", *repo_paths], timeout=60)
-    if diff_result["returncode"] == 0:
-        return {"ok": True, "skipped": True, "detail": "nothing_staged"}
+def _sync_real_index(snapshots: list[CommitSnapshot]) -> dict[str, Any]:
+    for snapshot in snapshots:
+        result = run_command(
+            [
+                "git", "-C", str(REPO_ROOT), "update-index", "--add", "--cacheinfo",
+                snapshot.mode, snapshot.blob_oid, snapshot.repo_path,
+            ],
+            timeout=60,
+        )
+        if not result["ok"]:
+            return {"ok": False, "stage": "index_sync", "detail": result, "file": snapshot.repo_path}
+    return {"ok": True}
 
-    message = args.message or f"memory closeout[{args.actor}]: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    commit_result = run_command(["git", "-C", str(REPO_ROOT), "commit", "-m", message, "--", *repo_paths], timeout=120)
+
+def _build_isolated_commit(
+    snapshots: list[CommitSnapshot],
+    *,
+    expected_head: str,
+    message: str,
+) -> dict[str, Any]:
+    transaction_dir = CONFIG_ROOT / "state"
+    transaction_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        transaction_dir.chmod(0o700)
+    except OSError:
+        return {"ok": False, "stage": "transaction_index", "detail": "transaction_directory_permission_failed"}
+    index_path = transaction_dir / "closeout-transaction.index"
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = str(index_path)
+    read_tree = run_command(
+        ["git", "-C", str(REPO_ROOT), "read-tree", "--reset", expected_head],
+        timeout=60,
+        env=env,
+    )
+    if not read_tree["ok"]:
+        return {"ok": False, "stage": "read_tree", "detail": read_tree}
+    try:
+        index_path.chmod(0o600)
+    except OSError:
+        return {"ok": False, "stage": "transaction_index", "detail": "transaction_index_permission_failed"}
+    for snapshot in snapshots:
+        update = run_command(
+            [
+                "git", "-C", str(REPO_ROOT), "update-index", "--add", "--cacheinfo",
+                snapshot.mode, snapshot.blob_oid, snapshot.repo_path,
+            ],
+            timeout=60,
+            env=env,
+        )
+        if not update["ok"]:
+            return {"ok": False, "stage": "isolated_index", "detail": update, "file": snapshot.repo_path}
+    tree_result = run_command(["git", "-C", str(REPO_ROOT), "write-tree"], timeout=60, env=env)
+    if not tree_result["ok"]:
+        return {"ok": False, "stage": "write_tree", "detail": tree_result}
+    tree_oid = str(tree_result["stdout"]).strip().lower()
+    head_tree = run_command(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", f"{expected_head}^{{tree}}"],
+        timeout=30,
+    )
+    if not head_tree["ok"]:
+        return {"ok": False, "stage": "head_tree", "detail": head_tree}
+    if tree_oid == str(head_tree["stdout"]).strip().lower():
+        sync = _sync_real_index(snapshots)
+        return sync if not sync["ok"] else {"ok": True, "skipped": True, "detail": "nothing_staged"}
+
+    commit_result = run_command(
+        ["git", "-C", str(REPO_ROOT), "commit-tree", tree_oid, "-p", expected_head, "-m", message],
+        timeout=120,
+    )
     if not commit_result["ok"]:
-        return {"ok": False, "stage": "commit", "detail": commit_result}
-
-    rev_result = run_command(["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"], timeout=30)
+        return {"ok": False, "stage": "commit_tree", "detail": commit_result}
+    commit_oid = str(commit_result["stdout"]).strip().lower()
+    update_ref = run_command(
+        ["git", "-C", str(REPO_ROOT), "update-ref", "-m", "agent-memory closeout", "HEAD", commit_oid, expected_head],
+        timeout=60,
+    )
+    if not update_ref["ok"]:
+        return {"ok": False, "stage": "head_cas", "detail": "GIT_HEAD_CHANGED"}
+    sync = _sync_real_index(snapshots)
+    if not sync["ok"]:
+        sync["commit"] = commit_oid
+        return sync
     return {
         "ok": True,
         "skipped": False,
-        "commit": str(rev_result["stdout"]).strip(),
-        "files": repo_paths,
+        "commit": commit_oid,
+        "files": [snapshot.repo_path for snapshot in snapshots],
+        "snapshot_sha256": {snapshot.repo_path: snapshot.raw_sha256 for snapshot in snapshots},
     }
 
 
+def commit_files(
+    files: list[Path],
+    args: argparse.Namespace,
+    *,
+    expected_raw_sha256: dict[Path, str] | None = None,
+    expected_head: str = "",
+) -> dict[str, Any]:
+    if not args.commit or args.dry_run:
+        return {"ok": True, "skipped": True, "detail": "commit_not_requested"}
+    snapshots, snapshot_error = _snapshot_commit_files(files, expected_raw_sha256 or {})
+    if snapshot_error is not None:
+        return snapshot_error
+    if not snapshots:
+        return {"ok": True, "skipped": True, "detail": "no_existing_files_to_commit"}
+    if not expected_head:
+        head_result = run_command(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], timeout=30)
+        if not head_result["ok"]:
+            return {"ok": False, "stage": "head", "detail": head_result}
+        expected_head = str(head_result["stdout"]).strip()
+    message = args.message or f"memory closeout[{args.actor}]: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    return _build_isolated_commit(snapshots, expected_head=expected_head, message=message)
+
+
 def append_log(payload: dict[str, Any]) -> None:
-    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+    secure_append_text(LOG_PATH, json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def privacy_safe_log_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Strip ephemeral scoped diffs before writing the durable JSONL audit log."""
+    copied = json.loads(json.dumps(payload, ensure_ascii=False))
+    validations = copied.get("write_intent_validations", [])
+    if isinstance(validations, list):
+        for validation in validations:
+            if not isinstance(validation, dict):
+                continue
+            scoped_diff = validation.pop("scoped_diff", None)
+            if isinstance(scoped_diff, str):
+                validation["scoped_diff_sha256"] = hashlib.sha256(scoped_diff.encode("utf-8")).hexdigest()
+                validation["scoped_diff_line_count"] = len(scoped_diff.splitlines())
+                validation["scoped_diff_char_count"] = len(scoped_diff)
+            mismatch = validation.get("mismatch")
+            if isinstance(mismatch, dict):
+                diff_text = mismatch.pop("diff", None)
+                if isinstance(diff_text, str):
+                    mismatch["diff_sha256"] = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+                    mismatch["diff_line_count"] = len(diff_text.splitlines())
+                    mismatch["diff_char_count"] = len(diff_text)
+    return copied
 
 
 def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
     if not entries or not STATE_DB.exists():
         return entries
     try:
-        with sqlite3.connect(STATE_DB, timeout=5) as conn:
-            conn.execute("PRAGMA busy_timeout=5000")
+        with secure_sqlite_connect(
+            STATE_DB,
+            timeout=5,
+            create=False,
+            read_only=True,
+            pragmas=("PRAGMA busy_timeout=5000",),
+        ) as conn:
             rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
-    except sqlite3.Error:
+    except (OSError, sqlite3.Error):
         return entries
     observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
     pending: list[GitEntry] = []
@@ -820,7 +1169,12 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     for entry in explicit:
         by_path[entry.path] = entry
     discovered_entries = list(by_path.values())
-    claim_rows = active_claim_rows(args.session_id, args.actor) if args.claimed_only else []
+    session_claim_rows = (
+        active_claim_rows(args.session_id, args.actor, read_only=args.dry_run)
+        if args.session_id
+        else []
+    )
+    claim_rows = session_claim_rows if args.claimed_only else []
     claimed_paths = {Path(row["path"]).resolve() for row in claim_rows}
     unclaimed_entries: list[GitEntry] = []
     ownership_error = ""
@@ -860,6 +1214,127 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     ]
     process_files = [entry.path for entry in process_entries]
 
+    claim_intent_ids = sorted(
+        {
+            str(row.get("intent_id", "")).strip()
+            for row in session_claim_rows
+            if str(row.get("intent_id", "")).strip()
+        }
+    )
+    intent_gate: dict[str, Any] = {
+        "ok": True,
+        "mode": write_intent.ENFORCEMENT_MODE,
+        "blocking": False,
+        "matched": [],
+        "violations": [],
+    }
+    intent_validations: list[dict[str, Any]] = []
+    intent_error = ""
+    try:
+        intent_gate = write_intent.enforce_protected_changes(
+            [entry.path for entry in all_entries],
+            actor=args.actor,
+            raw_session_id=args.session_id,
+            intent_ids=claim_intent_ids,
+            read_only=args.dry_run,
+        )
+        protected_deletions: list[str] = []
+        for entry in deleted_entries:
+            try:
+                if write_intent.is_protected_target(entry.path):
+                    protected_deletions.append(entry.repo_path)
+            except write_intent.IntentError:
+                continue
+        if protected_deletions:
+            violations = intent_gate.setdefault("violations", [])
+            for path in protected_deletions:
+                violations.append({"path": path, "reason_code": "PROTECTED_DELETE_FORBIDDEN"})
+            intent_gate["blocking"] = write_intent.ENFORCEMENT_MODE == "enforce"
+            intent_gate["ok"] = not bool(intent_gate["blocking"])
+            warnings.append("protected memory deletion is never staged automatically")
+        if intent_gate.get("violations") and intent_gate.get("mode") == "advisory":
+            warnings.append("write-intent advisory: protected changes lack a matching bound intent")
+        if not intent_gate.get("ok"):
+            violations = intent_gate.get("violations", [])
+            first_reason = (
+                str(violations[0].get("reason_code", ""))
+                if isinstance(violations, list) and violations and isinstance(violations[0], dict)
+                else "PROTECTED_WRITE_REJECTED"
+            )
+            intent_error = first_reason or "PROTECTED_WRITE_REJECTED"
+    except (write_intent.IntentError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+        intent_error = str(getattr(exc, "reason_code", "INTENT_GATE_FAILED"))
+
+    if not intent_error:
+        entry_paths = {entry.path.resolve() for entry in all_entries}
+        matched_intent_ids = {
+            str(item.get("intent_id", ""))
+            for item in intent_gate.get("matched", [])
+            if isinstance(item, dict) and str(item.get("intent_id", "")).strip()
+        }
+        claim_path_by_intent = {
+            str(row.get("intent_id", "")).strip(): Path(str(row.get("path", ""))).expanduser().resolve()
+            for row in session_claim_rows
+            if str(row.get("intent_id", "")).strip()
+        }
+        if any(intent_id not in claim_path_by_intent for intent_id in matched_intent_ids):
+            intent_error = "PROTECTED_WRITE_WITHOUT_MATCHING_CLAIM"
+        validation_intent_ids = sorted(
+            intent_id
+            for intent_id, claim_path in claim_path_by_intent.items()
+            if claim_path in entry_paths
+        )
+        if intent_error:
+            validation_intent_ids = []
+        for intent_id in validation_intent_ids:
+            claim_path = claim_path_by_intent.get(intent_id)
+            if claim_path is None:
+                continue
+            try:
+                validation = write_intent.validate_closeout(
+                    intent_id,
+                    actor=args.actor,
+                    raw_session_id=args.session_id,
+                    target=claim_path,
+                    mutate=not args.dry_run,
+                )
+            except (write_intent.IntentError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+                validation = {
+                    "ok": False,
+                    "intent_id": intent_id,
+                    "reason_code": str(getattr(exc, "reason_code", "INTENT_VALIDATE_FAILED")),
+                }
+            intent_validations.append(validation)
+            if not validation.get("ok") and not intent_error:
+                intent_error = str(validation.get("reason_code") or "INTENT_VALIDATE_FAILED")
+
+    preflight_error = ownership_error or intent_error
+    checked_commit_hashes: dict[Path, str] = {}
+    checked_canonical_hashes: dict[str, str] = {}
+    if process_files and not preflight_error:
+        try:
+            # Bind all ordinary and protected files before validation checks;
+            # the isolated snapshot below must still contain these bytes.
+            checked_commit_hashes, checked_canonical_hashes = bind_checked_file_hashes(
+                process_files
+            )
+        except (OSError, write_intent.IntentError):
+            preflight_error = "CHECK_INPUT_BIND_FAILED"
+
+    if not preflight_error:
+        for validation in intent_validations:
+            if not validation.get("ok") or validation.get("completed"):
+                continue
+            intent_id = str(validation.get("intent_id", ""))
+            claim_path = claim_path_by_intent.get(intent_id)
+            final_canonical = str(validation.get("final_canonical_sha256", "")).strip().lower()
+            if claim_path is None or not final_canonical:
+                continue
+            checked_key = os.path.normcase(str(claim_path.resolve()))
+            if checked_canonical_hashes.get(checked_key) != final_canonical:
+                preflight_error = "VALIDATED_CONTENT_CHANGED"
+                break
+
     if args.dry_run:
         warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
     if git_entries:
@@ -867,20 +1342,20 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "git reports dirty Agent Memory files; if some are historical, review dry-run output before committing"
         )
 
-    check_step = run_check(process_files, args) if process_files and not ownership_error else {
-        "ok": not bool(ownership_error),
+    check_step = run_check(process_files, args) if process_files and not preflight_error else {
+        "ok": not bool(preflight_error),
         "skipped": True,
-        "detail": ownership_error or "no_changed_files",
+        "detail": preflight_error or "no_changed_files",
     }
     advisories = list(check_step.get("advisories", [])) if isinstance(check_step.get("advisories"), list) else []
     reconcile_findings, reconcile_warnings = (
-        postwrite_reconcile(process_entries, args) if not ownership_error else ([], [])
+        postwrite_reconcile(process_entries, args) if not preflight_error else ([], [])
     )
     warnings.extend(reconcile_warnings)
-    index_step = run_index(args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
-    zvec_step = run_zvec(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
-    agent_step = run_agent_evolution(process_files, args) if process_files and not ownership_error else {"ok": not bool(ownership_error), "skipped": True, "detail": ownership_error or "no_changed_files"}
-    audit_step = run_audit_autorun(args) if not ownership_error else {"ok": False, "skipped": True, "detail": ownership_error}
+    index_step = run_index(args) if process_files and not preflight_error else {"ok": not bool(preflight_error), "skipped": True, "detail": preflight_error or "no_changed_files"}
+    zvec_step = run_zvec(process_files, args) if process_files and not preflight_error else {"ok": not bool(preflight_error), "skipped": True, "detail": preflight_error or "no_changed_files"}
+    agent_step = run_agent_evolution(process_files, args) if process_files and not preflight_error else {"ok": not bool(preflight_error), "skipped": True, "detail": preflight_error or "no_changed_files"}
+    audit_step = run_audit_autorun(args) if not preflight_error else {"ok": False, "skipped": True, "detail": preflight_error}
     audit_payload = audit_step.get("audit_payload") if isinstance(audit_step.get("audit_payload"), dict) else {}
     if audit_payload:
         audit_status = str(audit_payload.get("status", ""))
@@ -898,7 +1373,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         info.append(f"audit autorun failed: {str(audit_step.get('stderr', '')).strip()[:300]}")
 
     blocking_reconcile = bool(reconcile_findings)
-    step_failed = bool(ownership_error) or not all(
+    step_failed = bool(preflight_error) or not all(
         bool(step.get("ok"))
         for step in (check_step, index_step, zvec_step, agent_step)
     )
@@ -909,6 +1384,16 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         status = "warning"
 
     commit_step: dict[str, Any]
+    early_commit_paths = {
+        claim_path_by_intent[str(validation.get("intent_id", ""))].resolve()
+        for validation in intent_validations
+        if validation.get("ok")
+        and validation.get("early_commit")
+        and str(validation.get("intent_id", "")) in claim_path_by_intent
+    }
+    commit_process_files = [
+        path for path in process_files if path.resolve() not in early_commit_paths
+    ]
     if status == "error":
         commit_step = {"ok": False, "skipped": True, "detail": "skipped_due_to_error"}
     elif blocking_reconcile and not args.commit_warnings:
@@ -916,9 +1401,61 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     elif status == "warning" and not args.commit_warnings:
         commit_step = {"ok": True, "skipped": True, "detail": "skipped_due_to_warning"}
     else:
-        commit_step = commit_files(process_files, args)
+        commit_step = commit_files(
+            commit_process_files,
+            args,
+            expected_raw_sha256=checked_commit_hashes,
+            expected_head=git_head_before,
+        )
         if not commit_step.get("ok"):
             status = "error"
+
+    intent_receipts: list[dict[str, Any]] = []
+    intent_step: dict[str, Any] = {
+        "ok": not bool(intent_error),
+        "skipped": not bool(intent_validations),
+        "detail": intent_error or ("no_bound_intents" if not intent_validations else "validated"),
+    }
+    if status == "ok" and not args.dry_run and intent_validations:
+        for validation in intent_validations:
+            if not validation.get("ok"):
+                continue
+            durable_commit = str(
+                validation.get("proposal_commit")
+                if validation.get("early_commit")
+                else commit_step.get("commit")
+            ).strip()
+            if not durable_commit:
+                intent_error = "PROTECTED_WRITE_NOT_DURABLE"
+                intent_step = {"ok": False, "skipped": False, "detail": intent_error}
+                status = "error"
+                break
+            try:
+                receipt = write_intent.finalize_receipt(
+                    str(validation.get("intent_id", "")),
+                    actor=args.actor,
+                    raw_session_id=args.session_id,
+                    outcome="completed",
+                    git_commit=durable_commit,
+                    detail_code="EARLY_COMMIT_RECOVERED" if validation.get("early_commit") else "CLOSEOUT_COMMIT",
+                )
+            except (write_intent.IntentError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
+                intent_error = str(getattr(exc, "reason_code", "INTENT_RECEIPT_FAILED"))
+                intent_step = {"ok": False, "skipped": False, "detail": intent_error}
+                status = "error"
+                break
+            intent_receipts.append(receipt)
+            if str(receipt.get("outcome", "")) != "completed":
+                intent_error = "RECEIPT_OUTCOME_CONFLICT"
+                intent_step = {"ok": False, "skipped": False, "detail": intent_error}
+                status = "error"
+                break
+        else:
+            intent_step = {
+                "ok": True,
+                "skipped": False,
+                "detail": f"validated={len(intent_validations)} receipts={len(intent_receipts)}",
+            }
 
     claim_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "ownership_not_enabled"}
     observation_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "not_completed"}
@@ -942,7 +1479,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
     )
     can_advance_baseline = (
-        not step_failed and observation_step.get("ok") and not blocking_reconcile
+        status == "ok" and not step_failed and intent_step.get("ok")
+        and observation_step.get("ok") and not blocking_reconcile
         and not deleted_entries and not unclaimed_history and bool(git_head_before)
         and (not dirty_paths or bool(commit_step.get("commit")) or commit_step.get("detail") == "nothing_staged")
     )
@@ -960,6 +1498,10 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "session_hash": session_hash(args.session_id),
         "ownership_mode": "claimed_only" if args.claimed_only else "global",
         "ownership_error": ownership_error,
+        "intent_error": intent_error,
+        "write_intent_gate": intent_gate,
+        "write_intent_validations": intent_validations,
+        "write_intent_receipts": intent_receipts,
         "cwd": str(Path.cwd()),
         "mode": "closeout",
         "git_previous_observed_head": previous_observed_head,
@@ -983,6 +1525,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             "agent_evolution": short_step(agent_step),
             "audit": short_step(audit_step),
             "commit": short_step(commit_step),
+            "write_intents": short_step(intent_step),
             "observations": short_step(observation_step),
             "claims": short_step(claim_step),
         },
@@ -990,7 +1533,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "status": status,
     }
     if not args.dry_run:
-        append_log(payload)
+        append_log(privacy_safe_log_payload(payload))
     return payload
 
 
@@ -1032,14 +1575,41 @@ def parse_args() -> argparse.Namespace:
         description="Unified closeout for the local Agent Memory system."
     )
     parser.add_argument("--prewrite", help="Run reconcile before writing a new memory; does not modify files.")
+    parser.add_argument("--create-intent", action="store_true", help="Create a content-bound write intent after safety and reconcile pass.")
+    parser.add_argument("--target-file", default="", help="Canonical memory target for --create-intent.")
+    parser.add_argument("--proposal-file", default="", help="UTF-8 proposal outside the vault for --create-intent.")
+    parser.add_argument(
+        "--source-class",
+        choices=sorted(SOURCE_CLASSES),
+        default="unknown",
+        help="Origin class for the proposed memory. Unknown sources require confirmation.",
+    )
+    parser.add_argument(
+        "--knowledge-kind",
+        choices=sorted(KNOWLEDGE_KINDS),
+        default="fact",
+        help="Whether the proposal is a fact, preference, rule, inference, or hypothesis.",
+    )
+    parser.add_argument("--asserted-by", default="", help="Bounded identity label for who asserted the proposal.")
+    parser.add_argument("--evidence-ref", default="", help="Evidence reference; only its hash is included in safety output.")
     parser.add_argument("--changed-file", action="append", default=[], help="Explicit changed memory file. Repeatable.")
     parser.add_argument("--limit", type=int, default=8, help="Search candidates for reconcile.")
+    parser.add_argument(
+        "--current-project",
+        default="",
+        help="Current project_id for prewrite and postwrite search boundaries.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Inspect only; do not refresh indexes, write logs, or commit.")
     parser.add_argument("--commit", action="store_true", help="After successful closeout, commit only processed memory files.")
     parser.add_argument("--commit-warnings", action="store_true", help="Allow commit when non-blocking warnings exist.")
     parser.add_argument("--message", default="", help="Custom scoped commit message.")
-    parser.add_argument("--actor", default=os.environ.get("MEMORY_ACTOR", "codex"), help="Agent that initiated closeout.")
+    parser.add_argument(
+        "--actor",
+        choices=actor_names(),
+        default=os.environ.get("MEMORY_ACTOR", "codex"),
+        help="Agent that initiated closeout.",
+    )
     parser.add_argument(
         "--trigger",
         default="manual",
@@ -1099,6 +1669,8 @@ def main() -> int:
         return 2
     if payload.get("status") == "warning":
         return 1
+    if payload.get("status") == "blocked":
+        return 2
     return 0
 
 

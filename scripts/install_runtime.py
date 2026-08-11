@@ -6,9 +6,23 @@ import datetime as dt
 import hashlib
 import json
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
+
+from agent_memory_state import (
+    PRIVATE_DIRECTORY_MODE,
+    PRIVATE_FILE_MODE,
+    PERMISSION_MODEL,
+    POSIX_MODE_ENFORCED,
+    StateSecurityError,
+    absolute_path,
+    ensure_private_directory,
+    harden_private_file,
+    harden_sqlite_files,
+    sqlite_permission_report,
+)
 
 
 SOURCE_ROOT = Path(__file__).resolve().parent
@@ -20,22 +34,32 @@ CORE_FILES = (
     "agent_memory_check.py",
     "agent_memory_closeout.py",
     "agent_memory_doctor.py",
+    "agent_memory_decision_outcomes.py",
     "agent_memory_env.py",
     "agent_memory_evolution.py",
     "agent_memory_host.py",
     "agent_memory_index.py",
+    "agent_memory_intent.py",
     "agent_memory_lock.py",
     "agent_memory_paths.py",
+    "agent_memory_policy_benchmark.py",
     "agent_memory_retrieval_benchmark.py",
     "agent_memory_search.py",
+    "agent_memory_safety.py",
     "agent_memory_session_hook.py",
+    "agent_memory_state.py",
     "agent_memory_stop_hook.py",
     "agent_memory_zvec_index.py",
     "bootstrap.py",
     "install_runtime.py",
     "memoryctl",
 )
-SUPPORT_FILES = ("requirements-vector.lock",)
+SUPPORT_FILES = (
+    "requirements-vector.lock",
+    "benchmarks/public-sample.json",
+    "benchmarks/public-policy-reconcile.json",
+    "benchmarks/public-policy-safety.json",
+)
 
 
 def utc_now() -> str:
@@ -76,6 +100,84 @@ def expected_manifest(config_root: Path) -> dict[str, Any]:
     }
 
 
+def harden_runtime_permissions(config_root: Path) -> None:
+    ensure_private_directory(config_root, harden_existing=True)
+    for private_name in ("config", "logs", "reports", "proposals", "benchmarks"):
+        private_dir = config_root / private_name
+        if not (private_dir.exists() or private_dir.is_symlink()):
+            continue
+        ensure_private_directory(private_dir, harden_existing=True)
+        for path in private_dir.rglob("*"):
+            if path.is_symlink():
+                raise StateSecurityError(f"runtime private path must not be a symlink: {path}")
+            if path.is_dir():
+                ensure_private_directory(path, harden_existing=True)
+            elif path.is_file():
+                harden_private_file(path)
+            else:
+                raise StateSecurityError(f"runtime private path is not regular: {path}")
+    harden_sqlite_files(config_root / "state.sqlite", require_database=False)
+
+
+def runtime_permission_report(config_root: Path) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    try:
+        metadata = config_root.lstat()
+    except FileNotFoundError:
+        issues.append({"path": str(config_root), "reason": "missing_config_root"})
+    else:
+        if stat.S_ISLNK(metadata.st_mode):
+            issues.append({"path": str(config_root), "reason": "symlink"})
+        elif not stat.S_ISDIR(metadata.st_mode):
+            issues.append({"path": str(config_root), "reason": "not_directory"})
+        else:
+            actual_mode = stat.S_IMODE(metadata.st_mode)
+            if POSIX_MODE_ENFORCED and actual_mode != PRIVATE_DIRECTORY_MODE:
+                issues.append(
+                    {
+                        "path": str(config_root),
+                        "reason": "mode",
+                        "expected_mode": "0700",
+                        "actual_mode": f"{actual_mode:04o}",
+                    }
+                )
+
+    config_dir = config_root / "config"
+    if config_dir.is_symlink():
+        issues.append({"path": str(config_dir), "reason": "symlink"})
+    elif config_dir.is_dir():
+        for path in config_dir.rglob("*"):
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                issues.append({"path": str(path), "reason": "symlink"})
+            elif stat.S_ISREG(metadata.st_mode):
+                actual_mode = stat.S_IMODE(metadata.st_mode)
+                if POSIX_MODE_ENFORCED and actual_mode != PRIVATE_FILE_MODE:
+                    issues.append(
+                        {
+                            "path": str(path),
+                            "reason": "mode",
+                            "expected_mode": "0600",
+                            "actual_mode": f"{actual_mode:04o}",
+                        }
+                    )
+
+    sqlite_report = sqlite_permission_report(config_root / "state.sqlite", require_database=False)
+    issues.extend(sqlite_report["issues"])
+    return {
+        "ok": not issues,
+        "permission_model": PERMISSION_MODEL,
+        "mode_enforced": POSIX_MODE_ENFORCED,
+        "warnings": [] if POSIX_MODE_ENFORCED else ["windows_acl_unverified"],
+        "config_root": str(config_root),
+        "issues": issues,
+        "state": sqlite_report,
+    }
+
+
 def verify(config_root: Path) -> dict[str, Any]:
     manifest_path = config_root / "config" / "runtime-manifest.json"
     try:
@@ -103,8 +205,9 @@ def verify(config_root: Path) -> dict[str, Any]:
                 support_missing.append(str(name))
             elif sha256(path) != str(digest):
                 support_mismatched.append(str(name))
+    permissions = runtime_permission_report(config_root)
     return {
-        "ok": not missing and not mismatched and not support_missing and not support_mismatched,
+        "ok": not missing and not mismatched and not support_missing and not support_mismatched and permissions["ok"],
         "manifest": str(manifest_path),
         "source_commit": manifest.get("source_commit", ""),
         "source_dirty": bool(manifest.get("source_dirty")),
@@ -113,6 +216,7 @@ def verify(config_root: Path) -> dict[str, Any]:
         "mismatched": mismatched,
         "support_missing": support_missing,
         "support_mismatched": support_mismatched,
+        "permissions": permissions,
     }
 
 
@@ -122,6 +226,8 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
     manifest = expected_manifest(config_root)
     changed: list[str] = []
     unchanged: list[str] = []
+    if not dry_run:
+        ensure_private_directory(config_root, harden_existing=True)
     for name in CORE_FILES:
         source = SOURCE_ROOT / name
         target = script_root / name
@@ -146,17 +252,30 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
     if not dry_run:
-        config_dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(config_dir, harden_existing=True)
         manifest_path = config_dir / "runtime-manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        harden_runtime_permissions(config_root)
+    permissions = (
+        runtime_permission_report(config_root)
+        if not dry_run
+        else {
+            "ok": True,
+            "permission_model": PERMISSION_MODEL,
+            "mode_enforced": POSIX_MODE_ENFORCED,
+            "warnings": [] if POSIX_MODE_ENFORCED else ["windows_acl_unverified"],
+            "not_checked": True,
+        }
+    )
     return {
-        "ok": True,
+        "ok": bool(permissions["ok"]),
         "dry_run": dry_run,
         "config_root": str(config_root),
         "changed": changed,
         "unchanged": unchanged,
         "source_commit": manifest["source_commit"],
         "source_dirty": manifest["source_dirty"],
+        "permissions": permissions,
     }
 
 
@@ -171,8 +290,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    config_root = Path(args.config_root).expanduser().resolve()
-    payload = verify(config_root) if args.verify else install(config_root, args.dry_run)
+    config_root = absolute_path(args.config_root)
+    try:
+        payload = verify(config_root) if args.verify else install(config_root, args.dry_run)
+    except (OSError, StateSecurityError) as exc:
+        payload = {"ok": False, "config_root": str(config_root), "error": type(exc).__name__, "detail": str(exc)}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

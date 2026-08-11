@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_safety import SECRET_PATTERNS, normalize_for_detection
+from agent_memory_state import secure_sqlite_connect
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -63,17 +65,25 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_check.py",
     SCRIPT_ROOT / "agent_memory_evolution.py",
     SCRIPT_ROOT / "agent_memory_index.py",
+    SCRIPT_ROOT / "agent_memory_intent.py",
     SCRIPT_ROOT / "agent_memory_search.py",
+    SCRIPT_ROOT / "agent_memory_safety.py",
     SCRIPT_ROOT / "agent_memory_closeout.py",
     SCRIPT_ROOT / "agent_memory_audit.py",
     SCRIPT_ROOT / "agent_memory_audit_autorun.py",
+    SCRIPT_ROOT / "agent_memory_claim.py",
     SCRIPT_ROOT / "agent_memory_zvec_index.py",
+    SCRIPT_ROOT / "agent_memory_policy_benchmark.py",
     SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
     SCRIPT_ROOT / "agent_memory_doctor.py",
+    SCRIPT_ROOT / "agent_memory_decision_outcomes.py",
+    SCRIPT_ROOT / "agent_memory_host.py",
+    SCRIPT_ROOT / "agent_memory_lock.py",
+    SCRIPT_ROOT / "agent_memory_paths.py",
     SCRIPT_ROOT / "agent_memory_session_hook.py",
+    SCRIPT_ROOT / "agent_memory_state.py",
     SCRIPT_ROOT / "agent_memory_stop_hook.py",
     SCRIPT_ROOT / "agent_memory_env.py",
-    SCRIPT_ROOT / "agent_memory_paths.py",
     SCRIPT_ROOT / "install_runtime.py",
     SCRIPT_ROOT / "memoryctl",
 ]
@@ -86,6 +96,9 @@ REQUIRED_STATE_TABLES = {
     "memory_docs",
     "memory_fts",
     "memory_open_loops",
+    "memory_safety_log",
+    "memory_write_intents",
+    "memory_write_receipts",
     "memory_session_claims",
     "memory_file_observations",
 }
@@ -100,17 +113,6 @@ DEFAULT_COMPACTION_LINE_LIMIT = 140
 DEFAULT_COMPACTION_BYTE_LIMIT = 14 * 1024
 
 
-SECRET_PATTERNS = [
-    re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}"),
-    re.compile(r"ghp_[A-Za-z0-9_]{20,}"),
-    re.compile(r"AKIA[0-9A-Z]{16}"),
-    re.compile(r"(?i)DEEPSEEK_API_KEY\s*=\s*sk-"),
-    re.compile(r"(?i)OPENAI_API_KEY\s*=\s*sk-"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}"),
-    re.compile(r"(?<!\d)\d{8,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
-    re.compile(r"(?<![A-Za-z0-9])(?:sk|rk)_live_[A-Za-z0-9]{16,}"),
-]
 PRIVATE_PATH_PATTERN = re.compile(r"/Users/[A-Za-z0-9._-]+/")
 
 SECRET_ENV_NAMES = [
@@ -130,17 +132,38 @@ def exact_secret_values() -> list[str]:
     return values
 
 
+def publishable_repo_files() -> list[Path]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+    if completed is not None and completed.returncode == 0:
+        return [
+            REPO_ROOT / raw.decode("utf-8", errors="surrogateescape")
+            for raw in completed.stdout.split(b"\0")
+            if raw
+        ]
+    ignored_dirs = {".git", ".agent-memory", "__pycache__", "node_modules", ".pytest_cache"}
+    return [path for path in REPO_ROOT.rglob("*") if not any(part in ignored_dirs for part in path.parts)]
+
+
 def iter_text_files(root: Path) -> list[Path]:
     if not root.exists():
         return []
     ignored_dirs = {".git", "__pycache__", "node_modules", ".pytest_cache"}
     files: list[Path] = []
-    for path in root.rglob("*"):
+    candidates = publishable_repo_files() if PUBLIC_TEMPLATE_MODE and root.resolve() == REPO_ROOT.resolve() else root.rglob("*")
+    for path in candidates:
         if any(part in ignored_dirs for part in path.parts):
             continue
         if not path.is_file():
             continue
-        if path.suffix.lower() in {".md", ".txt", ".py", ".toml", ".example", ".gitignore", ""} or path.name in {
+        if path.suffix.lower() in {".json", ".md", ".txt", ".py", ".toml", ".example", ".gitignore", ""} or path.name in {
             "README.md",
             ".env.example",
         }:
@@ -164,7 +187,8 @@ def scan_for_secrets(roots: list[Path], include_private_paths: bool) -> list[tup
             if any(value and value in text for value in exact_values):
                 leaked.append((path, "configured_exact_secret"))
                 continue
-            if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+            detection_text = normalize_for_detection(text)
+            if any(pattern.search(detection_text) for pattern in SECRET_PATTERNS):
                 leaked.append((path, "credential_pattern"))
                 continue
             if include_private_paths and PRIVATE_PATH_PATTERN.search(text):
@@ -181,10 +205,14 @@ def check_state_db() -> tuple[bool, str]:
     if not STATE_DB.exists():
         return False, "missing"
     try:
-        with sqlite3.connect(STATE_DB) as conn:
-            conn.execute("PRAGMA busy_timeout=10000")
+        with secure_sqlite_connect(
+            STATE_DB,
+            create=False,
+            read_only=True,
+            pragmas=("PRAGMA busy_timeout=10000",),
+        ) as conn:
             rows = conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'virtual table')").fetchall()
-    except sqlite3.Error as exc:
+    except (OSError, sqlite3.Error) as exc:
         return False, str(exc)
     tables = {row[0] for row in rows}
     missing = sorted(REQUIRED_STATE_TABLES - tables)
@@ -274,9 +302,7 @@ def check_public_repo_files() -> list[str]:
     failures: list[str] = []
     forbidden_names = {".env"}
     forbidden_suffixes = {".sqlite", ".db", ".key", ".pem"}
-    for path in REPO_ROOT.rglob("*"):
-        if ".git" in path.parts:
-            continue
+    for path in publishable_repo_files():
         if path.is_file() and path.name in forbidden_names:
             failures.append(f"FORBIDDEN public_file {path}")
         if path.is_file() and path.suffix.lower() in forbidden_suffixes:

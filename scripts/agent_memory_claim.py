@@ -11,11 +11,15 @@ from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_host import actor_names, resolve
+import agent_memory_intent as write_intent
+from agent_memory_state import absolute_path, secure_sqlite_connect
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(RUNTIME_ROOT / "templates" / "vault")))
-STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+STATE_DB = absolute_path(
+    resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
+)
 
 
 def utc_now() -> str:
@@ -38,12 +42,17 @@ def session_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16] if value else ""
 
 
-def connect() -> sqlite3.Connection:
-    STATE_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(STATE_DB, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=10000")
-    ensure_schema(conn)
+def connect(*, read_only: bool = False) -> sqlite3.Connection:
+    conn = secure_sqlite_connect(
+        STATE_DB,
+        timeout=10,
+        create=not read_only,
+        read_only=read_only,
+        row_factory=sqlite3.Row,
+        pragmas=("PRAGMA busy_timeout=10000",),
+    )
+    if not read_only:
+        ensure_schema(conn)
     return conn
 
 
@@ -59,6 +68,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           claimed_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           completed_at TEXT,
+          intent_id TEXT NOT NULL DEFAULT '',
           PRIMARY KEY (session_hash, path)
         )
         """
@@ -79,6 +89,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memory_session_claims_active "
         "ON memory_session_claims(status, actor, session_hash)"
     )
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+    if "intent_id" not in columns:
+        conn.execute("ALTER TABLE memory_session_claims ADD COLUMN intent_id TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
+        "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
+    )
+    write_intent.ensure_schema(conn)
     conn.commit()
 
 
@@ -117,7 +135,14 @@ def record_file_observations(raw_session_id: str, actor: str, paths: list[Path])
     return len(rows)
 
 
-def normalize_claim_path(raw: str) -> tuple[Path, str]:
+def normalize_claim_path(raw: str, *, allow_missing: bool = False) -> tuple[Path, str]:
+    if allow_missing:
+        target = write_intent.canonical_target(raw)
+        if target.path.exists() and not target.path.is_file():
+            raise ValueError(f"claim path is not a regular file: {target.path}")
+        if not target.path.parent.is_dir():
+            raise ValueError(f"claim parent directory does not exist: {target.path.parent}")
+        return target.path, target.rel_path
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
@@ -134,47 +159,117 @@ def normalize_claim_path(raw: str) -> tuple[Path, str]:
     return path, rel_path
 
 
-def claim_paths(actor: str, raw_session_id: str, paths: list[str]) -> list[dict[str, str]]:
+def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: str = "") -> list[dict[str, str]]:
     hashed = session_hash(raw_session_id)
     if not hashed:
         raise ValueError("session id is required; pass --session-id or use a supported host session environment")
-    normalized = [normalize_claim_path(raw) for raw in paths]
+    normalized = [normalize_claim_path(raw, allow_missing=bool(intent_id)) for raw in paths]
+    if intent_id and len(normalized) != 1:
+        raise ValueError("one write intent can bind exactly one claimed file")
+    for path, rel_path in normalized:
+        if (
+            write_intent.PROTECTED_PATHS
+            and write_intent.ENFORCEMENT_MODE == "enforce"
+            and write_intent.is_protected_target(path)
+            and not intent_id
+        ):
+            raise ValueError(f"protected memory requires a bound write intent before editing: {rel_path}")
     now = utc_now()
-    with connect() as conn:
-        for path, rel_path in normalized:
-            conn.execute(
-                """
-                INSERT INTO memory_session_claims (
-                  session_hash, actor, path, rel_path, status, claimed_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL)
-                ON CONFLICT(session_hash, path) DO UPDATE SET
-                  actor=excluded.actor,
-                  rel_path=excluded.rel_path,
-                  status='active',
-                  updated_at=excluded.updated_at,
-                  completed_at=NULL
-                """,
-                (hashed, actor, str(path), rel_path, now, now),
-            )
-        conn.commit()
-    return [{"path": str(path), "rel_path": rel_path} for path, rel_path in normalized]
+    try:
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if intent_id:
+                bound = write_intent.bind_claim(
+                    intent_id,
+                    actor=actor,
+                    raw_session_id=raw_session_id,
+                    claim_path=normalized[0][0],
+                    claim_ref=f"{actor}:{hashed}:{normalized[0][1]}",
+                    connection=conn,
+                )
+                if str(bound.get("target_key", "")) != write_intent.canonical_target(normalized[0][0]).target_key:
+                    raise ValueError("write intent target does not match claimed file")
+            for path, rel_path in normalized:
+                existing = conn.execute(
+                    "SELECT status, intent_id FROM memory_session_claims WHERE session_hash=? AND path=?",
+                    (hashed, str(path)),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and str(existing[0]) == "active"
+                    and str(existing[1] or "")
+                    and str(existing[1]) != intent_id
+                ):
+                    raise ValueError(f"active claim already has a different write intent: {rel_path}")
+                conn.execute(
+                    """
+                    INSERT INTO memory_session_claims (
+                      session_hash, actor, path, rel_path, status, claimed_at, updated_at, completed_at, intent_id
+                    ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?)
+                    ON CONFLICT(session_hash, path) DO UPDATE SET
+                      actor=excluded.actor,
+                      rel_path=excluded.rel_path,
+                      status='active',
+                      updated_at=excluded.updated_at,
+                      completed_at=NULL,
+                      intent_id=CASE
+                        WHEN memory_session_claims.status='active'
+                             AND memory_session_claims.intent_id<>''
+                             AND excluded.intent_id=''
+                        THEN memory_session_claims.intent_id
+                        ELSE excluded.intent_id
+                      END
+                    """,
+                    (hashed, actor, str(path), rel_path, now, now, intent_id),
+                )
+            conn.commit()
+    except write_intent.IntentError as exc:
+        if intent_id and exc.reason_code in {"STALE_BASE", "INTENT_EXPIRED"}:
+            try:
+                write_intent.finalize_receipt(
+                    intent_id,
+                    actor=actor,
+                    raw_session_id=raw_session_id,
+                    outcome="expired" if exc.reason_code == "INTENT_EXPIRED" else "failed",
+                    reason_code=exc.reason_code,
+                    detail_code="CLAIM_BINDING_REJECTED",
+                )
+            except (write_intent.IntentError, OSError, sqlite3.Error):
+                pass
+        raise
+    return [{"path": str(path), "rel_path": rel_path, "intent_id": intent_id} for path, rel_path in normalized]
 
 
-def active_claim_rows(raw_session_id: str, actor: str = "") -> list[dict[str, str]]:
+def active_claim_rows(
+    raw_session_id: str,
+    actor: str = "",
+    *,
+    read_only: bool = False,
+) -> list[dict[str, str]]:
     hashed = session_hash(raw_session_id)
     if not hashed:
         return []
-    query = (
-        "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at "
-        "FROM memory_session_claims WHERE session_hash=? AND status='active'"
-    )
     params: list[str] = [hashed]
-    if actor:
-        query += " AND actor=?"
-        params.append(actor)
-    query += " ORDER BY rel_path"
-    with connect() as conn:
-        rows = conn.execute(query, params).fetchall()
+    try:
+        with connect(read_only=read_only) as conn:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+            if not columns:
+                return []
+            intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
+            query = (
+                "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
+                f"{intent_expression} FROM memory_session_claims "
+                "WHERE session_hash=? AND status='active'"
+            )
+            if actor:
+                query += " AND actor=?"
+                params.append(actor)
+            query += " ORDER BY rel_path"
+            rows = conn.execute(query, params).fetchall()
+    except (OSError, sqlite3.Error):
+        if read_only and not STATE_DB.exists():
+            return []
+        raise
     return [{key: str(row[key] or "") for key in row.keys()} for row in rows]
 
 
@@ -194,7 +289,7 @@ def all_active_claim_rows(max_age_hours: float | None = None) -> list[dict[str, 
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at
+            SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, intent_id
             FROM memory_session_claims
             WHERE status='active'
             ORDER BY actor, session_hash, rel_path
@@ -269,6 +364,7 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="action", required=True)
     claim_parser = subparsers.add_parser("claim", help="Claim one or more Markdown files for this session.")
     claim_parser.add_argument("--file", action="append", required=True)
+    claim_parser.add_argument("--intent-id", default="", help="Bind this single-file claim to a prepared write intent.")
     subparsers.add_parser("list", help="List active claims for this session.")
     subparsers.add_parser("list-all", help="List all active claims.")
     expire_parser = subparsers.add_parser("expire-stale", help="Preview or expire abandoned active claims.")
@@ -283,7 +379,7 @@ def main() -> int:
     applied = 0
     try:
         if args.action == "claim":
-            rows = claim_paths(args.actor, raw_session_id, args.file)
+            rows = claim_paths(args.actor, raw_session_id, args.file, args.intent_id)
         elif args.action == "list-all":
             rows = all_active_claim_rows()
         elif args.action == "expire-stale":

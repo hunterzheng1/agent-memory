@@ -15,8 +15,10 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import agent_memory_claim as claim
+import agent_memory_check as check
 import agent_memory_doctor as doctor
 import agent_memory_index as index
+import install_runtime as runtime
 
 
 def git(root: Path, *args: str) -> str:
@@ -33,6 +35,10 @@ def git(root: Path, *args: str) -> str:
 
 
 class DurabilityGuardTests(unittest.TestCase):
+    def test_local_check_covers_runtime_dependency_closure(self) -> None:
+        checked_files = {path.name for path in check.REQUIRED_LOCAL_FILES}
+        self.assertEqual(checked_files, set(runtime.CORE_FILES))
+
     def test_runtime_health_requires_path_resolver_dependency(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
             tmp = Path(raw_tmp).resolve()

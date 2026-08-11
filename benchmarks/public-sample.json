@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "name": "agent-memory-public-sample",
+  "privacy": "public_sample",
+  "description": "Safe repository examples only. Do not treat this sample as a production retrieval score.",
+  "cases": [
+    {
+      "id": "sample-field-rules",
+      "query": "Agent记忆字段规范",
+      "expected": ["工作流/Agent记忆字段规范.md"],
+      "required_at": 5,
+      "tags": ["fake", "workflow"]
+    },
+    {
+      "id": "sample-closeout-rules",
+      "query": "Agent记忆收尾决策规则",
+      "expected": ["工作流/Agent记忆收尾决策规则.md"],
+      "required_at": 5,
+      "tags": ["fake", "workflow"]
+    },
+    {
+      "id": "sample-sqlite-index",
+      "query": "Agent记忆SQLite全库索引设计",
+      "expected": ["工作流/Agent记忆SQLite全库索引设计.md"],
+      "required_at": 5,
+      "tags": ["fake", "index"]
+    },
+    {
+      "id": "sample-semantic-index",
+      "query": "Agent记忆语义检索设计",
+      "expected": ["工作流/Agent记忆语义检索设计.md"],
+      "required_at": 5,
+      "tags": ["fake", "semantic"]
+    },
+    {
+      "id": "sample-user-boundary",
+      "query": "偏好与边界",
+      "expected": ["用户记忆/偏好与边界.md"],
+      "required_at": 5,
+      "tags": ["fake", "user"]
+    }
+  ]
+}
