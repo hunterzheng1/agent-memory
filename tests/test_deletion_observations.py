@@ -486,11 +486,12 @@ class TrashPathClassificationTests(unittest.TestCase):
             )
 
     def test_macos_and_linux_use_their_native_trash_layouts(self) -> None:
+        mac_home = Path("/") / "Users" / "alice"
         self.assertTrue(
             claim._is_recognized_trash_path(
-                Path("/Users/alice/.Trash/note.md"),
+                mac_home / ".Trash" / "note.md",
                 platform="darwin",
-                home=Path("/Users/alice"),
+                home=mac_home,
                 uid=501,
             )
         )

@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sqlite3
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -16,37 +17,161 @@ from urllib.parse import urlparse
 
 from agent_memory_env import env_value, load_config, resolve_config_path
 from agent_memory_state import absolute_path, secure_sqlite_connect, sqlite_permission_report
+from install_runtime import CORE_FILES, managed_path_issue, verify as verify_runtime_install
 
 
 VERSION = "2.4"
-REPO_ROOT = Path(__file__).resolve().parents[1]
-VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
-GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
-CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
-STATE_DB = absolute_path(resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite"))))
+LEXICAL_RUNTIME_ROOT = absolute_path(Path(__file__).parent.parent)
+REPO_ROOT = LEXICAL_RUNTIME_ROOT
+
+
+def _lexical_config_path(raw: str) -> Path:
+    expanded = raw
+    home = str(Path.home())
+    expanded = re.sub(r"^\$\{HOME\}(?=[/\\]|$)", lambda _match: home, expanded)
+    expanded = re.sub(r"^\$HOME(?=[/\\]|$)", lambda _match: home, expanded)
+    expanded = os.path.expandvars(expanded)
+    expanded = re.sub(
+        r"%([^%]+)%",
+        lambda match: os.environ.get(match.group(1), match.group(0)),
+        expanded,
+    )
+    return absolute_path(Path(expanded).expanduser())
+
+
+def _configured_file_lexical_path() -> Path:
+    explicit = os.environ.get("AGENT_MEMORY_CONFIG_FILE", "").strip()
+    if explicit:
+        return _lexical_config_path(explicit)
+    return LEXICAL_RUNTIME_ROOT / "config" / "agent-memory.toml"
+
+
+def _initial_config_root() -> Path:
+    explicit_root = os.environ.get("AGENT_MEMORY_CONFIG_ROOT", "").strip()
+    if explicit_root:
+        return _lexical_config_path(explicit_root)
+    explicit_file = os.environ.get("AGENT_MEMORY_CONFIG_FILE", "").strip()
+    if explicit_file:
+        config_file = _lexical_config_path(explicit_file)
+        return config_file.parent.parent if config_file.parent.name == "config" else config_file.parent
+    manifest = LEXICAL_RUNTIME_ROOT / "config" / "runtime-manifest.json"
+    if managed_path_issue(LEXICAL_RUNTIME_ROOT, manifest, expected_kind="file") is None:
+        try:
+            if stat.S_ISREG(os.lstat(manifest).st_mode):
+                return LEXICAL_RUNTIME_ROOT
+        except FileNotFoundError:
+            pass
+    return _lexical_config_path("$HOME/.config/agent-memory")
+
+
+def _config_path_issues(config_root: Path, config_file: Path) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    targets = (
+        (config_root, config_root, "directory"),
+        (config_root, config_root / "config", "directory"),
+        (config_file.parent, config_file.parent, "directory"),
+        (config_file.parent, config_file, "file"),
+    )
+    for root, target, expected_kind in targets:
+        issue = managed_path_issue(root, target, expected_kind=expected_kind)
+        if issue is not None and issue not in issues:
+            issues.append(issue)
+    return issues
+
+
+def _runtime_path_issues() -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    targets = (
+        (LEXICAL_RUNTIME_ROOT, "directory"),
+        (LEXICAL_RUNTIME_ROOT / "scripts", "directory"),
+        (absolute_path(__file__), "file"),
+    )
+    for target, expected_kind in targets:
+        issue = managed_path_issue(
+            LEXICAL_RUNTIME_ROOT,
+            target,
+            expected_kind=expected_kind,
+        )
+        if issue is not None and issue not in issues:
+            issues.append(issue)
+    return issues
+
+
+CONFIG_FILE = _configured_file_lexical_path()
+CONFIG_ROOT = _initial_config_root()
+PRELOAD_PATH_ISSUES = _runtime_path_issues()
+for _issue in _config_path_issues(CONFIG_ROOT, CONFIG_FILE):
+    if _issue not in PRELOAD_PATH_ISSUES:
+        PRELOAD_PATH_ISSUES.append(_issue)
+RUNTIME_CONFIG: dict[str, Any] = {}
+if not PRELOAD_PATH_ISSUES:
+    RUNTIME_CONFIG = load_config()
+    configured_root = _lexical_config_path(
+        str(os.environ.get("AGENT_MEMORY_CONFIG_ROOT") or RUNTIME_CONFIG.get("config_root") or CONFIG_ROOT)
+    )
+    PRELOAD_PATH_ISSUES.extend(_config_path_issues(configured_root, CONFIG_FILE))
+    CONFIG_ROOT = configured_root
+
 SCRIPT_ROOT = REPO_ROOT / "scripts"
-AUDIT_LOG = resolve_config_path(env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl")))
-CLOSEOUT_LOG = resolve_config_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl")))
 RUNTIME_MANIFEST = CONFIG_ROOT / "config" / "runtime-manifest.json"
-HOST_CONFIG = load_config().get("host", {})
+RUNTIME_FILES = CORE_FILES
+HOST_CONFIG = RUNTIME_CONFIG.get("host", {})
 if not isinstance(HOST_CONFIG, dict):
     HOST_CONFIG = {}
-SEMANTIC_CONFIG = load_config().get("semantic_retrieval", {})
+SEMANTIC_CONFIG = RUNTIME_CONFIG.get("semantic_retrieval", {})
 if not isinstance(SEMANTIC_CONFIG, dict):
     SEMANTIC_CONFIG = {}
-WRITE_INTENT_CONFIG = load_config().get("write_intents", {})
+WRITE_INTENT_CONFIG = RUNTIME_CONFIG.get("write_intents", {})
 if not isinstance(WRITE_INTENT_CONFIG, dict):
     WRITE_INTENT_CONFIG = {}
 SEMANTIC_ENABLED = bool(SEMANTIC_CONFIG.get("enabled", False))
-ZVEC_PYTHON = resolve_config_path(env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python")))
-_EMBEDDING_MODEL_RAW = env_value("EMBEDDING_MODEL", "")
-EMBEDDING_MODEL = resolve_config_path(_EMBEDDING_MODEL_RAW) if _EMBEDDING_MODEL_RAW else Path()
-MODEL_MANIFEST = resolve_config_path(
-    env_value("MODEL_MANIFEST", str(CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json"))
-)
-MODEL_REVISION = env_value("MODEL_REVISION", "")
-DEPENDENCY_LOCK = resolve_config_path(env_value("DEPENDENCY_LOCK", str(CONFIG_ROOT / "requirements-vector.lock")))
-REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
+if PRELOAD_PATH_ISSUES:
+    VAULT_ROOT = CONFIG_ROOT / "unsafe-unresolved-vault"
+    GIT_ROOT = CONFIG_ROOT
+    STATE_DB = CONFIG_ROOT / "state.sqlite"
+    AUDIT_LOG = CONFIG_ROOT / "logs" / "audit_runs.jsonl"
+    CLOSEOUT_LOG = CONFIG_ROOT / "logs" / "closeout.jsonl"
+    ZVEC_PYTHON = CONFIG_ROOT / ".venv" / "bin" / "python"
+    EMBEDDING_MODEL = Path()
+    MODEL_MANIFEST = CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json"
+    MODEL_REVISION = ""
+    DEPENDENCY_LOCK = CONFIG_ROOT / "requirements-vector.lock"
+    REQUIRE_LOCAL_MODEL = False
+else:
+    VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
+    GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
+    STATE_DB = absolute_path(
+        resolve_config_path(env_value("STATE_DB", str(CONFIG_ROOT / "state.sqlite")))
+    )
+    AUDIT_LOG = resolve_config_path(
+        env_value("AUDIT_RUN_LOG", str(CONFIG_ROOT / "logs" / "audit_runs.jsonl"))
+    )
+    CLOSEOUT_LOG = resolve_config_path(
+        env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))
+    )
+    ZVEC_PYTHON = resolve_config_path(
+        env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python"))
+    )
+    _EMBEDDING_MODEL_RAW = env_value("EMBEDDING_MODEL", "")
+    EMBEDDING_MODEL = (
+        resolve_config_path(_EMBEDDING_MODEL_RAW) if _EMBEDDING_MODEL_RAW else Path()
+    )
+    MODEL_MANIFEST = resolve_config_path(
+        env_value(
+            "MODEL_MANIFEST",
+            str(CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json"),
+        )
+    )
+    MODEL_REVISION = env_value("MODEL_REVISION", "")
+    DEPENDENCY_LOCK = resolve_config_path(
+        env_value("DEPENDENCY_LOCK", str(CONFIG_ROOT / "requirements-vector.lock"))
+    )
+    REQUIRE_LOCAL_MODEL = env_value("REQUIRE_LOCAL_MODEL", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 EXCLUDED_VECTOR_TYPES = {"routing", "directory_index", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_VECTOR_STATUS = {"archived", "deleted", "obsolete", "outdated", "deprecated", "stale"}
 STALE_CLAIM_HOURS = 24
@@ -584,39 +709,41 @@ def repair_derived() -> list[dict[str, Any]]:
 
 def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
-    required = [
-        "agent_memory_claim.py",
-        "agent_memory_index.py",
-        "agent_memory_intent.py",
-        "agent_memory_search.py",
-        "agent_memory_safety.py",
-        "agent_memory_closeout.py",
-        "agent_memory_check.py",
-        "agent_memory_audit.py",
-        "agent_memory_audit_autorun.py",
-        "agent_memory_zvec_index.py",
-        "agent_memory_policy_benchmark.py",
-        "agent_memory_doctor.py",
-        "agent_memory_decision_outcomes.py",
-        "agent_memory_evolution.py",
-        "agent_memory_host.py",
-        "agent_memory_lock.py",
-        "agent_memory_paths.py",
-        "agent_memory_retrieval_benchmark.py",
-        "agent_memory_session_hook.py",
-        "agent_memory_state.py",
-        "agent_memory_stop_hook.py",
-        "agent_memory_env.py",
-        "audit-task.ps1",
-        "bootstrap.py",
-        "install-codex-hook.ps1",
-        "install_runtime.py",
-        "install-windows.ps1",
-        "memoryctl",
-        "stop-hook.ps1",
-    ]
-    missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
-    add(checks, "runtime_files", "fail" if missing else "pass", "Runtime files complete." if not missing else "Runtime files missing.", {"missing": missing})
+    if PRELOAD_PATH_ISSUES:
+        add(
+            checks,
+            "runtime_config_paths",
+            "fail",
+            "Runtime configuration paths are unsafe; configuration was not loaded.",
+            {"unsafe_paths": PRELOAD_PATH_ISSUES, "config_root": str(CONFIG_ROOT)},
+        )
+        return checks
+    required = list(RUNTIME_FILES)
+    installed_runtime = os.path.normcase(os.path.abspath(LEXICAL_RUNTIME_ROOT)) == os.path.normcase(
+        os.path.abspath(CONFIG_ROOT)
+    )
+    runtime_verification = verify_runtime_install(CONFIG_ROOT) if installed_runtime else None
+    if runtime_verification is not None:
+        runtime_closure = runtime_verification.get("closure", {})
+        missing = sorted(
+            set(runtime_verification.get("missing", []))
+            | set(runtime_closure.get("core_missing", []))
+        )
+        runtime_files_detail = {
+            "missing": missing,
+            "unsafe_paths": runtime_verification.get("unsafe_paths", []),
+        }
+    else:
+        missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
+        runtime_files_detail = {"missing": missing}
+    runtime_files_ok = not missing and not runtime_files_detail.get("unsafe_paths")
+    add(
+        checks,
+        "runtime_files",
+        "pass" if runtime_files_ok else "fail",
+        "Runtime files complete." if runtime_files_ok else "Runtime files missing or unsafe.",
+        runtime_files_detail,
+    )
     intent_enforcement = str(WRITE_INTENT_CONFIG.get("enforcement", "off")).strip().lower() or "off"
     enforcement_status = "fail" if intent_enforcement == "enforce" else ("warn" if intent_enforcement == "advisory" else "pass")
     add(
@@ -637,128 +764,17 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
             ),
         },
     )
-    if REPO_ROOT.resolve() == CONFIG_ROOT.resolve():
-        manifest = read_json_object(RUNTIME_MANIFEST)
-        expected = manifest.get("files") if isinstance(manifest, dict) else None
-        manifest_missing: list[str] = []
-        manifest_mismatch: list[str] = []
-        support_missing: list[str] = []
-        support_mismatch: list[str] = []
-        template_missing: list[str] = []
-        template_mismatch: list[str] = []
-        manifest_symlinked: list[str] = []
-        template_unsafe_names: list[str] = []
-        core_closure_missing = sorted(
-            set(required) - set(expected if isinstance(expected, dict) else {})
-        )
-        core_closure_unexpected = sorted(
-            set(expected if isinstance(expected, dict) else {}) - set(required)
-        )
-        if isinstance(expected, dict):
-            for name, digest in expected.items():
-                normalized = str(name)
-                if normalized not in required:
-                    continue
-                path = SCRIPT_ROOT / normalized
-                if path.is_symlink():
-                    manifest_symlinked.append(normalized)
-                elif not path.is_file():
-                    manifest_missing.append(normalized)
-                elif file_sha256(path) != str(digest):
-                    manifest_mismatch.append(normalized)
-        support_expected = manifest.get("support_files", {}) if isinstance(manifest, dict) else {}
-        required_support = {
-            "requirements-vector.lock",
-            "benchmarks/public-sample.json",
-            "benchmarks/public-policy-reconcile.json",
-            "benchmarks/public-policy-safety.json",
-        }
-        support_closure_missing = sorted(
-            required_support - set(support_expected if isinstance(support_expected, dict) else {})
-        )
-        support_closure_unexpected = sorted(
-            set(support_expected if isinstance(support_expected, dict) else {}) - required_support
-        )
-        if isinstance(support_expected, dict):
-            for name, digest in support_expected.items():
-                normalized = str(name)
-                if normalized not in required_support:
-                    continue
-                path = CONFIG_ROOT / normalized
-                if path.is_symlink():
-                    manifest_symlinked.append(normalized)
-                elif not path.is_file():
-                    support_missing.append(normalized)
-                elif file_sha256(path) != str(digest):
-                    support_mismatch.append(normalized)
-        template_expected = manifest.get("template_files", {}) if isinstance(manifest, dict) else {}
-        required_template_missing = (
-            []
-            if isinstance(template_expected, dict)
-            and "templates/vault/.gitignore" in template_expected
-            else ["templates/vault/.gitignore"]
-        )
-        if isinstance(template_expected, dict):
-            for name, digest in template_expected.items():
-                normalized = str(name)
-                parts = normalized.split("/")
-                if (
-                    "\\" in normalized
-                    or parts[:2] != ["templates", "vault"]
-                    or any(part in {"", ".", ".."} for part in parts)
-                ):
-                    template_unsafe_names.append(normalized)
-                    continue
-                path = CONFIG_ROOT / normalized
-                if path.is_symlink():
-                    manifest_symlinked.append(normalized)
-                elif not path.is_file():
-                    template_missing.append(normalized)
-                elif file_sha256(path) != str(digest):
-                    template_mismatch.append(normalized)
-        manifest_ok = (
-            isinstance(expected, dict)
-            and not RUNTIME_MANIFEST.is_symlink()
-            and not manifest_missing
-            and not manifest_mismatch
-            and not support_missing
-            and not support_mismatch
-            and not template_missing
-            and not template_mismatch
-            and not core_closure_missing
-            and not core_closure_unexpected
-            and not support_closure_missing
-            and not support_closure_unexpected
-            and not required_template_missing
-            and not manifest_symlinked
-            and not template_unsafe_names
-        )
+    if runtime_verification is not None:
+        manifest_ok = bool(runtime_verification.get("ok"))
         add(
             checks,
             "runtime_manifest",
             "pass" if manifest_ok else "fail",
             "Installed runtime matches its manifest." if manifest_ok else "Installed runtime drifted from its manifest.",
-            {
-                "source_commit": manifest.get("source_commit", "") if manifest else "",
-                "source_dirty": bool(manifest.get("source_dirty")) if manifest else False,
-                "manifest_symlink": RUNTIME_MANIFEST.is_symlink(),
-                "missing": manifest_missing,
-                "mismatched": manifest_mismatch,
-                "support_missing": support_missing,
-                "support_mismatched": support_mismatch,
-                "template_missing": template_missing,
-                "template_mismatched": template_mismatch,
-                "symlinked": manifest_symlinked,
-                "closure": {
-                    "core_missing": core_closure_missing,
-                    "core_unexpected": core_closure_unexpected,
-                    "support_missing": support_closure_missing,
-                    "support_unexpected": support_closure_unexpected,
-                    "required_template_missing": required_template_missing,
-                    "template_unsafe_names": template_unsafe_names,
-                },
-            },
+            runtime_verification,
         )
+        if runtime_verification.get("unsafe_paths"):
+            return checks
     if not STATE_DB.exists() and not STATE_DB.is_symlink():
         add(checks, "state_db", "fail", "State database is missing.", {"path": str(STATE_DB)})
         return checks

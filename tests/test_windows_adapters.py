@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,20 @@ SCRIPT_ROOT = REPO_ROOT / "scripts"
 INSTALLER = SCRIPT_ROOT / "install_runtime.py"
 WINDOWS_POWERSHELL = shutil.which("powershell.exe")
 POWERSHELL_7 = shutil.which("pwsh.exe")
+
+
+def make_windows_junction(link: Path, target: Path) -> None:
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if created.returncode != 0:
+        raise OSError(created.stdout + created.stderr)
 
 
 def run_ps(
@@ -385,6 +400,179 @@ class WindowsPowerShellAdapterTests(unittest.TestCase):
             self.assertIn("config_overwritten explicit=", third.stdout)
             self.assertTrue((other_vault / ".git" / "HEAD").is_file())
             self.assertNotEqual(config.read_bytes(), before)
+
+    def test_windows_installer_preflight_rejects_config_directory_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            config_path = runtime / "config" / "agent-memory.toml"
+            config_path.mkdir(parents=True)
+            vault = root / "must-not-exist-vault"
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                SCRIPT_ROOT / "install-windows.ps1",
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                env=isolated_subprocess_env(),
+                timeout=60,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("installer_preflight=error", result.stderr)
+            self.assertFalse(vault.exists())
+            self.assertFalse((runtime / ".venv").exists())
+            self.assertFalse((runtime / "scripts").exists())
+            self.assertFalse((runtime / "config" / "runtime-manifest.json").exists())
+            self.assertTrue(config_path.is_dir())
+
+    def test_windows_installer_preflight_rejects_config_file_symlink_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            config_path = runtime / "config" / "agent-memory.toml"
+            config_path.parent.mkdir(parents=True)
+            outside = root / "outside-config.toml"
+            outside.write_text("sentinel = true\n", encoding="utf-8")
+            try:
+                config_path.symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            vault = root / "must-not-exist-vault"
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                SCRIPT_ROOT / "install-windows.ps1",
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                env=isolated_subprocess_env(),
+                timeout=60,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("installer_preflight=error", result.stderr)
+            self.assertIn("reparse", result.stderr.lower())
+            self.assertFalse(vault.exists())
+            self.assertFalse((runtime / ".venv").exists())
+            self.assertFalse((runtime / "scripts").exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel = true\n")
+
+    def test_windows_installer_preflight_rejects_config_parent_junction_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            runtime.mkdir()
+            outside = root / "outside-config-parent"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            junction = runtime / "config"
+            try:
+                make_windows_junction(junction, outside)
+            except OSError as exc:
+                self.skipTest(f"junctions unavailable: {exc}")
+            vault = root / "must-not-exist-vault"
+            try:
+                result = run_ps(
+                    WINDOWS_POWERSHELL,
+                    SCRIPT_ROOT / "install-windows.ps1",
+                    "-MemoryRoot",
+                    str(vault),
+                    "-ConfigRoot",
+                    str(runtime),
+                    env=isolated_subprocess_env(),
+                    timeout=60,
+                )
+
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("installer_preflight=error", result.stderr)
+                self.assertIn("reparse", result.stderr.lower())
+                self.assertFalse(vault.exists())
+                self.assertFalse((runtime / ".venv").exists())
+                self.assertFalse((runtime / "scripts").exists())
+                self.assertEqual(
+                    sorted(path.name for path in outside.iterdir()),
+                    ["sentinel.txt"],
+                )
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+            finally:
+                os.rmdir(junction)
+
+    def test_windows_installer_rechecks_reserved_config_parent_before_venv(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            vault = root / "must-not-exist-vault"
+            external = root / "external-config-parent"
+            external.mkdir()
+            sentinel = external / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            barrier = root / "agent-memory-installer-test-barrier"
+            barrier.mkdir()
+            env = isolated_subprocess_env(
+                {"AGENT_MEMORY_INSTALLER_TEST_BARRIER": str(barrier)}
+            )
+            command = [
+                WINDOWS_POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SCRIPT_ROOT / "install-windows.ps1"),
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ready = barrier / "ready"
+            deadline = time.monotonic() + 15
+            while not ready.is_file() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready.is_file():
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=30)
+                self.fail("installer test barrier was not reached\n" + stdout + stderr)
+
+            config_dir = runtime / "config"
+            self.assertTrue(config_dir.is_dir())
+            os.rmdir(config_dir)
+            try:
+                make_windows_junction(config_dir, external)
+            except OSError:
+                process.terminate()
+                process.communicate(timeout=30)
+                raise
+            try:
+                (barrier / "continue").write_text("continue\n", encoding="utf-8")
+                stdout, stderr = process.communicate(timeout=60)
+
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("installer_preflight=error", stderr)
+                self.assertIn("reparse", stderr.lower())
+                self.assertFalse((runtime / ".venv").exists())
+                self.assertFalse((runtime / "scripts").exists())
+                self.assertFalse(vault.exists())
+                self.assertEqual(
+                    sorted(path.name for path in external.iterdir()),
+                    ["sentinel.txt"],
+                )
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+            finally:
+                os.rmdir(config_dir)
 
 
 if __name__ == "__main__":
