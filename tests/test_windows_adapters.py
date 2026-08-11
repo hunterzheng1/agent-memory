@@ -401,6 +401,241 @@ class WindowsPowerShellAdapterTests(unittest.TestCase):
             self.assertTrue((other_vault / ".git" / "HEAD").is_file())
             self.assertNotEqual(config.read_bytes(), before)
 
+    def test_windows_installer_explicit_hook_path_preserves_json_idempotently(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime with hooks"
+            vault = root / "vault with hooks"
+            safe_home = root / "fake user"
+            safe_home.mkdir()
+            hooks_path = root / "explicit hooks" / "hooks.json"
+            hooks_path.parent.mkdir()
+            original = {
+                "custom": {"label": "preserve-explicit"},
+                "hooks": {
+                    "Stop": [
+                        {"hooks": [{"type": "command", "command": "existing-stop"}]}
+                    ]
+                },
+            }
+            hooks_path.write_text(json.dumps(original), encoding="utf-8")
+            env = isolated_subprocess_env(
+                {
+                    "USERPROFILE": str(safe_home),
+                    "HOME": str(safe_home),
+                    "LOCALAPPDATA": str(root / "local app data"),
+                }
+            )
+            arguments = (
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                "-InstallCodexHook",
+                "-CodexHooksPath",
+                str(hooks_path),
+            )
+
+            first = run_ps(
+                WINDOWS_POWERSHELL,
+                SCRIPT_ROOT / "install-windows.ps1",
+                *arguments,
+                env=env,
+                timeout=300,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            second = run_ps(
+                WINDOWS_POWERSHELL,
+                runtime / "scripts" / "install-windows.ps1",
+                *arguments,
+                env=env,
+                timeout=300,
+            )
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+            installed = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(installed["custom"], original["custom"])
+            commands = [
+                hook["command"]
+                for group in installed["hooks"]["Stop"]
+                for hook in group.get("hooks", [])
+            ]
+            self.assertIn("existing-stop", commands)
+            managed = [command for command in commands if "stop-hook.ps1" in command.lower()]
+            self.assertEqual(len(managed), 1)
+            self.assertFalse((safe_home / ".codex" / "hooks.json").exists())
+
+    def test_windows_installer_default_hook_parent_reparse_fails_before_barrier(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            vault = root / "must-not-exist-vault"
+            safe_home = root / "fake user"
+            safe_home.mkdir()
+            external = root / "outside hooks"
+            external.mkdir()
+            sentinel = external / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            hooks_parent = safe_home / ".codex"
+            try:
+                make_windows_junction(hooks_parent, external)
+            except OSError as exc:
+                self.skipTest(f"junctions unavailable: {exc}")
+            barrier = root / "agent-memory-installer-test-default-hook-boundary"
+            barrier.mkdir()
+            env = isolated_subprocess_env(
+                {
+                    "USERPROFILE": str(safe_home),
+                    "HOME": str(safe_home),
+                    "LOCALAPPDATA": str(root / "local app data"),
+                    "AGENT_MEMORY_INSTALLER_TEST_BARRIER": str(barrier),
+                }
+            )
+            command = [
+                WINDOWS_POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SCRIPT_ROOT / "install-windows.ps1"),
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                "-InstallCodexHook",
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ready = barrier / "ready"
+            deadline = time.monotonic() + 15
+            try:
+                while (
+                    not ready.is_file()
+                    and process.poll() is None
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.05)
+                if ready.is_file():
+                    process.terminate()
+                    stdout, stderr = process.communicate(timeout=30)
+                    self.fail(
+                        "unsafe default hooks path reached the installer barrier\n"
+                        + stdout
+                        + stderr
+                    )
+                stdout, stderr = process.communicate(timeout=30)
+
+                self.assertNotEqual(process.returncode, 0, stdout + stderr)
+                self.assertIn("installer_preflight=error", stderr)
+                self.assertIn("reparse", stderr.lower())
+                self.assertFalse((runtime / ".venv").exists())
+                self.assertFalse((runtime / "scripts").exists())
+                self.assertFalse(vault.exists())
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.communicate(timeout=30)
+                os.rmdir(hooks_parent)
+
+    def test_windows_installer_default_hook_path_uses_temporary_userprofile(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "default hook runtime"
+            vault = root / "default hook vault"
+            safe_home = root / "temporary user profile"
+            safe_home.mkdir()
+            hooks_path = safe_home / ".codex" / "hooks.json"
+            env = isolated_subprocess_env(
+                {
+                    "USERPROFILE": str(safe_home),
+                    "HOME": str(safe_home),
+                    "LOCALAPPDATA": str(root / "local app data"),
+                }
+            )
+            arguments = (
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                "-InstallCodexHook",
+            )
+
+            first = run_ps(
+                WINDOWS_POWERSHELL,
+                SCRIPT_ROOT / "install-windows.ps1",
+                *arguments,
+                env=env,
+                timeout=300,
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            second = run_ps(
+                WINDOWS_POWERSHELL,
+                runtime / "scripts" / "install-windows.ps1",
+                *arguments,
+                env=env,
+                timeout=300,
+            )
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+            installed = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            commands = [
+                hook["command"]
+                for group in installed["hooks"]["Stop"]
+                for hook in group.get("hooks", [])
+            ]
+            managed = [command for command in commands if "stop-hook.ps1" in command.lower()]
+            self.assertEqual(len(managed), 1)
+
+    def test_windows_installer_hook_file_symlink_fails_before_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            vault = root / "must-not-exist-vault"
+            hooks_path = root / "hooks" / "hooks.json"
+            hooks_path.parent.mkdir()
+            external = root / "outside-hooks.json"
+            external.write_text('{"sentinel":"unchanged"}\n', encoding="utf-8")
+            try:
+                hooks_path.symlink_to(external)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                SCRIPT_ROOT / "install-windows.ps1",
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+                "-InstallCodexHook",
+                "-CodexHooksPath",
+                str(hooks_path),
+                env=isolated_subprocess_env(),
+                timeout=60,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("installer_preflight=error", result.stderr)
+            self.assertIn("reparse", result.stderr.lower())
+            self.assertFalse((runtime / ".venv").exists())
+            self.assertFalse((runtime / "scripts").exists())
+            self.assertFalse(vault.exists())
+            self.assertEqual(
+                external.read_text(encoding="utf-8"),
+                '{"sentinel":"unchanged"}\n',
+            )
+
     def test_windows_installer_preflight_rejects_config_directory_before_side_effects(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             root = Path(raw_root).resolve()

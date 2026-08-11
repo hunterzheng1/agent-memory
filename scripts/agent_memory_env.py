@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import ast
 import re
+import stat
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import tomllib
@@ -14,6 +15,7 @@ except ImportError:  # pragma: no cover - Python 3.10 fallback for import-time c
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
+FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 LOCAL_PATH_DEFAULTS: dict[str, tuple[str, ...]] = {
     "CONFIG_ROOT": (),
     "STATE_DB": ("state.sqlite",),
@@ -67,6 +69,174 @@ def config_path() -> Path:
     if explicit:
         return resolve_config_path(explicit)
     return RUNTIME_ROOT / "config" / "agent-memory.toml"
+
+
+class ConfigPathSecurityError(OSError):
+    """A lexical config path changed or redirected during a stable read."""
+
+    def __init__(self, path: Path, reason: str, detail: str = "") -> None:
+        self.path = path
+        self.reason = reason
+        self.detail = detail
+        message = f"unsafe config path ({reason}): {path}"
+        if detail:
+            message += f" ({detail})"
+        super().__init__(message)
+
+    def as_issue(self) -> dict[str, str]:
+        issue = {"path": str(self.path), "reason": self.reason}
+        if self.detail:
+            issue["detail"] = self.detail
+        return issue
+
+
+def _lexical_absolute_path(raw_path: str | os.PathLike[str]) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(raw_path))))
+
+
+def _config_path_components(path: Path) -> list[Path]:
+    absolute = _lexical_absolute_path(path)
+    anchor = Path(absolute.anchor)
+    components = [anchor]
+    cursor = anchor
+    for part in absolute.parts[1:]:
+        cursor = cursor / part
+        components.append(cursor)
+    return components
+
+
+def _metadata_is_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        int(getattr(metadata, "st_file_attributes", 0))
+        & FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _stable_config_lstat(path: Path) -> os.stat_result | None:
+    components = _config_path_components(path)
+    for index, component in enumerate(components):
+        final = index == len(components) - 1
+        try:
+            metadata = os.lstat(component)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ConfigPathSecurityError(
+                component,
+                "metadata_error",
+                exc.__class__.__name__,
+            ) from exc
+        if _metadata_is_reparse(metadata):
+            raise ConfigPathSecurityError(component, "reparse_point")
+        if not final and not stat.S_ISDIR(metadata.st_mode):
+            raise ConfigPathSecurityError(component, "parent_not_directory")
+        if final and not stat.S_ISREG(metadata.st_mode):
+            raise ConfigPathSecurityError(component, "not_regular_file")
+    return metadata
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
+    # Windows can expose different st_ctime_ns values for lstat(path) and
+    # fstat(handle) on the same file. Device and file index are the stable
+    # cross-handle identity pair supplied by CPython on supported platforms.
+    return (int(metadata.st_dev), int(metadata.st_ino))
+
+
+def _metadata_content_state(metadata: os.stat_result) -> tuple[int, int]:
+    return (
+        int(metadata.st_size),
+        int(getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1_000_000_000))),
+    )
+
+
+def _same_stable_config_file(
+    expected: os.stat_result,
+    observed: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(observed.st_mode)
+        and not _metadata_is_reparse(observed)
+        and _metadata_identity(expected) == _metadata_identity(observed)
+    )
+
+
+def _parse_config_bytes(payload_bytes: bytes) -> dict[str, Any]:
+    try:
+        payload_text = payload_bytes.decode("utf-8")
+        if tomllib is not None:
+            payload = tomllib.loads(payload_text)
+        else:
+            payload = parse_toml_fallback(payload_text)
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_config_stable(
+    raw_path: str | os.PathLike[str],
+    *,
+    before_open: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Read one lexical TOML file without parsing bytes from a redirected path."""
+
+    path = _lexical_absolute_path(raw_path)
+    before_metadata = _stable_config_lstat(path)
+    if before_metadata is None:
+        return {}
+    if before_open is not None:
+        before_open()
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    descriptor: int | None = None
+    payload_bytes = bytearray()
+    try:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ConfigPathSecurityError(
+                path,
+                "config_file_changed",
+                exc.__class__.__name__,
+            ) from exc
+        opened_metadata = os.fstat(descriptor)
+        if not _same_stable_config_file(before_metadata, opened_metadata):
+            raise ConfigPathSecurityError(path, "config_file_changed")
+
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            payload_bytes.extend(block)
+
+        after_descriptor_metadata = os.fstat(descriptor)
+        after_path_metadata = _stable_config_lstat(path)
+        if after_path_metadata is None:
+            raise ConfigPathSecurityError(path, "config_file_changed")
+        stable_identity = (
+            _same_stable_config_file(before_metadata, after_descriptor_metadata)
+            and _same_stable_config_file(before_metadata, after_path_metadata)
+        )
+        expected_content_state = _metadata_content_state(before_metadata)
+        stable_content = (
+            _metadata_content_state(after_descriptor_metadata) == expected_content_state
+            and _metadata_content_state(after_path_metadata) == expected_content_state
+            and len(payload_bytes) == after_descriptor_metadata.st_size
+        )
+        if not stable_identity or not stable_content:
+            raise ConfigPathSecurityError(path, "config_file_changed")
+    except ConfigPathSecurityError:
+        raise
+    except OSError as exc:
+        raise ConfigPathSecurityError(
+            path,
+            "config_file_changed",
+            exc.__class__.__name__,
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    return _parse_config_bytes(bytes(payload_bytes))
 
 
 

@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from agent_memory_env import env_value, load_config, resolve_config_path
+from agent_memory_env import (
+    ConfigPathSecurityError,
+    env_value,
+    load_config_stable,
+    resolve_config_path,
+)
 from agent_memory_state import absolute_path, secure_sqlite_connect, sqlite_permission_report
 from install_runtime import CORE_FILES, managed_path_issue, verify as verify_runtime_install
 
@@ -105,12 +110,20 @@ for _issue in _config_path_issues(CONFIG_ROOT, CONFIG_FILE):
         PRELOAD_PATH_ISSUES.append(_issue)
 RUNTIME_CONFIG: dict[str, Any] = {}
 if not PRELOAD_PATH_ISSUES:
-    RUNTIME_CONFIG = load_config()
-    configured_root = _lexical_config_path(
-        str(os.environ.get("AGENT_MEMORY_CONFIG_ROOT") or RUNTIME_CONFIG.get("config_root") or CONFIG_ROOT)
-    )
-    PRELOAD_PATH_ISSUES.extend(_config_path_issues(configured_root, CONFIG_FILE))
-    CONFIG_ROOT = configured_root
+    try:
+        RUNTIME_CONFIG = load_config_stable(CONFIG_FILE)
+    except ConfigPathSecurityError as exc:
+        PRELOAD_PATH_ISSUES.append(exc.as_issue())
+    if not PRELOAD_PATH_ISSUES:
+        configured_root = _lexical_config_path(
+            str(
+                os.environ.get("AGENT_MEMORY_CONFIG_ROOT")
+                or RUNTIME_CONFIG.get("config_root")
+                or CONFIG_ROOT
+            )
+        )
+        PRELOAD_PATH_ISSUES.extend(_config_path_issues(configured_root, CONFIG_FILE))
+        CONFIG_ROOT = configured_root
 
 SCRIPT_ROOT = REPO_ROOT / "scripts"
 RUNTIME_MANIFEST = CONFIG_ROOT / "config" / "runtime-manifest.json"

@@ -85,6 +85,97 @@ class RuntimeInstallTests(unittest.TestCase):
             check=False,
         )
 
+    def run_doctor_with_config_replacement_race(
+        self,
+        doctor_path: Path,
+        config_root: Path,
+        config_file: Path,
+        external_file: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        probe = textwrap.dedent(
+            """
+            import io
+            import os
+            import runpy
+            import sys
+
+            doctor_path, config_path, external_path = sys.argv[1:]
+            sys.path.insert(0, os.path.dirname(doctor_path))
+            import agent_memory_env
+
+            external_metadata = os.stat(external_path)
+            external_identity = (external_metadata.st_dev, external_metadata.st_ino)
+            original_io_open = io.open
+            original_os_read = os.read
+
+            def points_at_external(path):
+                try:
+                    metadata = os.stat(path)
+                except (OSError, TypeError, ValueError):
+                    return False
+                return (metadata.st_dev, metadata.st_ino) == external_identity
+
+            def guarded_io_open(path, *args, **kwargs):
+                if points_at_external(path):
+                    raise RuntimeError("external_config_read")
+                return original_io_open(path, *args, **kwargs)
+
+            def guarded_os_read(descriptor, size):
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == external_identity:
+                    raise RuntimeError("external_config_read")
+                return original_os_read(descriptor, size)
+
+            io.open = guarded_io_open
+            os.read = guarded_os_read
+
+            def replace_before_open():
+                os.unlink(config_path)
+                os.symlink(external_path, config_path)
+
+            if hasattr(agent_memory_env, "load_config_stable"):
+                original_loader = agent_memory_env.load_config_stable
+
+                def racing_loader(path):
+                    return original_loader(path, before_open=replace_before_open)
+
+                agent_memory_env.load_config_stable = racing_loader
+            else:
+                original_loader = agent_memory_env.load_config
+
+                def racing_loader():
+                    replace_before_open()
+                    return original_loader()
+
+                agent_memory_env.load_config = racing_loader
+
+            sys.argv = [doctor_path, "--json"]
+            runpy.run_path(doctor_path, run_name="__main__")
+            """
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                probe,
+                str(doctor_path),
+                str(config_file),
+                str(external_file),
+            ],
+            cwd=config_root.parent,
+            env=isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_ROOT": str(config_root),
+                    "AGENT_MEMORY_CONFIG_FILE": str(config_file),
+                    "AGENT_MEMORY_STATE_DB": str(config_root / "state.sqlite"),
+                }
+            ),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+
     def test_doctor_rejects_config_root_reparse_before_loading_config(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             base = Path(raw_root).resolve()
@@ -172,6 +263,51 @@ class RuntimeInstallTests(unittest.TestCase):
                 self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
             finally:
                 remove_directory_reparse(config_link)
+
+    def test_doctor_rejects_config_replacement_before_reading_external_target(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            base = Path(raw_root).resolve()
+            runtime = base / "runtime"
+            installed = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(runtime), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            config_file = runtime / "config" / "agent-memory.toml"
+            config_file.write_text("user_id = 'safe-config'\n", encoding="utf-8")
+            external = base / "external-config.toml"
+            external.write_text("user_id = 'external-read-payload'\n", encoding="utf-8")
+            capability_link = base / "symlink-capability.toml"
+            try:
+                capability_link.symlink_to(external)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            else:
+                capability_link.unlink()
+
+            doctor = self.run_doctor_with_config_replacement_race(
+                runtime / "scripts" / "agent_memory_doctor.py",
+                runtime,
+                config_file,
+                external,
+            )
+
+            self.assertEqual(doctor.returncode, 2, doctor.stdout + doctor.stderr)
+            self.assertNotIn("external_config_read", doctor.stderr)
+            self.assertNotIn("external-read-payload", doctor.stdout + doctor.stderr)
+            payload = json.loads(doctor.stdout)
+            self.assertEqual(
+                [item["name"] for item in payload["checks"]],
+                ["runtime_config_paths"],
+            )
+            self.assertIn(
+                "changed",
+                json.dumps(payload["checks"][0]["detail"]["unsafe_paths"]).lower(),
+            )
 
     def test_install_rejects_managed_parent_reparse_before_external_write(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:

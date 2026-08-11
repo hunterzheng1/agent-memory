@@ -42,6 +42,19 @@ $configDir = Join-Path $ConfigRoot 'config'
 $configPath = Join-Path $configDir 'agent-memory.toml'
 $runtimeScripts = Join-Path $ConfigRoot 'scripts'
 $runtimeManifest = Join-Path $configDir 'runtime-manifest.json'
+if ($InstallCodexHook) {
+    if ([string]::IsNullOrWhiteSpace($CodexHooksPath)) {
+        $codexUserProfile = [string]$env:USERPROFILE
+        if ([string]::IsNullOrWhiteSpace($codexUserProfile)) {
+            $codexUserProfile = [Environment]::GetFolderPath('UserProfile')
+        }
+        if ([string]::IsNullOrWhiteSpace($codexUserProfile)) {
+            throw 'installer_preflight=error reason=missing_user_profile'
+        }
+        $CodexHooksPath = Join-Path $codexUserProfile '.codex\hooks.json'
+    }
+    $CodexHooksPath = [System.IO.Path]::GetFullPath($CodexHooksPath)
+}
 
 function Get-LexicalPathComponents([string]$Path) {
     $fullPath = [System.IO.Path]::GetFullPath($Path)
@@ -468,12 +481,26 @@ Assert-InstallerBoundary
 Invoke-Checked $venvPython @((Join-Path $runtimeScripts 'agent_memory_check.py')) 'structure check'
 
 if ($InstallCodexHook) {
-    $hookArgs = @('-RuntimeRoot', $ConfigRoot)
-    if ($CodexHooksPath) { $hookArgs += @('-HooksPath', $CodexHooksPath) }
-    if ($AutoCloseout) { $hookArgs += '-AutoCloseout' }
     Assert-InstallerBoundary
-    & (Join-Path $runtimeScripts 'install-codex-hook.ps1') @hookArgs
+    $hookAllowedChanges = @($CodexHooksPath)
+    $hooksParent = Split-Path -Parent $CodexHooksPath
+    foreach ($component in @(Get-LexicalPathComponents $hooksParent)) {
+        if (
+            $script:installerPathSnapshot.ContainsKey($component) -and
+            $script:installerPathSnapshot[$component] -eq 'missing'
+        ) {
+            $hookAllowedChanges += $component
+        }
+    }
+    $hookParameters = @{
+        RuntimeRoot = $ConfigRoot
+        HooksPath = $CodexHooksPath
+    }
+    if ($AutoCloseout) { $hookParameters['AutoCloseout'] = $true }
+    & (Join-Path $runtimeScripts 'install-codex-hook.ps1') @hookParameters
     if ($LASTEXITCODE -ne 0) { throw "Codex hook installation failed with exit code $LASTEXITCODE" }
+    Assert-InstallerSnapshot -AllowedChanges $hookAllowedChanges
+    Set-InstallerPathSnapshot
 }
 if ($InstallAuditTask) {
     Assert-InstallerBoundary
