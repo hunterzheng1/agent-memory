@@ -25,6 +25,7 @@ CORE_FILES = (
     "agent_memory_host.py",
     "agent_memory_index.py",
     "agent_memory_lock.py",
+    "agent_memory_paths.py",
     "agent_memory_retrieval_benchmark.py",
     "agent_memory_search.py",
     "agent_memory_session_hook.py",

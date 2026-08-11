@@ -19,9 +19,7 @@ class RuntimeInstallTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             root = Path(raw_root).resolve()
             scripts = root / "scripts"
-            scripts.mkdir(parents=True)
             local_adapter = scripts / "local_adapter.py"
-            local_adapter.write_text("LOCAL = True\n", encoding="utf-8")
 
             first = subprocess.run(
                 [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
@@ -35,22 +33,28 @@ class RuntimeInstallTests(unittest.TestCase):
             payload = json.loads(first.stdout)
             self.assertIn("memoryctl", payload["changed"])
             self.assertIn("agent_memory_lock.py", payload["changed"])
+            self.assertIn("agent_memory_paths.py", payload["changed"])
             self.assertIn("requirements-vector.lock", payload["changed"])
-            self.assertTrue(local_adapter.exists())
             self.assertTrue((scripts / "agent_memory_lock.py").is_file())
+            self.assertTrue((scripts / "agent_memory_paths.py").is_file())
             self.assertTrue((root / "requirements-vector.lock").is_file())
+            local_adapter.write_text("LOCAL = True\n", encoding="utf-8")
 
             runtime_env = isolated_subprocess_env(
-                {"AGENT_MEMORY_CONFIG_ROOT": str(root)}
+                {
+                    "AGENT_MEMORY_CONFIG_ROOT": str(root),
+                    "AGENT_MEMORY_ROOT": str(REPO_ROOT / "templates" / "vault"),
+                    "AGENT_MEMORY_GIT_ROOT": str(REPO_ROOT),
+                }
             )
             runtime = subprocess.run(
                 [
                     sys.executable,
                     str(scripts / "memoryctl"),
                     "--actor",
-                    "cursor",
-                    "version",
-                    "--json",
+                    "codex",
+                    "check",
+                    "--skip-state-db",
                 ],
                 cwd=root,
                 env=runtime_env,
@@ -60,7 +64,7 @@ class RuntimeInstallTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(runtime.returncode, 0, runtime.stdout + runtime.stderr)
-            self.assertIn("source_commit", json.loads(runtime.stdout))
+            self.assertIn("agent_memory_check=ok", runtime.stdout)
 
             verify = subprocess.run(
                 [sys.executable, str(INSTALLER), "--config-root", str(root), "--verify", "--json"],

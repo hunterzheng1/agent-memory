@@ -73,6 +73,7 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_session_hook.py",
     SCRIPT_ROOT / "agent_memory_stop_hook.py",
     SCRIPT_ROOT / "agent_memory_env.py",
+    SCRIPT_ROOT / "agent_memory_paths.py",
     SCRIPT_ROOT / "install_runtime.py",
     SCRIPT_ROOT / "memoryctl",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import ast
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -145,6 +146,139 @@ def _toml_array_is_complete(value: str) -> bool:
     return depth <= 0
 
 
+_TOML_INTEGER = re.compile(
+    r"[+-]?(?:0|[1-9](?:_?\d)*|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|"
+    r"0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*)"
+)
+_TOML_BASIC_ESCAPES = {
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "f": "\f",
+    "r": "\r",
+    '"': '"',
+    "\\": "\\",
+}
+
+
+class _TomlValueParser:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.index = 0
+
+    def parse(self) -> object:
+        value = self._parse_value()
+        self._skip_whitespace()
+        if self.index != len(self.text):
+            raise ValueError(f"unexpected TOML value suffix at offset {self.index}")
+        return value
+
+    def _skip_whitespace(self) -> None:
+        while self.index < len(self.text) and self.text[self.index] in {" ", "\t"}:
+            self.index += 1
+
+    def _parse_value(self) -> object:
+        self._skip_whitespace()
+        if self.index >= len(self.text):
+            raise ValueError("missing TOML value")
+        char = self.text[self.index]
+        if char == '"':
+            return self._parse_basic_string()
+        if char == "'":
+            return self._parse_literal_string()
+        if char == "[":
+            return self._parse_array()
+
+        start = self.index
+        while (
+            self.index < len(self.text)
+            and self.text[self.index] not in {" ", "\t", ",", "]"}
+        ):
+            self.index += 1
+        token = self.text[start:self.index]
+        if token == "true":
+            return True
+        if token == "false":
+            return False
+        if _TOML_INTEGER.fullmatch(token):
+            return int(token.replace("_", ""), 0)
+        raise ValueError(f"unsupported TOML value: {token!r}")
+
+    def _parse_basic_string(self) -> str:
+        self.index += 1
+        chars: list[str] = []
+        while self.index < len(self.text):
+            char = self.text[self.index]
+            self.index += 1
+            if char == '"':
+                return "".join(chars)
+            if char != "\\":
+                if ord(char) < 0x20:
+                    raise ValueError("unescaped control character in TOML basic string")
+                chars.append(char)
+                continue
+            if self.index >= len(self.text):
+                raise ValueError("unterminated TOML basic string escape")
+            escape = self.text[self.index]
+            self.index += 1
+            if escape in _TOML_BASIC_ESCAPES:
+                chars.append(_TOML_BASIC_ESCAPES[escape])
+                continue
+            if escape in {"u", "U"}:
+                width = 4 if escape == "u" else 8
+                digits = self.text[self.index:self.index + width]
+                if len(digits) != width or not re.fullmatch(
+                    rf"[0-9A-Fa-f]{{{width}}}", digits
+                ):
+                    raise ValueError("invalid TOML unicode escape")
+                self.index += width
+                codepoint = int(digits, 16)
+                if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                    raise ValueError("invalid TOML unicode scalar")
+                chars.append(chr(codepoint))
+                continue
+            raise ValueError(f"invalid TOML basic string escape: \\{escape}")
+        raise ValueError("unterminated TOML basic string")
+
+    def _parse_literal_string(self) -> str:
+        self.index += 1
+        end = self.text.find("'", self.index)
+        if end < 0:
+            raise ValueError("unterminated TOML literal string")
+        value = self.text[self.index:end]
+        if any(ord(char) < 0x20 for char in value):
+            raise ValueError("control character in TOML literal string")
+        self.index = end + 1
+        return value
+
+    def _parse_array(self) -> list[object]:
+        self.index += 1
+        values: list[object] = []
+        self._skip_whitespace()
+        if self.index < len(self.text) and self.text[self.index] == "]":
+            self.index += 1
+            return values
+        while True:
+            values.append(self._parse_value())
+            self._skip_whitespace()
+            if self.index >= len(self.text):
+                raise ValueError("unterminated TOML array")
+            delimiter = self.text[self.index]
+            self.index += 1
+            if delimiter == "]":
+                return values
+            if delimiter != ",":
+                raise ValueError(f"expected TOML array delimiter at offset {self.index - 1}")
+            self._skip_whitespace()
+            if self.index < len(self.text) and self.text[self.index] == "]":
+                self.index += 1
+                return values
+
+
+def _parse_toml_value(raw_value: str) -> object:
+    return _TomlValueParser(raw_value).parse()
+
+
 def parse_toml_fallback(text: str) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     section: tuple[str, ...] = ()
@@ -171,17 +305,7 @@ def parse_toml_fallback(text: str) -> dict[str, Any]:
                 if _toml_array_is_complete(joined):
                     break
             raw_value = " ".join(value_lines)
-        try:
-            value: object = ast.literal_eval(raw_value)
-        except (SyntaxError, ValueError):
-            lowered = raw_value.lower()
-            if lowered in {"true", "false"}:
-                value = lowered == "true"
-            else:
-                try:
-                    value = int(raw_value)
-                except ValueError:
-                    value = raw_value
+        value = _parse_toml_value(raw_value)
         target = payload
         for part in section:
             child = target.setdefault(part, {})

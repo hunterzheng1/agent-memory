@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 
 import agent_memory_claim as claim
 import agent_memory_doctor as doctor
+import agent_memory_index as index
 
 
 def git(root: Path, *args: str) -> str:
@@ -32,6 +33,20 @@ def git(root: Path, *args: str) -> str:
 
 
 class DurabilityGuardTests(unittest.TestCase):
+    def test_runtime_health_requires_path_resolver_dependency(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp).resolve()
+            with mock.patch.multiple(
+                doctor,
+                SCRIPT_ROOT=tmp / "empty-scripts",
+                STATE_DB=tmp / "missing-state.sqlite",
+                CONFIG_ROOT=tmp / "runtime",
+            ):
+                checks = doctor.collect_checks()
+
+        runtime = next(item for item in checks if item["name"] == "runtime_files")
+        self.assertIn("agent_memory_paths.py", runtime["detail"]["missing"])
+
     def test_derived_repair_uses_configured_semantic_python(self) -> None:
         configured_python = Path("/configured/vector/python")
         with mock.patch.object(doctor, "SEMANTIC_ENABLED", True), mock.patch.object(
@@ -145,6 +160,11 @@ class DurabilityGuardTests(unittest.TestCase):
     def test_codebuddy_stop_hook_requires_actor_flag_in_settings(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
             tmp = Path(raw_tmp).resolve()
+            vault = tmp / "vault"
+            vault.mkdir()
+            state_db = tmp / "state.sqlite"
+            with sqlite3.connect(state_db) as conn:
+                index.init_db(conn)
             settings = tmp / "settings.json"
             settings.write_text(
                 '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"python agent_memory_stop_hook.py --actor codebuddy --protocol claude"}]}]}}',
@@ -156,13 +176,22 @@ class DurabilityGuardTests(unittest.TestCase):
                 encoding="utf-8",
             )
             host = {"codebuddy_settings_json": str(settings)}
-            with mock.patch.object(doctor, "HOST_CONFIG", host):
+            doctor_globals = {
+                "STATE_DB": state_db,
+                "VAULT_ROOT": vault,
+                "GIT_ROOT": tmp,
+                "CONFIG_ROOT": tmp / "runtime",
+                "AUDIT_LOG": tmp / "audit.jsonl",
+                "CLOSEOUT_LOG": tmp / "closeout.jsonl",
+                "SEMANTIC_ENABLED": False,
+            }
+            with mock.patch.multiple(doctor, HOST_CONFIG=host, **doctor_globals):
                 checks = doctor.collect_checks(allow_dirty_memory=True)
             by_name = {c["name"]: c for c in checks}
             self.assertEqual(by_name["codebuddy_stop_hook"]["status"], "pass")
 
             host_weak = {"codebuddy_settings_json": str(weak)}
-            with mock.patch.object(doctor, "HOST_CONFIG", host_weak):
+            with mock.patch.multiple(doctor, HOST_CONFIG=host_weak, **doctor_globals):
                 checks_weak = doctor.collect_checks(allow_dirty_memory=True)
             by_weak = {c["name"]: c for c in checks_weak}
             self.assertEqual(by_weak["codebuddy_stop_hook"]["status"], "warn")

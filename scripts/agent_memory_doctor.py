@@ -471,6 +471,7 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         "agent_memory_session_hook.py",
         "agent_memory_stop_hook.py",
         "agent_memory_env.py",
+        "agent_memory_paths.py",
         "install_runtime.py",
         "memoryctl",
     ]

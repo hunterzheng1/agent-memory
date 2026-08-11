@@ -76,3 +76,10 @@ jobs:
             $allErrors | ForEach-Object { Write-Host $_ }
             exit 1
           }
+      - name: Smoke installed runtime with Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: >-
+          python -m unittest
+          tests.test_runtime_install.RuntimeInstallTests.test_install_is_idempotent_and_preserves_local_adapter
+          -v
