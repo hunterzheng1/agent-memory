@@ -21,7 +21,14 @@ from typing import Any
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_host import actor_names
 from agent_memory_lock import try_lock, unlock
-from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
+from agent_memory_claim import (
+    active_claim_rows,
+    all_active_claim_rows,
+    complete_claim_paths,
+    deletion_commit_matches_audit,
+    parse_deleted_observation,
+    record_file_observations,
+)
 from agent_memory_safety import KNOWLEDGE_KINDS, SOURCE_CLASSES, assess_source, record_assessment
 from agent_memory_state import secure_append_text, secure_sqlite_connect
 import agent_memory_intent as write_intent
@@ -58,7 +65,14 @@ PYTHON = env_value("PYTHON", sys.executable)
 ZVEC_PYTHON = env_value("ZVEC_PYTHON", PYTHON)
 
 MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
-TOP_LEVEL_MEMORY_FILES = {"AGENTS.md", "INDEX.md", "README.md", "STRUCTURE.md"}
+TOP_LEVEL_MEMORY_FILES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODEBUDDY.md",
+    "INDEX.md",
+    "README.md",
+    "STRUCTURE.md",
+}
 RECONCILE_ACTIONS = {
     "ADD",
     "UPDATE",
@@ -239,6 +253,16 @@ def repo_path_in_vault(repo_path: str) -> bool:
     return candidate == vault_repo_path or candidate.startswith(f"{vault_repo_path}/")
 
 
+def repo_path_is_memory_markdown(repo_path: str) -> bool:
+    if not repo_path_in_vault(repo_path):
+        return False
+    return GitEntry(
+        status="",
+        repo_path=repo_path,
+        path=(REPO_ROOT / repo_path).resolve(),
+    ).is_memory_markdown
+
+
 def git_status_entries() -> tuple[list[GitEntry], list[str]]:
     result = run_command(
         [
@@ -267,10 +291,10 @@ def git_status_entries() -> tuple[list[GitEntry], list[str]]:
             previous_repo_path = items[index + 1]
             index += 1
         if entry:
-            if repo_path_in_vault(entry.repo_path):
+            if repo_path_is_memory_markdown(entry.repo_path):
                 entry.previous_repo_path = previous_repo_path
                 entries.append(entry)
-            elif entry.status.startswith("R") and repo_path_in_vault(previous_repo_path):
+            elif entry.status.startswith("R") and repo_path_is_memory_markdown(previous_repo_path):
                 old_path = (REPO_ROOT / previous_repo_path).resolve()
                 entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
         index += 1
@@ -339,7 +363,7 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
             previous_repo_path = ""
             repo_path = items[index]
             index += 1
-        if repo_path_in_vault(repo_path):
+        if repo_path_is_memory_markdown(repo_path):
             entries.append(
                 GitEntry(
                     status=status,
@@ -348,7 +372,7 @@ def git_history_entries(baseline: str, head: str) -> tuple[list[GitEntry], list[
                     previous_repo_path=previous_repo_path,
                 )
             )
-        elif status.startswith("R") and repo_path_in_vault(previous_repo_path):
+        elif status.startswith("R") and repo_path_is_memory_markdown(previous_repo_path):
             old_path = (REPO_ROOT / previous_repo_path).resolve()
             entries.append(GitEntry(status="D", repo_path=previous_repo_path, path=old_path))
     return entries, []
@@ -367,6 +391,9 @@ def explicit_entries(paths: list[str]) -> tuple[list[GitEntry], list[str]]:
             repo_path = str(path.relative_to(REPO_ROOT))
         except ValueError:
             warnings.append(f"changed file outside repo skipped: {path}")
+            continue
+        if not repo_path_is_memory_markdown(repo_path):
+            warnings.append(f"changed non-memory file skipped: {path}")
             continue
         status = "??" if path.exists() else "D"
         entries.append(GitEntry(status=status, repo_path=repo_path, path=path))
@@ -1178,17 +1205,102 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
             pragmas=("PRAGMA busy_timeout=5000",),
         ) as conn:
             rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+            try:
+                deletion_rows = conn.execute(
+                    """
+                    SELECT path, sentinel, actor, user_authorized,
+                           deletion_commit, parent_commit, prior_sha256,
+                           trash_sha256, trash_path_sha256,
+                           evidence_ref_sha256, evidence_ref_length
+                    FROM memory_deletion_observations
+                    """
+                ).fetchall()
+            except sqlite3.Error:
+                deletion_rows = []
     except (OSError, sqlite3.Error):
         return entries
     observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    deletion_audits: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for row in deletion_rows:
+        (
+            path,
+            sentinel,
+            actor,
+            user_authorized,
+            deletion_commit,
+            parent_commit,
+            prior_sha256,
+            trash_sha256,
+            trash_path_sha256,
+            evidence_ref_sha256,
+            evidence_ref_length,
+        ) = row
+        parsed = parse_deleted_observation(str(sentinel))
+        try:
+            authorized = int(user_authorized) == 1
+            evidence_length = int(evidence_ref_length)
+        except (TypeError, ValueError):
+            continue
+        if (
+            parsed is None
+            or str(actor) != "human"
+            or not authorized
+            or parsed != (str(deletion_commit), str(prior_sha256))
+            or str(trash_sha256) != str(prior_sha256)
+            or re.fullmatch(r"[0-9a-f]{40}", str(parent_commit)) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(trash_path_sha256)) is None
+            or re.fullmatch(r"[0-9a-f]{64}", str(evidence_ref_sha256)) is None
+            or not 0 < evidence_length <= 4096
+        ):
+            continue
+        deletion_audits[(str(Path(str(path)).resolve()), str(sentinel))] = (
+            parsed[0],
+            parsed[1],
+            str(parent_commit),
+        )
     pending: list[GitEntry] = []
     for entry in entries:
+        resolved_path = str(entry.path.resolve())
         try:
             digest = hashlib.sha256(entry.path.read_bytes()).hexdigest()
         except OSError:
+            sentinel = observed.get(resolved_path, "")
+            parsed = parse_deleted_observation(sentinel)
+            audit = deletion_audits.get((resolved_path, sentinel))
+            if (
+                entry.is_deleted
+                and parsed is not None
+                and audit is not None
+                and audit[:2] == parsed
+                and deletion_commit_matches_audit(
+                    parsed[0],
+                    entry.repo_path,
+                    audit[2],
+                    parsed[1],
+                    git_root=REPO_ROOT,
+                )
+            ):
+                deletion_commit, _prior_sha256 = parsed
+                latest = run_command(
+                    [
+                        "git",
+                        "-C",
+                        str(REPO_ROOT),
+                        "log",
+                        "-1",
+                        "--format=%H",
+                        "HEAD",
+                        "--",
+                        entry.repo_path,
+                    ],
+                    timeout=30,
+                )
+                latest_commit = str(latest.get("stdout", "")).strip().lower()
+                if latest.get("ok") and latest_commit == deletion_commit:
+                    continue
             pending.append(entry)
             continue
-        if observed.get(str(entry.path.resolve())) != digest:
+        if observed.get(resolved_path) != digest:
             pending.append(entry)
     return pending
 
@@ -1215,35 +1327,60 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     previous_observed_head = last_observed_git_head()
     history_entries, history_warnings = git_history_entries(previous_observed_head, git_head_before)
     warnings.extend(history_warnings)
-    if history_entries:
-        info.append(f"recovered {len(history_entries)} memory file changes from Git history after an external/automatic commit")
+    pending_history_entries = unobserved_history_entries(history_entries)
+    if pending_history_entries:
+        info.append(
+            f"recovered {len(pending_history_entries)} unobserved memory file changes "
+            "from Git history after an external/automatic commit"
+        )
+    observed_history_count = len(history_entries) - len(pending_history_entries)
+    if observed_history_count:
+        info.append(
+            f"ignored {observed_history_count} historical memory files with matching observations"
+        )
     explicit, explicit_warnings = explicit_entries(args.changed_file)
     warnings.extend(explicit_warnings)
 
-    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in history_entries}
+    by_path: dict[Path, GitEntry] = {entry.path: entry for entry in pending_history_entries}
     for entry in git_entries:
         by_path[entry.path] = entry
     for entry in explicit:
         by_path[entry.path] = entry
     discovered_entries = list(by_path.values())
     session_claim_rows = (
-        active_claim_rows(args.session_id, args.actor, read_only=args.dry_run)
+        active_claim_rows(
+            args.session_id,
+            args.actor,
+            read_only=args.dry_run,
+            max_age_hours=24,
+        )
         if args.session_id
         else []
     )
     claim_rows = session_claim_rows if args.claimed_only else []
     claimed_paths = {Path(row["path"]).resolve() for row in claim_rows}
-    unclaimed_entries: list[GitEntry] = []
+    excluded_entries: list[GitEntry] = []
+    truly_unclaimed_entries: list[GitEntry] = []
+    other_session_entries: list[GitEntry] = []
     ownership_error = ""
     if args.claimed_only:
+        active_rows = all_active_claim_rows(max_age_hours=24, read_only=args.dry_run)
+        all_claimed_paths = {Path(row["path"]).resolve() for row in active_rows}
+        excluded_entries = [entry for entry in discovered_entries if entry.path not in claimed_paths]
+        truly_unclaimed_entries = [
+            entry for entry in excluded_entries if entry.path not in all_claimed_paths
+        ]
+        other_session_entries = [
+            entry for entry in excluded_entries if entry.path in all_claimed_paths
+        ]
         if not args.session_id:
             ownership_error = "claimed-only closeout requires --session-id"
-        elif not claimed_paths:
+        elif truly_unclaimed_entries:
             ownership_error = (
-                "no active memory claims for this session; claim each changed file with "
+                f"no active memory claims cover {len(truly_unclaimed_entries)} changed file(s); "
+                "claim each changed file with "
                 f"memoryctl --actor {args.actor} claim --file <path>"
             )
-        unclaimed_entries = [entry for entry in discovered_entries if entry.path not in claimed_paths]
         selected = {entry.path: entry for entry in discovered_entries if entry.path in claimed_paths}
         for path in claimed_paths:
             try:
@@ -1255,8 +1392,10 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
                 GitEntry(status="M" if path.exists() else "D", repo_path=repo_path, path=path),
             )
         all_entries = list(selected.values())
-        if unclaimed_entries:
-            info.append(f"excluded {len(unclaimed_entries)} files owned by other or unclaimed sessions")
+        if other_session_entries:
+            info.append(f"excluded {len(other_session_entries)} files owned by other active sessions")
+        if truly_unclaimed_entries:
+            info.append(f"found {len(truly_unclaimed_entries)} files with no active session claim")
     else:
         all_entries = discovered_entries
 
@@ -1289,7 +1428,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     intent_error = ""
     try:
         intent_gate = write_intent.enforce_protected_changes(
-            [entry.path for entry in all_entries],
+            [entry.path for entry in process_entries],
             actor=args.actor,
             raw_session_id=args.session_id,
             intent_ids=claim_intent_ids,
@@ -1393,7 +1532,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
                 break
 
     if args.dry_run:
-        warnings.append("dry_run: no index refresh, zvec refresh, or commit will be written")
+        info.append("dry_run: no index refresh, zvec refresh, or commit will be written")
     if git_entries:
         info.append(
             "git reports dirty Agent Memory files; if some are historical, review dry-run output before committing"
@@ -1426,8 +1565,9 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
             info.append(f"audit dry-run check: {due_text}; report={audit_payload.get('report_path', '')}")
         else:
             info.append(f"audit check: {audit_status}; report={audit_payload.get('report_path', '')}")
-    elif not audit_step.get("ok"):
-        info.append(f"audit autorun failed: {str(audit_step.get('stderr', '')).strip()[:300]}")
+    elif not audit_step.get("ok") and not audit_step.get("skipped"):
+        detail = str(audit_step.get("stderr", "")).strip() or str(audit_step.get("detail", "")).strip()
+        info.append(f"audit autorun failed: {detail[:300]}")
 
     blocking_reconcile = bool(reconcile_findings)
     step_failed = bool(preflight_error) or not all(
@@ -1533,7 +1673,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     warnings.extend(after_warnings)
     dirty_paths = {entry.path for entry in git_entries}
     unclaimed_history = unobserved_history_entries(
-        [entry for entry in history_entries if entry.path in {item.path for item in unclaimed_entries}]
+        [entry for entry in pending_history_entries if entry.path in {item.path for item in excluded_entries}]
     )
     can_advance_baseline = (
         status == "ok" and not step_failed and intent_step.get("ok")
@@ -1568,7 +1708,8 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
         "git_would_observe_through": would_observe_through,
         "changed_files": [entry.repo_path for entry in all_entries],
         "claimed_files": sorted(row["rel_path"] for row in claim_rows),
-        "unclaimed_files": sorted(entry.repo_path for entry in unclaimed_entries),
+        "unclaimed_files": sorted(entry.repo_path for entry in truly_unclaimed_entries),
+        "other_session_files": sorted(entry.repo_path for entry in other_session_entries),
         "processed_files": [relative_to_vault(path) for path in process_files],
         "deleted_files_skipped": [entry.repo_path for entry in deleted_entries],
         "reconcile_findings": reconcile_findings,

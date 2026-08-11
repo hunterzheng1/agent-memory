@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 
 import agent_memory_claim as claim
 import agent_memory_check as check
+import agent_memory_closeout as closeout
 import agent_memory_doctor as doctor
 import agent_memory_index as index
 import install_runtime as runtime
@@ -35,6 +36,108 @@ def git(root: Path, *args: str) -> str:
 
 
 class DurabilityGuardTests(unittest.TestCase):
+    def test_index_initializes_recovery_audit_tables(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        index.init_db(conn)
+        tables = {
+            str(row[0])
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        conn.close()
+        self.assertIn("memory_deletion_observations", tables)
+        self.assertIn("memory_committed_observations", tables)
+
+    def test_doctor_reports_unobserved_closeout_history(self) -> None:
+        pending = closeout.GitEntry(
+            status="M",
+            repo_path="AgentMemory/项目/pending.md",
+            path=Path("/tmp/AgentMemory/项目/pending.md"),
+        )
+        with (
+            mock.patch.object(closeout, "last_observed_git_head", return_value="a" * 40),
+            mock.patch.object(closeout, "current_git_head", return_value=("b" * 40, [])),
+            mock.patch.object(closeout, "git_history_entries", return_value=([pending], [])),
+            mock.patch.object(closeout, "unobserved_history_entries", return_value=[pending]),
+            mock.patch.object(closeout, "relative_to_vault", return_value="项目/pending.md"),
+        ):
+            healthy, detail = doctor.closeout_observation_health()
+        self.assertFalse(healthy)
+        self.assertEqual(detail["pending_count"], 1)
+        self.assertEqual(detail["pending_existing"], ["项目/pending.md"])
+        self.assertEqual(detail["pending_deleted"], [])
+
+    def test_doctor_accepts_fully_observed_closeout_history(self) -> None:
+        with (
+            mock.patch.object(closeout, "last_observed_git_head", return_value="a" * 40),
+            mock.patch.object(closeout, "current_git_head", return_value=("b" * 40, [])),
+            mock.patch.object(closeout, "git_history_entries", return_value=([], [])),
+            mock.patch.object(closeout, "unobserved_history_entries", return_value=[]),
+        ):
+            healthy, detail = doctor.closeout_observation_health()
+        self.assertTrue(healthy)
+        self.assertEqual(detail["pending_count"], 0)
+
+    def test_doctor_validates_claude_compatible_hook_lifecycle(self) -> None:
+        def hooks(actor: str, *, session_end_nonblocking: bool = True) -> dict[str, object]:
+            nonblocking = " --non-blocking" if session_end_nonblocking else ""
+            return {
+                "Stop": [{"hooks": [{
+                    "type": "command",
+                    "command": (
+                        f"agent_memory_stop_hook.py --actor {actor} --protocol claude "
+                        "--event stop-hook --auto-closeout"
+                    ),
+                    "timeout": 320,
+                }]}],
+                "SessionEnd": [{"hooks": [{
+                    "type": "command",
+                    "command": (
+                        f"agent_memory_stop_hook.py --actor {actor} --protocol claude "
+                        f"--event session-end{nonblocking} --auto-closeout"
+                    ),
+                    "timeout": 60,
+                }]}],
+                "SessionStart": [{"hooks": [{
+                    "type": "command",
+                    "command": f"agent_memory_session_hook.py --actor {actor}",
+                    "timeout": 10,
+                }]}],
+            }
+
+        for actor in ("claude", "codebuddy"):
+            with self.subTest(actor=actor):
+                healthy, detail = doctor.claude_compatible_hook_semantics(hooks(actor), actor)
+                self.assertTrue(healthy, detail)
+                broken, broken_detail = doctor.claude_compatible_hook_semantics(
+                    hooks(actor, session_end_nonblocking=False),
+                    actor,
+                )
+                self.assertFalse(broken)
+                self.assertFalse(broken_detail["session_end_non_blocking"])
+
+        impostor = hooks("claude")
+        for event in ("Stop", "SessionEnd", "SessionStart"):
+            command = impostor[event][0]["hooks"][0]["command"]
+            impostor[event][0]["hooks"][0]["command"] = command.replace(
+                "--actor claude",
+                "--actor claude-malicious",
+            )
+        healthy, _detail = doctor.claude_compatible_hook_semantics(impostor, "claude")
+        self.assertFalse(healthy)
+
+    def test_search_log_privacy_detects_plain_used_paths_after_query_redaction(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE memory_search_log(query TEXT, used_paths TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO memory_search_log VALUES (?, ?)",
+            ("[redacted:abc123]", "项目/private-customer.md"),
+        )
+        healthy, detail = doctor.search_log_privacy_health(conn)
+        conn.close()
+        self.assertFalse(healthy)
+        self.assertEqual(detail["legacy_raw_rows"], 1)
     def test_local_check_covers_runtime_dependency_closure(self) -> None:
         checked_files = {path.name for path in check.REQUIRED_LOCAL_FILES}
         self.assertEqual(checked_files, set(runtime.CORE_FILES))
@@ -218,6 +321,10 @@ class DurabilityGuardTests(unittest.TestCase):
                     )
                     conn.commit()
                 self.assertEqual(claim.all_active_claim_rows(max_age_hours=24), [])
+                self.assertEqual(
+                    claim.active_claim_rows("old-session", "codex", max_age_hours=24),
+                    [],
+                )
                 rows, applied = claim.expire_stale_claims(24, apply=False)
                 self.assertEqual((len(rows), applied), (1, 0))
                 with sqlite3.connect(state_db) as conn:

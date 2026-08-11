@@ -2,15 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
+import os
+import re
 import sqlite3
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_host import actor_names, resolve
+from agent_memory_lock import try_lock, unlock
 import agent_memory_intent as write_intent
 from agent_memory_state import absolute_path, secure_sqlite_connect
 
@@ -20,6 +26,28 @@ VAULT_ROOT = resolve_config_path(env_value("ROOT", str(RUNTIME_ROOT / "templates
 STATE_DB = absolute_path(
     resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
 )
+CONFIG_ROOT = resolve_config_path(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))
+
+
+def find_default_git_root() -> Path:
+    for candidate in (VAULT_ROOT, *VAULT_ROOT.parents):
+        if (candidate / ".git").exists():
+            return candidate.resolve()
+    return VAULT_ROOT.resolve()
+
+
+GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(find_default_git_root())))
+FORMAL_MEMORY_TOP_LEVELS = {"用户记忆", "项目", "工作流", "决策", "agent"}
+FORMAL_TOP_LEVEL_FILES = {
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CODEBUDDY.md",
+    "INDEX.md",
+    "README.md",
+    "STRUCTURE.md",
+}
+DELETED_OBSERVATION_RE = re.compile(r"^deleted:([0-9a-f]{40}):([0-9a-f]{64})$")
+DELETION_OBSERVATION_LOCK = CONFIG_ROOT / "locks" / "closeout.lock"
 
 
 def utc_now() -> str:
@@ -32,6 +60,22 @@ def file_sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def deleted_observation_sentinel(deletion_commit: str, prior_sha256: str) -> str:
+    value = f"deleted:{deletion_commit.strip().lower()}:{prior_sha256.strip().lower()}"
+    if parse_deleted_observation(value) is None:
+        raise ValueError("deleted observation requires a 40-hex commit and 64-hex prior SHA-256")
+    return value
+
+
+def parse_deleted_observation(value: str) -> tuple[str, str] | None:
+    """Parse a deletion sentinel without trusting state or consulting Git."""
+
+    match = DELETED_OBSERVATION_RE.fullmatch(str(value or ""))
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
 
 
 def session_value(explicit: str = "", actor: str = "codex") -> str:
@@ -82,6 +126,48 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL DEFAULT '',
           observed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_deletion_observations (
+          observation_id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          sentinel TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          user_authorized INTEGER NOT NULL,
+          deletion_commit TEXT NOT NULL,
+          parent_commit TEXT NOT NULL,
+          prior_sha256 TEXT NOT NULL,
+          trash_sha256 TEXT NOT NULL,
+          trash_path_sha256 TEXT NOT NULL,
+          evidence_ref_sha256 TEXT NOT NULL,
+          evidence_ref_length INTEGER NOT NULL,
+          observed_at TEXT NOT NULL,
+          UNIQUE(path, deletion_commit)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_committed_observations (
+          observation_id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          user_authorized INTEGER NOT NULL,
+          intent_id TEXT NOT NULL,
+          receipt_id TEXT NOT NULL,
+          proposal_commit TEXT NOT NULL,
+          observed_git_head TEXT NOT NULL,
+          audit_chain_sha256 TEXT NOT NULL,
+          evidence_ref_sha256 TEXT NOT NULL,
+          evidence_ref_length INTEGER NOT NULL,
+          observed_at TEXT NOT NULL,
+          UNIQUE(path, intent_id, proposal_commit)
         )
         """
     )
@@ -157,6 +243,960 @@ def normalize_claim_path(raw: str, *, allow_missing: bool = False) -> tuple[Path
     if not path.exists():
         raise ValueError(f"claim path does not exist: {path}")
     return path, rel_path
+
+
+def _is_formal_memory_markdown(rel_path: Path) -> bool:
+    if rel_path.suffix.lower() != ".md":
+        return False
+    if len(rel_path.parts) == 1:
+        return rel_path.name in FORMAL_TOP_LEVEL_FILES
+    return bool(rel_path.parts) and rel_path.parts[0] in FORMAL_MEMORY_TOP_LEVELS
+
+
+def _normalize_missing_formal_path(raw: str) -> tuple[Path, str, str]:
+    path = Path(raw).expanduser()
+    try:
+        path = ((Path.cwd() / path) if not path.is_absolute() else path).resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("deletion target path could not be resolved") from exc
+    try:
+        relative = path.relative_to(VAULT_ROOT)
+    except ValueError as exc:
+        raise ValueError("deletion target is outside the memory vault") from exc
+    if not _is_formal_memory_markdown(relative):
+        raise ValueError("deletion target is not formal vault Markdown")
+    if any(character in relative.as_posix() for character in ("\0", "\n", "\r", "\t")):
+        raise ValueError("deletion target contains unsupported control characters")
+    if os.path.lexists(path):
+        raise ValueError("deletion target still exists")
+    if not path.parent.is_dir():
+        raise ValueError("deletion target parent directory does not exist")
+    try:
+        repo_path = path.relative_to(GIT_ROOT).as_posix()
+    except ValueError as exc:
+        raise ValueError("memory vault is outside the configured Git root") from exc
+    return path, relative.as_posix(), repo_path
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_recognized_trash_path(path: Path) -> bool:
+    """Accept real platform Trash roots, never a lookalike path component."""
+
+    home_trash = (Path.home() / ".Trash").resolve(strict=False)
+    if _path_is_within(path, home_trash):
+        return True
+    xdg_root = Path(
+        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    ).expanduser().resolve(strict=False)
+    if _path_is_within(path, xdg_root / "Trash" / "files"):
+        return True
+    if os.name == "nt":
+        recycle_root = Path(path.anchor) / "$Recycle.Bin"
+        return bool(path.anchor) and _path_is_within(path, recycle_root)
+    if hasattr(os, "getuid"):
+        try:
+            volume_relative = path.relative_to(Path("/Volumes"))
+        except ValueError:
+            volume_relative = None
+        if volume_relative is not None:
+            parts = volume_relative.parts
+            if len(parts) >= 4 and parts[1:3] == (".Trashes", str(os.getuid())):
+                return True
+    return False
+
+
+def _normalize_trash_file(raw: str) -> Path:
+    lexical_path = Path(raw).expanduser()
+    if not lexical_path.is_absolute():
+        raise ValueError("Trash path must be absolute")
+    if lexical_path.is_symlink():
+        raise ValueError("Trash evidence is not an existing regular file")
+    try:
+        path = lexical_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Trash evidence is not an existing regular file") from exc
+    if not _is_recognized_trash_path(path):
+        raise ValueError("provided path is not inside a recognized Trash location")
+    if not path.is_file():
+        raise ValueError("Trash evidence is not an existing regular file")
+    return path
+
+
+def _run_git(
+    *args: str,
+    timeout: int = 30,
+    git_root: Path | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(git_root or GIT_ROOT), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Git validation could not be completed") from exc
+
+
+def _require_clean_git_path(repo_path: str) -> None:
+    result = _run_git(
+        "-c",
+        "core.quotepath=false",
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        repo_path,
+    )
+    if result.returncode != 0:
+        raise ValueError("target Git state could not be verified")
+    if result.stdout:
+        raise ValueError("deletion target has uncommitted Git index or worktree state")
+
+
+def _resolved_commit(raw_commit: str, *, git_root: Path | None = None) -> str:
+    candidate = raw_commit.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{7,40}", candidate):
+        raise ValueError("commit must be a hexadecimal Git commit id")
+    result = _run_git(
+        "rev-parse",
+        "--verify",
+        f"{candidate}^{{commit}}",
+        git_root=git_root,
+    )
+    resolved = result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+        raise ValueError("commit cannot be resolved")
+    return resolved
+
+
+def _deletion_parent_and_prior_sha(
+    deletion_commit: str,
+    repo_path: str,
+    *,
+    git_root: Path | None = None,
+) -> tuple[str, str]:
+    parents_result = _run_git(
+        "rev-list",
+        "--parents",
+        "-n",
+        "1",
+        deletion_commit,
+        git_root=git_root,
+    )
+    tokens = parents_result.stdout.decode("ascii", errors="ignore").strip().lower().split()
+    if parents_result.returncode != 0 or not tokens or tokens[0] != deletion_commit or len(tokens) < 2:
+        raise ValueError("deletion commit has no verifiable parent")
+    if _run_git(
+        "cat-file",
+        "-e",
+        f"{deletion_commit}:{repo_path}",
+        git_root=git_root,
+    ).returncode == 0:
+        raise ValueError("deletion commit still contains the target path")
+    for parent_commit in tokens[1:]:
+        status_result = _run_git(
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            parent_commit,
+            deletion_commit,
+            "--",
+            repo_path,
+            git_root=git_root,
+        )
+        parts = [part for part in status_result.stdout.split(b"\0") if part]
+        if status_result.returncode != 0 or len(parts) < 2:
+            continue
+        try:
+            changed_path = parts[1].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            continue
+        if parts[0] != b"D" or changed_path != repo_path:
+            continue
+        blob_result = _run_git(
+            "rev-parse",
+            "--verify",
+            f"{parent_commit}:{repo_path}",
+            git_root=git_root,
+        )
+        blob_oid = blob_result.stdout.decode("ascii", errors="ignore").strip().lower()
+        if blob_result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", blob_oid):
+            continue
+        content_result = _run_git("cat-file", "blob", blob_oid, git_root=git_root)
+        if content_result.returncode == 0:
+            return parent_commit, hashlib.sha256(content_result.stdout).hexdigest()
+    raise ValueError("provided commit did not delete the target relative to a parent")
+
+
+def deletion_commit_matches_audit(
+    deletion_commit: str,
+    repo_path: str,
+    parent_commit: str,
+    prior_sha256: str,
+    *,
+    git_root: Path | None = None,
+) -> bool:
+    """Revalidate a stored deletion audit against immutable Git history."""
+
+    try:
+        resolved = _resolved_commit(deletion_commit, git_root=git_root)
+        actual_parent, actual_prior_sha256 = _deletion_parent_and_prior_sha(
+            resolved,
+            repo_path,
+            git_root=git_root,
+        )
+    except (UnicodeError, ValueError):
+        return False
+    return (
+        resolved == deletion_commit.strip().lower()
+        and actual_parent == parent_commit.strip().lower()
+        and actual_prior_sha256 == prior_sha256.strip().lower()
+    )
+
+
+def validate_deletion_observation(
+    *,
+    actor: str,
+    target_file: str,
+    trash_file: str,
+    deletion_commit: str,
+    evidence_ref: str,
+    user_authorized: bool,
+) -> dict[str, Any]:
+    if actor != "human":
+        raise ValueError("deletion observations are restricted to actor=human")
+    if not user_authorized:
+        raise ValueError("explicit user authorization flag is required")
+    evidence = evidence_ref.strip()
+    if not evidence:
+        raise ValueError("evidence ref is required")
+    if len(evidence) > 4096:
+        raise ValueError("evidence ref is too long")
+
+    target, rel_path, repo_path = _normalize_missing_formal_path(target_file)
+    trash = _normalize_trash_file(trash_file)
+    _require_clean_git_path(repo_path)
+    resolved_commit = _resolved_commit(deletion_commit)
+    ancestor = _run_git("merge-base", "--is-ancestor", resolved_commit, "HEAD")
+    if ancestor.returncode == 1:
+        raise ValueError("deletion commit is not an ancestor of current HEAD")
+    if ancestor.returncode != 0:
+        raise ValueError("deletion commit ancestry could not be verified")
+    parent_commit, prior_sha256 = _deletion_parent_and_prior_sha(resolved_commit, repo_path)
+    latest_result = _run_git("log", "-1", "--format=%H", "HEAD", "--", repo_path)
+    latest_commit = latest_result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if latest_result.returncode != 0 or latest_commit != resolved_commit:
+        raise ValueError("deletion commit is not the target path's latest change")
+    try:
+        trash_sha256 = file_sha256(trash)
+    except OSError as exc:
+        raise ValueError("Trash evidence could not be read") from exc
+    if trash_sha256 != prior_sha256:
+        raise ValueError("Trash evidence SHA-256 does not match the pre-deletion Git blob")
+
+    evidence_sha256 = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+    trash_path_sha256 = hashlib.sha256(str(trash).encode("utf-8")).hexdigest()
+    sentinel = deleted_observation_sentinel(resolved_commit, prior_sha256)
+    material = "\0".join((str(target), sentinel, trash_path_sha256, evidence_sha256, "explicit_user"))
+    return {
+        "observation_id": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        "path": str(target),
+        "rel_path": rel_path,
+        "sentinel": sentinel,
+        "actor": actor,
+        "user_authorized": 1,
+        "deletion_commit": resolved_commit,
+        "parent_commit": parent_commit,
+        "prior_sha256": prior_sha256,
+        "trash_sha256": trash_sha256,
+        "trash_path_sha256": trash_path_sha256,
+        "evidence_ref_sha256": evidence_sha256,
+        "evidence_ref_length": len(evidence),
+    }
+
+
+@contextlib.contextmanager
+def deletion_observation_lock(timeout: float = 15.0):
+    DELETION_OBSERVATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with DELETION_OBSERVATION_LOCK.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + max(timeout, 0.0)
+        while True:
+            try:
+                if try_lock(handle):
+                    break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("another memory closeout or observation is still running")
+            time.sleep(0.1)
+        try:
+            yield
+        finally:
+            unlock(handle)
+
+
+def _store_deletion_observation(observation: dict[str, Any]) -> int:
+    now = utc_now()
+    columns = (
+        "observation_id",
+        "path",
+        "rel_path",
+        "sentinel",
+        "actor",
+        "user_authorized",
+        "deletion_commit",
+        "parent_commit",
+        "prior_sha256",
+        "trash_sha256",
+        "trash_path_sha256",
+        "evidence_ref_sha256",
+        "evidence_ref_length",
+    )
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            """
+            SELECT observation_id, path, rel_path, sentinel, actor, user_authorized,
+                   deletion_commit, parent_commit, prior_sha256, trash_sha256,
+                   trash_path_sha256, evidence_ref_sha256, evidence_ref_length
+            FROM memory_deletion_observations WHERE path=? AND deletion_commit=?
+            """,
+            (observation["path"], observation["deletion_commit"]),
+        ).fetchone()
+        expected = tuple(observation[column] for column in columns)
+        if existing is not None:
+            if tuple(existing[column] for column in columns) != expected:
+                conn.rollback()
+                raise ValueError("existing deletion audit record does not match this evidence")
+            current = conn.execute(
+                "SELECT sha256 FROM memory_file_observations WHERE path=?",
+                (observation["path"],),
+            ).fetchone()
+            if current is not None and str(current[0]) == observation["sentinel"]:
+                conn.rollback()
+                return 0
+        else:
+            conn.execute(
+                """
+                INSERT INTO memory_deletion_observations (
+                  observation_id, path, rel_path, sentinel, actor, user_authorized,
+                  deletion_commit, parent_commit, prior_sha256, trash_sha256,
+                  trash_path_sha256, evidence_ref_sha256, evidence_ref_length, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*expected, now),
+            )
+        conn.execute(
+            """
+            INSERT INTO memory_file_observations (
+              path, rel_path, sha256, actor, session_hash, observed_at
+            ) VALUES (?, ?, ?, ?, '', ?)
+            ON CONFLICT(path) DO UPDATE SET
+              rel_path=excluded.rel_path,
+              sha256=excluded.sha256,
+              actor=excluded.actor,
+              session_hash='',
+              observed_at=excluded.observed_at
+            """,
+            (
+                observation["path"],
+                observation["rel_path"],
+                observation["sentinel"],
+                observation["actor"],
+                now,
+            ),
+        )
+        conn.commit()
+    return 1
+
+
+def apply_deletion_observation(
+    observation: dict[str, Any],
+    *,
+    actor: str,
+    target_file: str,
+    trash_file: str,
+    deletion_commit: str,
+    evidence_ref: str,
+    user_authorized: bool,
+) -> int:
+    with deletion_observation_lock():
+        refreshed = validate_deletion_observation(
+            actor=actor,
+            target_file=target_file,
+            trash_file=trash_file,
+            deletion_commit=deletion_commit,
+            evidence_ref=evidence_ref,
+            user_authorized=user_authorized,
+        )
+        if refreshed != observation:
+            raise ValueError("deletion evidence changed between preview and apply")
+        return _store_deletion_observation(refreshed)
+
+
+def safe_deletion_observation_payload(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: observation[key]
+        for key in (
+            "rel_path",
+            "sentinel",
+            "actor",
+            "user_authorized",
+            "deletion_commit",
+            "parent_commit",
+            "prior_sha256",
+            "trash_sha256",
+            "trash_path_sha256",
+            "evidence_ref_sha256",
+            "evidence_ref_length",
+        )
+    }
+
+
+def _normalize_existing_formal_path(raw: str) -> tuple[Path, str, str]:
+    path, rel_path = normalize_claim_path(raw)
+    if not _is_formal_memory_markdown(Path(rel_path)):
+        raise ValueError("committed observation target is not formal vault Markdown")
+    try:
+        repo_path = path.relative_to(GIT_ROOT).as_posix()
+    except ValueError as exc:
+        raise ValueError("memory vault is outside the configured Git root") from exc
+    return path, rel_path, repo_path
+
+
+def _git_blob_oid(commit: str, repo_path: str) -> str:
+    result = _run_git("rev-parse", "--verify", f"{commit}:{repo_path}")
+    oid = result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+        raise ValueError("committed target blob could not be resolved")
+    return oid
+
+
+def _clean_filtered_blob_oid(data: bytes, repo_path: str) -> str:
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(GIT_ROOT),
+                "hash-object",
+                f"--path={repo_path}",
+                "--stdin",
+            ],
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Git clean-filter validation could not be completed") from exc
+    oid = result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+        raise ValueError("Git clean-filter validation could not be completed")
+    return oid
+
+
+def _git_commit_matches_worktree(commit: str, repo_path: str, data: bytes) -> bool:
+    """Bind raw worktree bytes to a committed blob through configured clean filters."""
+
+    return _git_blob_oid(commit, repo_path) == _clean_filtered_blob_oid(data, repo_path)
+
+
+def _current_git_head() -> str:
+    result = _run_git("rev-parse", "--verify", "HEAD^{commit}")
+    head = result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise ValueError("current Git HEAD could not be resolved")
+    return head
+
+
+def _committed_chain_sha256(
+    intent: dict[str, Any],
+    receipt: dict[str, Any],
+    safety: dict[str, Any],
+) -> str:
+    safe_intent = dict(intent)
+    snapshot = str(safe_intent.pop("proposal_canonical_snapshot", ""))
+    safe_intent["proposal_canonical_snapshot_sha256"] = hashlib.sha256(
+        snapshot.encode("utf-8")
+    ).hexdigest()
+    payload = {"intent": safe_intent, "receipt": dict(receipt), "safety": dict(safety)}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_committed_observation(
+    *,
+    actor: str,
+    target_file: str,
+    intent_id: str,
+    evidence_ref: str,
+    user_authorized: bool,
+) -> dict[str, Any]:
+    """Verify an already-committed protected write from an expired intent chain."""
+
+    if actor != "human":
+        raise ValueError("committed observations are restricted to actor=human")
+    if not user_authorized:
+        raise ValueError("explicit user authorization flag is required")
+    evidence = evidence_ref.strip()
+    if not evidence:
+        raise ValueError("evidence ref is required")
+    if len(evidence) > 4096:
+        raise ValueError("evidence ref is too long")
+    intent_id = intent_id.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", intent_id):
+        raise ValueError("historical intent id is invalid")
+
+    target, rel_path, repo_path = _normalize_existing_formal_path(target_file)
+    if not write_intent.is_protected_target(target):
+        raise ValueError("committed observation recovery is restricted to protected memory")
+    _require_clean_git_path(repo_path)
+    try:
+        current_bytes = target.read_bytes()
+        current_digest = write_intent.content_hashes(current_bytes)
+    except OSError as exc:
+        raise ValueError("committed observation target could not be read") from exc
+    current_sha256 = current_digest.raw_sha256
+    current_canonical_sha256 = current_digest.canonical_sha256
+    head = _current_git_head()
+    if not _git_commit_matches_worktree(head, repo_path, current_bytes):
+        raise ValueError("target content does not match the current HEAD blob")
+
+    with connect(read_only=True) as conn:
+        intent_row = conn.execute(
+            "SELECT * FROM memory_write_intents WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        receipt_row = conn.execute(
+            "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+            (intent_id,),
+        ).fetchone()
+        safety_row = None
+        if intent_row is not None:
+            safety_row = conn.execute(
+                "SELECT * FROM memory_safety_log WHERE id=? AND run_id=?",
+                (intent_row["safety_audit_id"], intent_row["safety_run_id"]),
+            ).fetchone()
+        target_key = write_intent.canonical_target(target).target_key
+        other_active_intents = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_write_intents "
+                "WHERE target_key=? AND intent_id<>? "
+                "AND status IN ('pending','approved','bound','validated')",
+                (target_key, intent_id),
+            ).fetchone()[0]
+        )
+        active_claims = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_session_claims WHERE path=? AND status='active'",
+                (str(target),),
+            ).fetchone()[0]
+        )
+    if intent_row is None or receipt_row is None or safety_row is None:
+        raise ValueError("historical intent, safety audit, and terminal receipt are all required")
+    if other_active_intents or active_claims:
+        raise ValueError("target still has an active intent or session claim")
+
+    intent = {key: intent_row[key] for key in intent_row.keys()}
+    receipt = {key: receipt_row[key] for key in receipt_row.keys()}
+    safety = {key: safety_row[key] for key in safety_row.keys()}
+    proposal_commit = str(intent.get("proposal_commit", "")).lower()
+    proposal_sha256 = str(intent.get("proposal_raw_sha256", "")).lower()
+    receipt_id = str(receipt.get("receipt_id", "")).lower()
+    original_evidence = str(intent.get("evidence_ref_sha256", "")).lower()
+    historical_actor = str(intent.get("actor", ""))
+    historical_session = str(intent.get("session_hash", ""))
+    asserted_by = str(intent.get("asserted_by", ""))
+    base_head = str(intent.get("base_git_head", "")).lower()
+    validated_head = str(intent.get("validated_git_head", "")).lower()
+    created_at = write_intent.parse_time(str(intent.get("created_at", "")))
+    validated_at = write_intent.parse_time(str(intent.get("validated_at", "")))
+    expires_at = write_intent.parse_time(str(intent.get("expires_at", "")))
+    receipt_created_at = write_intent.parse_time(str(receipt.get("created_at", "")))
+    safety_created_at = write_intent.parse_time(str(safety.get("created_at", "")))
+    now = dt.datetime.now(dt.timezone.utc)
+    recoverable_actors = {
+        name for name in actor_names() if name not in {"human", "migration", "test"}
+    }
+
+    exact_intent = (
+        str(intent.get("target_rel_path", "")) == rel_path
+        and str(intent.get("target_key", "")) == target_key
+        and historical_actor in recoverable_actors
+        and re.fullmatch(r"[0-9a-f]{16}", historical_session) is not None
+        and str(intent.get("status", "")) == "expired"
+        and str(intent.get("reason_code", "")) == "INTENT_EXPIRED"
+        and int(intent.get("intent_system_enabled", 0)) == 1
+        and str(intent.get("effective_enforcement", "")) in {"advisory", "enforce"}
+        and str(intent.get("source_class", "")) == "user_direct"
+        and str(intent.get("knowledge_kind", "")) in {"preference", "rule"}
+        and str(intent.get("safety_decision", "")) == "ALLOW"
+        and str(intent.get("safety_reason_code", "")) == "SOURCE_ALLOWED"
+        and int(intent.get("approval_required", 1)) == 0
+        and bool(asserted_by)
+        and bool(str(intent.get("bound_at", "")))
+        and bool(str(intent.get("validated_at", "")))
+        and str(intent.get("validation_mode", "")) == "exact"
+        and int(intent.get("early_commit", 0)) == 1
+        and proposal_sha256 == current_sha256
+        and str(intent.get("proposal_canonical_sha256", "")).lower() == current_canonical_sha256
+        and str(intent.get("final_raw_sha256", "")).lower() == current_sha256
+        and str(intent.get("final_canonical_sha256", "")).lower() == current_canonical_sha256
+        and str(intent.get("safety_input_sha256", "")).lower() == current_sha256
+        and int(intent.get("safety_input_length", 0)) > 0
+        and re.fullmatch(r"[0-9a-f]{64}", original_evidence) is not None
+        and re.fullmatch(r"[0-9a-f]{40}", proposal_commit) is not None
+        and re.fullmatch(r"[0-9a-f]{40}", base_head) is not None
+        and base_head != proposal_commit
+        and re.fullmatch(r"[0-9a-f]{40}", validated_head) is not None
+        and created_at is not None
+        and validated_at is not None
+        and expires_at is not None
+        and receipt_created_at is not None
+        and safety_created_at is not None
+        and created_at <= safety_created_at <= validated_at <= expires_at <= receipt_created_at <= now
+    )
+    exact_receipt = (
+        str(receipt.get("intent_id", "")) == intent_id
+        and str(receipt.get("actor", "")) == historical_actor
+        and str(receipt.get("session_hash", "")) == historical_session
+        and str(receipt.get("target_rel_path", "")) == rel_path
+        and str(receipt.get("target_key", "")) == target_key
+        and str(receipt.get("outcome", "")) == "expired"
+        and str(receipt.get("reason_code", "")) == "INTENT_EXPIRED"
+        and str(receipt.get("detail_code", "")) == "TTL_ELAPSED"
+        and str(receipt.get("validation_mode", "")) == "exact"
+        and int(receipt.get("early_commit", 0)) == 1
+        and str(receipt.get("proposal_commit", "")).lower() == proposal_commit
+        and str(receipt.get("base_raw_sha256", "")).lower()
+        == str(intent.get("base_raw_sha256", "")).lower()
+        and str(receipt.get("proposal_raw_sha256", "")).lower() == current_sha256
+        and str(receipt.get("proposal_canonical_sha256", "")).lower() == current_canonical_sha256
+        and str(receipt.get("final_raw_sha256", "")).lower() == current_sha256
+        and str(receipt.get("final_canonical_sha256", "")).lower() == current_canonical_sha256
+        and str(receipt.get("source_class", "")) == "user_direct"
+        and str(receipt.get("knowledge_kind", "")) in {"preference", "rule"}
+        and str(receipt.get("safety_decision", "")) == "ALLOW"
+        and str(receipt.get("safety_reason_code", "")) == "SOURCE_ALLOWED"
+        and str(receipt.get("safety_input_sha256", "")).lower() == current_sha256
+        and int(receipt.get("safety_input_length", 0)) == int(intent.get("safety_input_length", 0))
+        and str(receipt.get("evidence_ref_sha256", "")).lower() == original_evidence
+        and str(receipt.get("base_git_head", "")).lower() == base_head
+        and str(receipt.get("validated_git_head", "")).lower() == validated_head
+        and str(receipt.get("git_commit", "")) == ""
+        and str(receipt.get("approval_binding_sha256", ""))
+        == str(intent.get("approval_binding_sha256", ""))
+        and str(receipt.get("approval_ref_sha256", ""))
+        == str(intent.get("approval_ref_sha256", ""))
+        and str(receipt.get("asserted_by_sha256", "")).lower()
+        == hashlib.sha256(asserted_by.encode("utf-8")).hexdigest()
+        and re.fullmatch(r"[0-9a-f]{32}", receipt_id) is not None
+    )
+    exact_safety = (
+        int(safety.get("id", 0)) == int(intent.get("safety_audit_id", 0))
+        and str(safety.get("run_id", "")) == str(intent.get("safety_run_id", ""))
+        and str(safety.get("run_id", "")) == f"write-intent:{intent_id}"
+        and str(safety.get("actor", "")) == historical_actor
+        and str(safety.get("session_hash", "")) == historical_session
+        and str(safety.get("trigger", "")) == "write_intent_proposal"
+        and str(safety.get("decision", "")) == str(intent.get("safety_decision", "")) == "ALLOW"
+        and str(safety.get("reason_code", ""))
+        == str(intent.get("safety_reason_code", ""))
+        == "SOURCE_ALLOWED"
+        and str(safety.get("source_class", "")) == str(intent.get("source_class", ""))
+        and str(safety.get("knowledge_kind", "")) == str(intent.get("knowledge_kind", ""))
+        and str(safety.get("asserted_by", "")).lower()
+        == hashlib.sha256(asserted_by.encode("utf-8")).hexdigest()
+        and str(safety.get("input_sha256", "")).lower() == current_sha256
+        and int(safety.get("input_length", 0)) == int(intent.get("safety_input_length", 0))
+        and str(safety.get("evidence_ref_sha256", "")).lower()
+        == original_evidence
+    )
+    invalid_components = [
+        name
+        for name, valid in (("intent", exact_intent), ("receipt", exact_receipt), ("safety", exact_safety))
+        if not valid
+    ]
+    if invalid_components:
+        raise ValueError(
+            "historical intent audit chain is not eligible for committed observation recovery: "
+            + ",".join(invalid_components)
+        )
+
+    ancestry_checks = (
+        (proposal_commit, head, "historical proposal commit is not an ancestor of current HEAD"),
+        (base_head, proposal_commit, "historical base does not precede the proposal commit"),
+        (proposal_commit, validated_head, "historical validation does not contain the proposal commit"),
+        (validated_head, head, "historical validated head is not an ancestor of current HEAD"),
+    )
+    for older, newer, message in ancestry_checks:
+        if _run_git("merge-base", "--is-ancestor", older, newer).returncode != 0:
+            raise ValueError(message)
+    latest_result = _run_git("log", "-1", "--format=%H", "HEAD", "--", repo_path)
+    latest_commit = latest_result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if latest_result.returncode != 0 or latest_commit != proposal_commit:
+        raise ValueError("historical proposal commit is not the target path's latest change")
+    if not _git_commit_matches_worktree(proposal_commit, repo_path, current_bytes):
+        raise ValueError("historical proposal commit blob does not match the current target")
+
+    evidence_sha256 = hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+    chain_sha256 = _committed_chain_sha256(intent, receipt, safety)
+    material = "\0".join(
+        (str(target), current_sha256, intent_id, proposal_commit, receipt_id, evidence_sha256)
+    )
+    return {
+        "observation_id": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+        "path": str(target),
+        "rel_path": rel_path,
+        "sha256": current_sha256,
+        "actor": actor,
+        "user_authorized": 1,
+        "intent_id": intent_id,
+        "receipt_id": receipt_id,
+        "proposal_commit": proposal_commit,
+        "observed_git_head": head,
+        "audit_chain_sha256": chain_sha256,
+        "target_key": target_key,
+        "canonical_sha256": current_canonical_sha256,
+        "evidence_ref_sha256": evidence_sha256,
+        "evidence_ref_length": len(evidence),
+    }
+
+
+def _store_committed_observation(observation: dict[str, Any]) -> int:
+    now = utc_now()
+    audit_columns = (
+        "observation_id",
+        "path",
+        "rel_path",
+        "sha256",
+        "actor",
+        "user_authorized",
+        "intent_id",
+        "receipt_id",
+        "proposal_commit",
+        "observed_git_head",
+        "audit_chain_sha256",
+        "evidence_ref_sha256",
+        "evidence_ref_length",
+    )
+    expected = tuple(observation[column] for column in audit_columns)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current_intent_row = conn.execute(
+            "SELECT * FROM memory_write_intents WHERE intent_id=?",
+            (observation["intent_id"],),
+        ).fetchone()
+        current_receipt_row = conn.execute(
+            "SELECT * FROM memory_write_receipts WHERE intent_id=?",
+            (observation["intent_id"],),
+        ).fetchone()
+        current_safety_row = None
+        if current_intent_row is not None:
+            current_safety_row = conn.execute(
+                "SELECT * FROM memory_safety_log WHERE id=? AND run_id=?",
+                (current_intent_row["safety_audit_id"], current_intent_row["safety_run_id"]),
+            ).fetchone()
+        if current_intent_row is None or current_receipt_row is None or current_safety_row is None:
+            conn.rollback()
+            raise ValueError("historical audit chain changed before committed observation apply")
+        current_intent = {key: current_intent_row[key] for key in current_intent_row.keys()}
+        current_receipt = {key: current_receipt_row[key] for key in current_receipt_row.keys()}
+        current_safety = {key: current_safety_row[key] for key in current_safety_row.keys()}
+        if _committed_chain_sha256(current_intent, current_receipt, current_safety) != observation["audit_chain_sha256"]:
+            conn.rollback()
+            raise ValueError("historical audit chain changed before committed observation apply")
+
+        target = Path(observation["path"]).resolve()
+        target_key = write_intent.canonical_target(target).target_key
+        if target_key != observation["target_key"]:
+            conn.rollback()
+            raise ValueError("committed observation target identity changed")
+        other_active_intents = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_write_intents "
+                "WHERE target_key=? AND intent_id<>? "
+                "AND status IN ('pending','approved','bound','validated')",
+                (target_key, observation["intent_id"]),
+            ).fetchone()[0]
+        )
+        active_claims = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_session_claims WHERE path=? AND status='active'",
+                (str(target),),
+            ).fetchone()[0]
+        )
+        if other_active_intents or active_claims:
+            conn.rollback()
+            raise ValueError("target gained an active intent or session claim before apply")
+
+        try:
+            repo_path = target.relative_to(GIT_ROOT).as_posix()
+            _require_clean_git_path(repo_path)
+            current_bytes = target.read_bytes()
+            current_digest = write_intent.content_hashes(current_bytes)
+            current_head = _current_git_head()
+            latest_result = _run_git("log", "-1", "--format=%H", "HEAD", "--", repo_path)
+            latest_commit = latest_result.stdout.decode("ascii", errors="ignore").strip().lower()
+        except (OSError, ValueError, write_intent.IntentError) as exc:
+            conn.rollback()
+            raise ValueError("committed target changed before observation apply") from exc
+        if (
+            current_digest.raw_sha256 != observation["sha256"]
+            or current_digest.canonical_sha256 != observation["canonical_sha256"]
+            or current_head != observation["observed_git_head"]
+            or not _git_commit_matches_worktree(current_head, repo_path, current_bytes)
+            or latest_result.returncode != 0
+            or latest_commit != observation["proposal_commit"]
+        ):
+            conn.rollback()
+            raise ValueError("committed target changed before observation apply")
+
+        existing = conn.execute(
+            "SELECT " + ", ".join(audit_columns) + " FROM memory_committed_observations "
+            "WHERE path=? AND intent_id=? AND proposal_commit=?",
+            (observation["path"], observation["intent_id"], observation["proposal_commit"]),
+        ).fetchone()
+        if existing is not None:
+            stable_columns = tuple(
+                column for column in audit_columns if column != "observed_git_head"
+            )
+            if tuple(existing[column] for column in stable_columns) != tuple(
+                observation[column] for column in stable_columns
+            ):
+                conn.rollback()
+                raise ValueError("existing committed observation does not match this audit chain")
+            stored_head = str(existing["observed_git_head"] or "").lower()
+            stored_head_checks = (
+                re.fullmatch(r"[0-9a-f]{40}", stored_head) is not None
+                and _run_git(
+                    "merge-base",
+                    "--is-ancestor",
+                    observation["proposal_commit"],
+                    stored_head,
+                ).returncode
+                == 0
+                and _run_git(
+                    "merge-base",
+                    "--is-ancestor",
+                    stored_head,
+                    observation["observed_git_head"],
+                ).returncode
+                == 0
+            )
+            stored_latest = _run_git(
+                "log",
+                "-1",
+                "--format=%H",
+                stored_head,
+                "--",
+                repo_path,
+            )
+            if (
+                not stored_head_checks
+                or stored_latest.returncode != 0
+                or stored_latest.stdout.decode("ascii", errors="ignore").strip().lower()
+                != observation["proposal_commit"]
+            ):
+                conn.rollback()
+                raise ValueError("existing committed observation has an invalid observed Git head")
+            current = conn.execute(
+                "SELECT sha256 FROM memory_file_observations WHERE path=?",
+                (observation["path"],),
+            ).fetchone()
+            if current is not None and str(current[0]) == observation["sha256"]:
+                conn.rollback()
+                return 0
+        else:
+            conn.execute(
+                "INSERT INTO memory_committed_observations ("
+                + ", ".join(audit_columns)
+                + ", observed_at) VALUES ("
+                + ", ".join("?" for _ in audit_columns)
+                + ", ?)",
+                (*expected, now),
+            )
+        conn.execute(
+            """
+            INSERT INTO memory_file_observations (
+              path, rel_path, sha256, actor, session_hash, observed_at
+            ) VALUES (?, ?, ?, ?, '', ?)
+            ON CONFLICT(path) DO UPDATE SET
+              rel_path=excluded.rel_path,
+              sha256=excluded.sha256,
+              actor=excluded.actor,
+              session_hash='',
+              observed_at=excluded.observed_at
+            """,
+            (
+                observation["path"],
+                observation["rel_path"],
+                observation["sha256"],
+                observation["actor"],
+                now,
+            ),
+        )
+        conn.commit()
+    return 1
+
+
+def apply_committed_observation(
+    observation: dict[str, Any],
+    *,
+    actor: str,
+    target_file: str,
+    intent_id: str,
+    evidence_ref: str,
+    user_authorized: bool,
+) -> int:
+    with deletion_observation_lock():
+        refreshed = validate_committed_observation(
+            actor=actor,
+            target_file=target_file,
+            intent_id=intent_id,
+            evidence_ref=evidence_ref,
+            user_authorized=user_authorized,
+        )
+        if refreshed != observation:
+            raise ValueError("committed observation evidence changed between preview and apply")
+        return _store_committed_observation(refreshed)
+
+
+def safe_committed_observation_payload(observation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: observation[key]
+        for key in (
+            "rel_path",
+            "sha256",
+            "actor",
+            "user_authorized",
+            "intent_id",
+            "receipt_id",
+            "proposal_commit",
+            "evidence_ref_sha256",
+            "evidence_ref_length",
+        )
+    }
 
 
 def claim_paths(actor: str, raw_session_id: str, paths: list[str], intent_id: str = "") -> list[dict[str, str]]:
@@ -245,7 +1285,10 @@ def active_claim_rows(
     actor: str = "",
     *,
     read_only: bool = False,
+    max_age_hours: float | None = None,
 ) -> list[dict[str, str]]:
+    if max_age_hours is not None and max_age_hours <= 0:
+        raise ValueError("max_age_hours must be positive")
     hashed = session_hash(raw_session_id)
     if not hashed:
         return []
@@ -270,7 +1313,16 @@ def active_claim_rows(
         if read_only and not STATE_DB.exists():
             return []
         raise
-    return [{key: str(row[key] or "") for key in row.keys()} for row in rows]
+    payloads = [{key: str(row[key] or "") for key in row.keys()} for row in rows]
+    if max_age_hours is None:
+        return payloads
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age_hours)
+    return [
+        row
+        for row in payloads
+        if (parsed_time(row["updated_at"]) or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+        >= cutoff
+    ]
 
 
 def parsed_time(value: str) -> dt.datetime | None:
@@ -283,18 +1335,28 @@ def parsed_time(value: str) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
-def all_active_claim_rows(max_age_hours: float | None = None) -> list[dict[str, str]]:
+def all_active_claim_rows(
+    max_age_hours: float | None = None,
+    *,
+    read_only: bool = False,
+) -> list[dict[str, str]]:
     if max_age_hours is not None and max_age_hours <= 0:
         raise ValueError("max_age_hours must be positive")
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, intent_id
-            FROM memory_session_claims
-            WHERE status='active'
-            ORDER BY actor, session_hash, rel_path
-            """
-        ).fetchall()
+    try:
+        with connect(read_only=read_only) as conn:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_session_claims)")}
+            if not columns:
+                return []
+            intent_expression = "intent_id" if "intent_id" in columns else "'' AS intent_id"
+            rows = conn.execute(
+                "SELECT session_hash, actor, path, rel_path, status, claimed_at, updated_at, "
+                f"{intent_expression} FROM memory_session_claims "
+                "WHERE status='active' ORDER BY actor, session_hash, rel_path"
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        if read_only and not STATE_DB.exists():
+            return []
+        raise
     payloads = [{key: str(row[key] or "") for key in row.keys()} for row in rows]
     if max_age_hours is None:
         return payloads
@@ -370,6 +1432,33 @@ def parse_args() -> argparse.Namespace:
     expire_parser = subparsers.add_parser("expire-stale", help="Preview or expire abandoned active claims.")
     expire_parser.add_argument("--older-than-hours", type=float, default=24)
     expire_parser.add_argument("--apply", action="store_true", help="Mark matching claims expired; default is preview only.")
+    deletion_parser = subparsers.add_parser(
+        "observe-deletion",
+        help="Preview or record an explicitly authorized, recoverable Markdown deletion.",
+    )
+    deletion_parser.add_argument("--file", required=True, help="Missing formal Markdown path inside the vault.")
+    deletion_parser.add_argument("--trash-path", required=True, help="Existing recoverable copy in a Trash location.")
+    deletion_parser.add_argument("--deletion-commit", required=True, help="Git commit that deleted the target path.")
+    deletion_parser.add_argument("--evidence-ref", required=True, help="Authorization evidence; only its hash is stored.")
+    deletion_parser.add_argument(
+        "--confirm-user-authorized",
+        action="store_true",
+        help="Confirm that the user explicitly authorized this exact deletion.",
+    )
+    deletion_parser.add_argument("--apply", action="store_true", help="Write the audit and tombstone; default is preview only.")
+    committed_parser = subparsers.add_parser(
+        "observe-committed",
+        help="Preview or record an already-committed protected write from an expired exact intent.",
+    )
+    committed_parser.add_argument("--file", required=True, help="Existing formal Markdown path inside the vault.")
+    committed_parser.add_argument("--intent-id", required=True, help="Expired historical intent with an exact audit chain.")
+    committed_parser.add_argument("--evidence-ref", required=True, help="Recovery evidence; only its hash is stored.")
+    committed_parser.add_argument(
+        "--confirm-user-authorized",
+        action="store_true",
+        help="Confirm that the historical write was explicitly authorized by the user.",
+    )
+    committed_parser.add_argument("--apply", action="store_true", help="Write the audit and observation; default is preview only.")
     return parser.parse_args()
 
 
@@ -377,6 +1466,8 @@ def main() -> int:
     args = parse_args()
     raw_session_id = session_value(args.session_id, args.actor)
     applied = 0
+    observation: dict[str, Any] | None = None
+    observation_kind = ""
     try:
         if args.action == "claim":
             rows = claim_paths(args.actor, raw_session_id, args.file, args.intent_id)
@@ -384,11 +1475,57 @@ def main() -> int:
             rows = all_active_claim_rows()
         elif args.action == "expire-stale":
             rows, applied = expire_stale_claims(args.older_than_hours, args.apply)
+        elif args.action == "observe-deletion":
+            observation_kind = "deletion"
+            observation = validate_deletion_observation(
+                actor=args.actor,
+                target_file=args.file,
+                trash_file=args.trash_path,
+                deletion_commit=args.deletion_commit,
+                evidence_ref=args.evidence_ref,
+                user_authorized=args.confirm_user_authorized,
+            )
+            applied = (
+                apply_deletion_observation(
+                    observation,
+                    actor=args.actor,
+                    target_file=args.file,
+                    trash_file=args.trash_path,
+                    deletion_commit=args.deletion_commit,
+                    evidence_ref=args.evidence_ref,
+                    user_authorized=args.confirm_user_authorized,
+                )
+                if args.apply
+                else 0
+            )
+            rows = []
+        elif args.action == "observe-committed":
+            observation_kind = "committed"
+            observation = validate_committed_observation(
+                actor=args.actor,
+                target_file=args.file,
+                intent_id=args.intent_id,
+                evidence_ref=args.evidence_ref,
+                user_authorized=args.confirm_user_authorized,
+            )
+            applied = (
+                apply_committed_observation(
+                    observation,
+                    actor=args.actor,
+                    target_file=args.file,
+                    intent_id=args.intent_id,
+                    evidence_ref=args.evidence_ref,
+                    user_authorized=args.confirm_user_authorized,
+                )
+                if args.apply
+                else 0
+            )
+            rows = []
         else:
             if not raw_session_id:
                 raise ValueError("session id is required; pass --session-id or use a supported host session environment")
             rows = active_claim_rows(raw_session_id, args.actor)
-    except (ValueError, sqlite3.Error) as exc:
+    except (ValueError, OSError, sqlite3.Error) as exc:
         payload: dict[str, Any] = {"ok": False, "error": str(exc), "action": args.action}
         if args.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -404,12 +1541,32 @@ def main() -> int:
         "claims": rows,
         "applied": applied,
     }
+    if observation is not None:
+        payload["preview"] = not args.apply
+        payload["observation"] = (
+            safe_committed_observation_payload(observation)
+            if observation_kind == "committed"
+            else safe_deletion_observation_payload(observation)
+        )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(f"claims={len(rows)} applied={applied} actor={args.actor} session={payload['session_hash']}")
-        for row in rows:
-            print(row.get("rel_path", row.get("path", "")))
+        if observation is not None:
+            safe = (
+                safe_committed_observation_payload(observation)
+                if observation_kind == "committed"
+                else safe_deletion_observation_payload(observation)
+            )
+            print(
+                f"{observation_kind}_observation=ok applied={applied} preview={not args.apply} "
+                f"actor={args.actor} rel_path={safe['rel_path']}"
+            )
+            if observation_kind == "deletion":
+                print(f"sentinel={safe['sentinel']}")
+        else:
+            print(f"claims={len(rows)} applied={applied} actor={args.actor} session={payload['session_hash']}")
+            for row in rows:
+                print(row.get("rel_path", row.get("path", "")))
     return 0
 
 

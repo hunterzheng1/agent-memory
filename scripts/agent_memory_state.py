@@ -246,28 +246,56 @@ def secure_sqlite_connect(
     if repair_permissions:
         harden_sqlite_files(path)
 
-    connection_target = f"{path.as_uri()}?mode=ro" if read_only else str(path)
-    connection = sqlite3.connect(
-        connection_target,
-        timeout=timeout,
-        factory=PrivateSQLiteConnection,
-        uri=read_only,
-    )
-    connection._agent_memory_path = path  # type: ignore[attr-defined]
-    connection._agent_memory_repair_permissions = repair_permissions  # type: ignore[attr-defined]
-    if row_factory is not None:
-        connection.row_factory = row_factory
+    def open_connection(target: str, *, uri: bool, query_only: bool) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                target,
+                timeout=timeout,
+                factory=PrivateSQLiteConnection,
+                uri=uri,
+            )
+            connection._agent_memory_path = path  # type: ignore[attr-defined]
+            connection._agent_memory_repair_permissions = repair_permissions  # type: ignore[attr-defined]
+            if row_factory is not None:
+                connection.row_factory = row_factory
+            if query_only:
+                connection.execute("PRAGMA query_only=ON")
+            for pragma in pragmas:
+                connection.execute(pragma)
+                if query_only:
+                    connection.execute("PRAGMA query_only=ON")
+            if query_only:
+                # Force WAL/SHM attachment now so a mode=ro incompatibility can
+                # fall back without surfacing later during a caller query.
+                connection.execute("PRAGMA schema_version").fetchone()
+            if repair_permissions:
+                harden_sqlite_files(path)
+            return connection
+        except Exception:
+            if connection is not None:
+                connection.close()
+            raise
+
+    if not read_only:
+        return open_connection(str(path), uri=False, query_only=False)
+
+    read_only_target = f"{path.as_uri()}?mode=ro"
     try:
-        if read_only:
-            connection.execute("PRAGMA query_only=ON")
-        for pragma in pragmas:
-            connection.execute(pragma)
-        if repair_permissions:
-            harden_sqlite_files(path)
-    except Exception:
-        connection.close()
-        raise
-    return connection
+        return open_connection(read_only_target, uri=True, query_only=True)
+    except sqlite3.OperationalError as exc:
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        cant_open = (
+            isinstance(error_code, int)
+            and (error_code & 0xFF) == getattr(sqlite3, "SQLITE_CANTOPEN", 14)
+        ) or "unable to open database file" in str(exc).lower()
+        if not cant_open:
+            raise
+
+    # mode=rw still refuses to create a missing database; query_only prevents
+    # SQL writes while allowing SQLite builds that cannot attach WAL via mode=ro.
+    read_existing_target = f"{path.as_uri()}?mode=rw"
+    return open_connection(read_existing_target, uri=True, query_only=True)
 
 
 def secure_append_text(raw_path: str | os.PathLike[str], text: str) -> Path:

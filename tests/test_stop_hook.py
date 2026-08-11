@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -148,6 +149,151 @@ class StopHookProtocolTests(unittest.TestCase):
         ):
             self.assertEqual(self.module.session_key({}, "codebuddy"), "cb-stop-session")
 
+    def test_session_end_failure_is_notification_only(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "notify") as notified,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.report_failure(
+                "claude",
+                {"status": "error", "error": "synthetic session-end failure"},
+                non_blocking=True,
+            )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        notified.assert_called_once()
+
+    def test_session_end_closeout_is_attributed_and_skips_audit(self) -> None:
+        completed = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({"status": "ok"}),
+            stderr="",
+        )
+        with mock.patch.object(self.module.subprocess, "run", return_value=completed) as invoked:
+            result = self.module.run_closeout(
+                {"session_id": "claude-session-end"},
+                "claude",
+                55,
+                "session-end",
+            )
+        self.assertEqual(result["status"], "ok")
+        command = invoked.call_args.args[0]
+        self.assertEqual(command[command.index("--trigger") + 1], "session-end")
+        self.assertIn("--skip-audit", command)
+
+    def test_reentered_claude_or_codebuddy_stop_does_not_block_again(self) -> None:
+        for actor in ("claude", "codebuddy"):
+            with self.subTest(actor=actor):
+                args = types.SimpleNamespace(
+                    actor=actor,
+                    protocol="claude",
+                    event="stop-hook",
+                    non_blocking=False,
+                    auto_closeout=True,
+                    timeout=300,
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(self.module, "parse_args", return_value=args),
+                    mock.patch.object(
+                        self.module,
+                        "read_payload",
+                        return_value={"session_id": f"{actor}-reentry", "stop_hook_active": True},
+                    ),
+                    mock.patch.object(self.module, "pending_paths", return_value=[Path("/tmp/pending.md")]),
+                    mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+                    mock.patch.object(self.module, "all_active_claim_rows", return_value=[]),
+                    mock.patch.object(self.module, "notify") as notified,
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    returncode = self.module.main()
+                self.assertEqual(returncode, 0)
+                self.assertEqual(stdout.getvalue(), "")
+                notified.assert_called_once()
+
+    def test_first_stop_still_blocks_real_unclaimed_change(self) -> None:
+        args = types.SimpleNamespace(
+            actor="claude",
+            protocol="claude",
+            event="stop-hook",
+            non_blocking=False,
+            auto_closeout=True,
+            timeout=300,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(
+                self.module,
+                "read_payload",
+                return_value={"session_id": "claude-first-stop", "stop_hook_active": False},
+            ),
+            mock.patch.object(self.module, "pending_paths", return_value=[Path("/tmp/pending.md")]),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(self.module, "all_active_claim_rows", return_value=[]),
+            mock.patch.object(self.module, "notify"),
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = self.module.main()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(returncode, 0)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("not claimed", payload["reason"])
+
+    def test_clean_session_end_is_nonblocking_and_skips_weekly_audit(self) -> None:
+        args = types.SimpleNamespace(
+            actor="claude",
+            protocol="claude",
+            event="session-end",
+            non_blocking=True,
+            auto_closeout=True,
+            timeout=55,
+        )
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(self.module, "read_payload", return_value={"session_id": "clean-end"}),
+            mock.patch.object(self.module, "pending_paths", return_value=[]),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(self.module, "run_due_audit") as audit,
+        ):
+            returncode = self.module.main()
+        self.assertEqual(returncode, 0)
+        audit.assert_not_called()
+
+    def test_missing_session_is_quiet_when_all_changes_belong_to_other_session(self) -> None:
+        pending = Path("/tmp/other-session.md").resolve()
+        args = types.SimpleNamespace(
+            actor="claude",
+            protocol="claude",
+            event="stop-hook",
+            non_blocking=False,
+            auto_closeout=True,
+            timeout=300,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(self.module, "read_payload", return_value={}),
+            mock.patch.object(self.module, "pending_paths", return_value=[pending]),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(
+                self.module,
+                "all_active_claim_rows",
+                return_value=[{"path": str(pending)}],
+            ),
+            mock.patch.object(self.module, "run_due_audit") as audit,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = self.module.main()
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        audit.assert_called_once()
+
 
 class StopHookGitBaselineTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -180,6 +326,14 @@ class StopHookGitBaselineTests(unittest.TestCase):
     def test_dirty_markdown_is_detected_under_renamed_vault(self) -> None:
         self.note.write_text("# Agent Memory\n\nChanged.\n", encoding="utf-8")
         self.assertEqual(self.module.dirty_paths(), [self.note.resolve()])
+
+    def test_missing_markdown_path_is_not_silently_dropped(self) -> None:
+        missing = self.vault / "missing.md"
+        self.assertEqual(
+            self.module.normalize_path("Agent记忆/missing.md"),
+            missing.resolve(),
+        )
+        self.assertEqual(self.module.unobserved_paths([missing]), [missing])
 
     def test_external_commit_after_observed_baseline_is_recovered(self) -> None:
         self.note.write_text("# Agent Memory\n\nCommitted externally.\n", encoding="utf-8")

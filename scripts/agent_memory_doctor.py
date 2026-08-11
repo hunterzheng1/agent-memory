@@ -18,7 +18,7 @@ from agent_memory_env import env_value, load_config, resolve_config_path
 from agent_memory_state import absolute_path, secure_sqlite_connect, sqlite_permission_report
 
 
-VERSION = "2.2"
+VERSION = "2.4"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
 GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
@@ -83,6 +83,60 @@ def text_sha256(path: Path) -> str:
     # universal-newline translation (CRLF -> LF), not the raw bytes.
     text = path.read_text(encoding="utf-8", errors="replace")
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def closeout_observation_health() -> tuple[bool, dict[str, Any]]:
+    """Report formal-memory Git history that lacks a completed observation."""
+
+    try:
+        import agent_memory_closeout as closeout
+
+        baseline = closeout.last_observed_git_head()
+        head, head_warnings = closeout.current_git_head()
+        entries, history_warnings = closeout.git_history_entries(baseline, head)
+        pending = closeout.unobserved_history_entries(entries)
+    except (
+        AttributeError,
+        ImportError,
+        OSError,
+        sqlite3.Error,
+        subprocess.SubprocessError,
+        ValueError,
+    ) as exc:
+        return False, {"error": type(exc).__name__}
+    warnings = [*head_warnings, *history_warnings]
+    detail = {
+        "baseline": baseline,
+        "head": head,
+        "history_paths": len(entries),
+        "pending_count": len(pending),
+        "pending_existing": sorted(
+            closeout.relative_to_vault(entry.path) for entry in pending if not entry.is_deleted
+        ),
+        "pending_deleted": sorted(
+            closeout.relative_to_vault(entry.path) for entry in pending if entry.is_deleted
+        ),
+        "warnings": warnings,
+    }
+    return bool(baseline and head and not warnings and not pending), detail
+
+
+def search_log_privacy_health(conn: sqlite3.Connection) -> tuple[bool, dict[str, int]]:
+    """Use the same legacy-row predicate as the irreversible redaction command."""
+
+    raw_rows = int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM memory_search_log
+            WHERE query NOT LIKE '[redacted:%'
+               OR (
+                    COALESCE(used_paths, '') <> ''
+                    AND used_paths NOT LIKE '[redacted:%'
+                  )
+            """
+        ).fetchone()[0]
+    )
+    return raw_rows == 0, {"legacy_raw_rows": raw_rows}
 
 
 def offline_env() -> dict[str, str]:
@@ -254,6 +308,73 @@ def read_json_object(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def claude_compatible_hook_semantics(
+    hooks: dict[str, Any],
+    actor: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate lifecycle semantics for Claude-protocol hosts without actor aliasing."""
+
+    if actor not in {"claude", "codebuddy"}:
+        return False, {"error": "unsupported_actor"}
+
+    def command_entries(event: str) -> list[dict[str, Any]]:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            return []
+        entries: list[dict[str, Any]] = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            entries.extend(item for item in group["hooks"] if isinstance(item, dict))
+        return entries
+
+    def has_value(command: str, flag: str, value: str) -> bool:
+        return re.search(
+            rf"(?<!\S){re.escape(flag)}\s+{re.escape(value)}(?=\s|$)",
+            command,
+        ) is not None
+
+    def has_switch(command: str, flag: str) -> bool:
+        return re.search(rf"(?<!\S){re.escape(flag)}(?=\s|$)", command) is not None
+
+    stop_ok = any(
+        "agent_memory_stop_hook.py" in (command := str(item.get("command", "")))
+        and has_value(command, "--actor", actor)
+        and has_value(command, "--protocol", "claude")
+        and has_value(command, "--event", "stop-hook")
+        and not has_switch(command, "--non-blocking")
+        and has_switch(command, "--auto-closeout")
+        for item in command_entries("Stop")
+    )
+    session_end_ok = any(
+        "agent_memory_stop_hook.py" in (command := str(item.get("command", "")))
+        and has_value(command, "--actor", actor)
+        and has_value(command, "--protocol", "claude")
+        and has_value(command, "--event", "session-end")
+        and has_switch(command, "--non-blocking")
+        and has_switch(command, "--auto-closeout")
+        and isinstance(item.get("timeout"), (int, float))
+        and 0 < float(item["timeout"]) <= 60
+        for item in command_entries("SessionEnd")
+    )
+    session_start_ok = any(
+        "agent_memory_session_hook.py" in (command := str(item.get("command", "")))
+        and has_value(command, "--actor", actor)
+        and isinstance(item.get("timeout"), (int, float))
+        and 0 < float(item["timeout"]) <= 10
+        for item in command_entries("SessionStart")
+    )
+    return stop_ok and session_end_ok and session_start_ok, {
+        "stop_scoped_and_blocking": stop_ok,
+        "session_end_non_blocking": session_end_ok,
+        "session_start_bridge": session_start_ok,
+    }
+
+
+def claude_hook_semantics(hooks: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    return claude_compatible_hook_semantics(hooks, "claude")
 
 
 def configured_path(name: str) -> Path | None:
@@ -708,8 +829,15 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         and (int(row["line_count"]) > 180 or int(row["size_bytes"]) > 24576)
     ]
     add(checks, "large_memory_files", "warn" if large else "pass", f"{len(large)} docs exceed compaction advisory thresholds.", {"files": large})
-    raw_logs = int(conn.execute("SELECT COUNT(*) FROM memory_search_log WHERE query NOT LIKE '[redacted:%'").fetchone()[0])
-    add(checks, "search_log_privacy", "warn" if raw_logs else "pass", f"{raw_logs} legacy raw-query rows remain.", {"legacy_raw_rows": raw_logs})
+    search_privacy_ok, search_privacy_detail = search_log_privacy_health(conn)
+    raw_logs = int(search_privacy_detail["legacy_raw_rows"])
+    add(
+        checks,
+        "search_log_privacy",
+        "pass" if search_privacy_ok else "warn",
+        f"{raw_logs} legacy raw query/path rows remain.",
+        search_privacy_detail,
+    )
     claims_ok, claims_detail = session_claim_hygiene(conn)
     stale_claim_count = len(claims_detail.get("stale", []))
     add(
@@ -726,6 +854,25 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     add(checks, "audit_freshness", "pass" if age is not None and age <= 7 else "warn", f"Last successful audit age: {age} days." if age is not None else "No successful audit recorded.")
     closeout = latest_jsonl(CLOSEOUT_LOG)
     add(checks, "closeout_history", "pass" if closeout and closeout.get("status") in {"ok", "warning"} else "warn", f"Latest closeout status: {closeout.get('status')}." if closeout else "No closeout history.")
+    observation_ok, observation_detail = closeout_observation_health()
+    pending_observations = int(observation_detail.get("pending_count", 0) or 0)
+    if observation_ok:
+        observation_message = "Closeout observation baseline covers current formal memory history."
+    elif not observation_detail.get("baseline"):
+        observation_message = "No completed closeout observation baseline is recorded."
+    elif observation_detail.get("warnings") or observation_detail.get("error"):
+        observation_message = "Closeout observation baseline could not be verified."
+    else:
+        observation_message = (
+            f"{pending_observations} formal memory paths still lack closeout completion observations."
+        )
+    add(
+        checks,
+        "closeout_observation_baseline",
+        "pass" if observation_ok else "warn",
+        observation_message,
+        observation_detail,
+    )
 
     remote_has_credential = git_remote_has_credential()
     add(
@@ -785,6 +932,27 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         if claude_settings_path or claude_fragment_path:
             claude_ok = bool(expected_hooks) and claude_settings.get("hooks") == expected_hooks
             add(checks, "claude_stop_hook", "pass" if claude_ok else "warn", "Claude Stop/SessionEnd hooks are configured." if claude_ok else "Claude hooks differ from the managed fragment.")
+            live_hooks = claude_settings.get("hooks") if isinstance(claude_settings.get("hooks"), dict) else {}
+            live_semantics_ok, live_semantics_detail = claude_compatible_hook_semantics(
+                live_hooks,
+                "claude",
+            )
+            fragment_semantics_ok, fragment_semantics_detail = claude_compatible_hook_semantics(
+                expected_hooks,
+                "claude",
+            )
+            semantics_ok = live_semantics_ok and fragment_semantics_ok
+            add(
+                checks,
+                "claude_hook_semantics",
+                "pass" if semantics_ok else "warn",
+                (
+                    "Claude Stop is scoped and SessionEnd is non-blocking."
+                    if semantics_ok
+                    else "Claude managed hooks have unsafe Stop/SessionEnd lifecycle semantics."
+                ),
+                {"live": live_semantics_detail, "managed_fragment": fragment_semantics_detail},
+            )
 
         codebuddy_settings_path = configured_path("codebuddy_settings_json")
         codebuddy_fragment_path = configured_path("codebuddy_hooks_fragment")
@@ -805,6 +973,33 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
                 "CodeBuddy Stop/SessionEnd hooks are configured."
                 if codebuddy_ok
                 else "CodeBuddy hooks differ from the managed fragment or lack stop_hook --actor codebuddy.",
+            )
+            codebuddy_live_hooks = (
+                codebuddy_settings.get("hooks")
+                if isinstance(codebuddy_settings.get("hooks"), dict)
+                else {}
+            )
+            live_semantics_ok, live_semantics_detail = claude_compatible_hook_semantics(
+                codebuddy_live_hooks,
+                "codebuddy",
+            )
+            fragment_semantics_ok, fragment_semantics_detail = claude_compatible_hook_semantics(
+                codebuddy_expected,
+                "codebuddy",
+            )
+            semantics_ok = live_semantics_ok and (
+                fragment_semantics_ok if codebuddy_fragment_path else True
+            )
+            add(
+                checks,
+                "codebuddy_hook_semantics",
+                "pass" if semantics_ok else "warn",
+                (
+                    "CodeBuddy uses scoped Claude-compatible lifecycle hooks."
+                    if semantics_ok
+                    else "CodeBuddy hooks have unsafe Stop/SessionEnd lifecycle semantics."
+                ),
+                {"live": live_semantics_detail, "managed_fragment": fragment_semantics_detail},
             )
 
         cc_switch_path = configured_path("cc_switch_db")

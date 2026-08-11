@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import sys
 import unittest
@@ -77,6 +79,86 @@ class MemoryctlCommandTests(unittest.TestCase):
             command,
             [sys.executable, str(module.COMMANDS["check"]), "--json"],
         )
+
+    def test_hook_actor_closeout_without_session_fails_closed(self) -> None:
+        for actor in ("codex", "claude", "codebuddy"):
+            with self.subTest(actor=actor):
+                module = load_memoryctl()
+                stderr = io.StringIO()
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["memoryctl", "--actor", actor, "closeout", "--dry-run"],
+                    ),
+                    mock.patch.object(
+                        module,
+                        "resolve",
+                        return_value=SimpleNamespace(
+                            session_id="",
+                            search_scope=actor,
+                            hook_protocol="codex" if actor == "codex" else "claude",
+                        ),
+                    ),
+                    mock.patch.object(module.subprocess, "run") as invoked,
+                    contextlib.redirect_stderr(stderr),
+                ):
+                    self.assertEqual(module.main(), 2)
+                invoked.assert_not_called()
+                self.assertIn("requires an active host session", stderr.getvalue())
+
+    def test_explicit_session_closeout_is_always_claim_scoped(self) -> None:
+        module = load_memoryctl()
+        completed = SimpleNamespace(returncode=0)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "memoryctl",
+                    "--actor",
+                    "claude",
+                    "closeout",
+                    "--dry-run",
+                    "--session-id",
+                    "explicit-session",
+                ],
+            ),
+            mock.patch.object(module.subprocess, "run", return_value=completed) as invoked,
+        ):
+            self.assertEqual(module.main(), 0)
+        command = invoked.call_args.args[0]
+        self.assertIn("--session-id", command)
+        self.assertIn("explicit-session", command)
+        self.assertIn("--claimed-only", command)
+
+    def test_global_closeout_requires_explicit_global_flag(self) -> None:
+        module = load_memoryctl()
+        completed = SimpleNamespace(returncode=0)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["memoryctl", "--actor", "claude", "closeout", "--global", "--dry-run"],
+            ),
+            mock.patch.object(module.subprocess, "run", return_value=completed) as invoked,
+        ):
+            self.assertEqual(module.main(), 0)
+        self.assertNotIn("--claimed-only", invoked.call_args.args[0])
+
+    def test_non_hook_actor_is_not_mistaken_for_hook_lifecycle(self) -> None:
+        module = load_memoryctl()
+        completed = SimpleNamespace(returncode=0)
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["memoryctl", "--actor", "cursor", "closeout", "--dry-run"],
+            ),
+            mock.patch.object(module.subprocess, "run", return_value=completed) as invoked,
+        ):
+            self.assertEqual(module.main(), 0)
+        self.assertNotIn("--claimed-only", invoked.call_args.args[0])
 
 
 if __name__ == "__main__":

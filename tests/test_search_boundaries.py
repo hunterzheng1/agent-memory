@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -353,7 +354,7 @@ class SearchBoundaryTests(unittest.TestCase):
             self.assertEqual(after_rows, before_rows)
             self.assertEqual(state_db.read_bytes(), before_bytes)
 
-    def test_cli_no_log_does_not_migrate_an_older_schema(self) -> None:
+    def test_cli_no_log_does_not_migrate_an_older_schema_and_reports_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
             state_db = tmp / "legacy.sqlite"
@@ -383,7 +384,7 @@ class SearchBoundaryTests(unittest.TestCase):
                 capture_output=True,
                 check=False,
             )
-            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["results"], [])
             self.assertTrue(any("sqlite search failed" in warning for warning in payload["warnings"]))
@@ -396,6 +397,54 @@ class SearchBoundaryTests(unittest.TestCase):
             self.assertEqual(tables, {"legacy_marker"})
             self.assertEqual(marker, "unchanged")
             self.assertEqual(state_db.read_bytes(), before_bytes)
+
+    def test_run_search_distinguishes_total_failure_from_backend_degradation(self) -> None:
+        search_args = args(
+            query="healthcheck",
+            limit=5,
+            no_zvec=False,
+            force_rg=False,
+            no_log=True,
+            zvec_timeout=5,
+            zvec_max_distance=0.8,
+            rg_timeout=5,
+        )
+        with (
+            mock.patch.object(search, "sqlite_search", return_value=([], ["sqlite failed"])),
+            mock.patch.object(search, "zvec_search", return_value=([], ["zvec failed"])),
+        ):
+            rows, warnings, all_failed = search.run_search(search_args)
+        self.assertEqual(rows, [])
+        self.assertTrue(all_failed)
+        self.assertCountEqual(warnings, ["sqlite failed", "zvec failed"])
+
+        with (
+            mock.patch.object(search, "sqlite_search", return_value=([], ["sqlite failed"])),
+            mock.patch.object(search, "zvec_search", return_value=([], [])),
+        ):
+            rows, warnings, all_failed = search.run_search(search_args)
+        self.assertEqual(rows, [])
+        self.assertFalse(all_failed)
+        self.assertEqual(warnings, ["sqlite failed"])
+
+    def test_main_returns_nonzero_only_for_total_backend_failure_without_results(self) -> None:
+        cli_args = args(query="healthcheck", json=True, redact_legacy_logs=False)
+        output = io.StringIO()
+        with (
+            mock.patch.object(search, "parse_args", return_value=cli_args),
+            mock.patch.object(search, "run_search", return_value=([], ["all failed"], True)),
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(search.main(), 2)
+        self.assertEqual(json.loads(output.getvalue())["warnings"], ["all failed"])
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(search, "parse_args", return_value=cli_args),
+            mock.patch.object(search, "run_search", return_value=([], ["sqlite degraded"], False)),
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(search.main(), 0)
 
 
 if __name__ == "__main__":

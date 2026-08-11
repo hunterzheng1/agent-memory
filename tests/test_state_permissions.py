@@ -197,6 +197,59 @@ class StatePermissionTests(unittest.TestCase):
             else:
                 self.assertIn("windows_acl_unverified", permission_check["detail"]["warnings"])
 
+    def test_read_only_connect_falls_back_to_query_only_rw_for_wal_open_failure(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            database = Path(raw_root).resolve() / "state.sqlite"
+            with secure_sqlite_connect(
+                database,
+                pragmas=("PRAGMA journal_mode=WAL",),
+            ) as writer:
+                writer.execute("CREATE TABLE sample(value TEXT)")
+                writer.execute("INSERT INTO sample VALUES ('ok')")
+                writer.commit()
+
+                real_connect = sqlite3.connect
+                real_execute = state.PrivateSQLiteConnection.execute
+                failed_schema_probe = False
+
+                def fail_first_schema_probe(connection, statement, *args, **kwargs):
+                    nonlocal failed_schema_probe
+                    if not failed_schema_probe and statement.strip().upper() == "PRAGMA SCHEMA_VERSION":
+                        failed_schema_probe = True
+                        raise sqlite3.OperationalError("unable to open database file")
+                    return real_execute(connection, statement, *args, **kwargs)
+
+                with (
+                    mock.patch.object(state.sqlite3, "connect", wraps=real_connect) as connect_mock,
+                    mock.patch.object(
+                        state.PrivateSQLiteConnection,
+                        "execute",
+                        new=fail_first_schema_probe,
+                    ),
+                ):
+                    with secure_sqlite_connect(
+                        database,
+                        read_only=True,
+                        pragmas=("PRAGMA query_only=OFF",),
+                    ) as reader:
+                        self.assertEqual(reader.execute("PRAGMA query_only").fetchone()[0], 1)
+                        self.assertEqual(reader.execute("SELECT value FROM sample").fetchone()[0], "ok")
+                        with self.assertRaises(sqlite3.OperationalError):
+                            reader.execute("UPDATE sample SET value='changed'")
+                self.assertEqual(writer.execute("SELECT value FROM sample").fetchone()[0], "ok")
+
+                targets = [str(call.args[0]) for call in connect_mock.call_args_list]
+                self.assertEqual(len(targets), 2)
+                self.assertTrue(targets[0].endswith("?mode=ro"), targets)
+                self.assertTrue(targets[1].endswith("?mode=rw"), targets)
+
+    def test_read_only_connect_never_creates_a_missing_database(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            database = Path(raw_root).resolve() / "missing.sqlite"
+            with self.assertRaises(StateSecurityError):
+                secure_sqlite_connect(database, read_only=True)
+            self.assertFalse(database.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

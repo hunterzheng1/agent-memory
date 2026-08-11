@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -173,7 +174,7 @@ class IntentSandbox:
                     "ttl_hours = 24",
                     "max_proposal_bytes = 1048576",
                     "max_target_bytes = 1048576",
-                    'protected_paths = ["工作流/*.md"]',
+                    'protected_paths = ["工作流/*.md", "用户记忆/偏好与边界.md"]',
                 ]
             )
             + "\n",
@@ -246,6 +247,8 @@ class IntentSandbox:
         target: Path,
         proposal: Path,
         approval_required: bool = False,
+        knowledge_kind: str = "fact",
+        evidence_ref_sha256: str = "",
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
         args = [
             "create",
@@ -256,12 +259,14 @@ class IntentSandbox:
             "--source-class",
             "user_direct",
             "--knowledge-kind",
-            "fact",
+            knowledge_kind,
             "--asserted-by",
             "user",
         ]
         if not approval_required:
             args.append("--no-approval-required")
+        if evidence_ref_sha256:
+            args.extend(["--evidence-ref-sha256", evidence_ref_sha256])
         args.append("--json")
         completed = self.ctl(actor, session, "intent", *args)
         return completed, self.json_payload(completed)
@@ -316,6 +321,222 @@ class WriteIntentEndToEndTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.box.close()
+
+    def test_expired_exact_early_commit_can_be_recovered_as_audited_observation(self) -> None:
+        session = "codex-historical-observation"
+        target = self.box.vault / "用户记忆" / "偏好与边界.md"
+        proposal_text = target.read_text(encoding="utf-8") + "\n- User-authorized preference.\n"
+        proposal = self.box.proposal(
+            "historical-observation",
+            "",
+            raw=proposal_text.replace("\n", "\r\n").encode("utf-8"),
+        )
+        created, intent = self.box.create_intent(
+            actor="codex",
+            session=session,
+            target=target,
+            proposal=proposal,
+            knowledge_kind="preference",
+            evidence_ref_sha256="d" * 64,
+        )
+        self.assertEqual(created.returncode, 0, created.stderr + created.stdout)
+        intent_id = str(intent["intent_id"])
+        claimed, _ = self.box.claim(
+            actor="codex",
+            session=session,
+            target=target,
+            intent_id=intent_id,
+        )
+        self.assertEqual(claimed.returncode, 0, claimed.stderr + claimed.stdout)
+        target.write_bytes(proposal.read_bytes())
+        git(self.box.git_root, "add", "AgentMemory/用户记忆/偏好与边界.md")
+        git(self.box.git_root, "commit", "-qm", "external authorized preference commit")
+
+        validated = self.box.ctl(
+            "codex",
+            session,
+            "intent",
+            "validate",
+            "--intent-id",
+            intent_id,
+            "--target",
+            str(target),
+            "--json",
+        )
+        self.assertEqual(validated.returncode, 0, validated.stderr + validated.stdout)
+        self.assertTrue(self.box.json_payload(validated)["early_commit"])
+        with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_intents SET expires_at=validated_at WHERE intent_id=?",
+                (intent_id,),
+            )
+        expired = self.box.ctl("codex", session, "intent", "expire", "--apply", "--json")
+        self.assertEqual(expired.returncode, 0, expired.stderr + expired.stdout)
+        self.assertEqual(self.box.json_payload(expired)["applied"], 1)
+
+        observe_args = (
+            "--file",
+            str(target),
+            "--intent-id",
+            intent_id,
+            "--evidence-ref",
+            "verified-original-user-authorization",
+            "--confirm-user-authorized",
+            "--json",
+        )
+        blocked = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
+        self.assertEqual(blocked.returncode, 2, blocked.stderr + blocked.stdout)
+        self.assertIn("active intent or session claim", self.box.json_payload(blocked)["error"])
+
+        with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_session_claims SET status='expired', completed_at=updated_at "
+                "WHERE path=? AND status='active'",
+                (str(target),),
+            )
+        preview = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
+        self.assertEqual(preview.returncode, 0, preview.stderr + preview.stdout)
+        self.assertTrue(self.box.json_payload(preview)["preview"])
+        with closing(sqlite3.connect(self.box.state_db)) as conn:
+            count_before = conn.execute(
+                "SELECT COUNT(*) FROM memory_committed_observations"
+            ).fetchone()[0]
+        self.assertEqual(count_before, 0)
+
+        race_script = f"""
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+import agent_memory_claim as claim
+observation = claim.validate_committed_observation(
+    actor='human',
+    target_file={str(target)!r},
+    intent_id={intent_id!r},
+    evidence_ref='verified-original-user-authorization',
+    user_authorized=True,
+)
+with claim.connect() as conn:
+    conn.execute('BEGIN IMMEDIATE')
+    conn.execute(
+        \"\"\"INSERT INTO memory_session_claims (
+          session_hash, actor, path, rel_path, status, claimed_at, updated_at, completed_at, intent_id
+        ) VALUES (?, 'codex', ?, ?, 'active', ?, ?, NULL, '')\"\"\",
+        ('1' * 16, {str(target)!r}, '用户记忆/偏好与边界.md', claim.utc_now(), claim.utc_now()),
+    )
+    conn.commit()
+try:
+    claim._store_committed_observation(observation)
+except ValueError as exc:
+    print(str(exc))
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+        raced = run(
+            [sys.executable, "-c", race_script],
+            cwd=REPO_ROOT,
+            env=self.box.env("human", "human-maintenance"),
+        )
+        self.assertEqual(raced.returncode, 0, raced.stderr + raced.stdout)
+        self.assertIn("gained an active intent or session claim", raced.stdout)
+        with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_session_claims SET status='expired', completed_at=updated_at "
+                "WHERE session_hash=? AND path=?",
+                ("1" * 16, str(target)),
+            )
+
+        stale_head_script = f"""
+import subprocess
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+import agent_memory_claim as claim
+observation = claim.validate_committed_observation(
+    actor='human', target_file={str(target)!r}, intent_id={intent_id!r},
+    evidence_ref='verified-original-user-authorization', user_authorized=True,
+)
+subprocess.run(
+    ['git', '-C', str(claim.GIT_ROOT), 'commit', '--allow-empty', '-qm', 'concurrent unrelated commit'],
+    check=True,
+)
+try:
+    claim._store_committed_observation(observation)
+except ValueError as exc:
+    print(str(exc))
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+        stale_head = run(
+            [sys.executable, "-c", stale_head_script],
+            cwd=REPO_ROOT,
+            env=self.box.env("human", "human-maintenance"),
+        )
+        self.assertEqual(stale_head.returncode, 0, stale_head.stderr + stale_head.stdout)
+        self.assertIn("changed before observation apply", stale_head.stdout)
+
+        applied_args = (*observe_args[:-1], "--apply", "--json")
+        applied = self.box.ctl("human", "human-maintenance", "observe-committed", *applied_args)
+        self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
+        self.assertEqual(self.box.json_payload(applied)["applied"], 1)
+        with closing(sqlite3.connect(self.box.state_db)) as conn:
+            audit = conn.execute(
+                "SELECT actor, user_authorized, intent_id, proposal_commit, evidence_ref_sha256 "
+                "FROM memory_committed_observations"
+            ).fetchone()
+            observed = conn.execute(
+                "SELECT sha256, actor, session_hash FROM memory_file_observations WHERE path=?",
+                (str(target),),
+            ).fetchone()
+        self.assertEqual(audit[0:3], ("human", 1, intent_id))
+        self.assertEqual(
+            audit[3],
+            git(
+                self.box.git_root,
+                "log",
+                "-1",
+                "--format=%H",
+                "--",
+                "AgentMemory/用户记忆/偏好与边界.md",
+            ),
+        )
+        self.assertEqual(
+            audit[4],
+            hashlib.sha256(b"verified-original-user-authorization").hexdigest(),
+        )
+        self.assertEqual(observed[1:], ("human", ""))
+
+        git(self.box.git_root, "commit", "--allow-empty", "-qm", "later unrelated commit")
+        repeated = self.box.ctl("human", "human-maintenance", "observe-committed", *applied_args)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr + repeated.stdout)
+        self.assertEqual(self.box.json_payload(repeated)["applied"], 0)
+
+        with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_receipts SET evidence_ref_sha256=? WHERE intent_id=?",
+                ("f" * 64, intent_id),
+            )
+        corrupted = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
+        self.assertEqual(corrupted.returncode, 2, corrupted.stderr + corrupted.stdout)
+        self.assertIn("not eligible", self.box.json_payload(corrupted)["error"])
+
+        proposal_commit = git(
+            self.box.git_root,
+            "log",
+            "-1",
+            "--format=%H",
+            "--",
+            "AgentMemory/用户记忆/偏好与边界.md",
+        )
+        with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
+            conn.execute(
+                "UPDATE memory_write_receipts SET evidence_ref_sha256=?, base_git_head=? WHERE intent_id=?",
+                ("d" * 64, proposal_commit, intent_id),
+            )
+            conn.execute(
+                "UPDATE memory_write_intents SET base_git_head=? WHERE intent_id=?",
+                (proposal_commit, intent_id),
+            )
+        equal_base = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
+        self.assertEqual(equal_base.returncode, 2, equal_base.stderr + equal_base.stdout)
+        self.assertIn("not eligible", self.box.json_payload(equal_base)["error"])
 
     def test_complete_dry_run_leaves_state_database_byte_identical(self) -> None:
         session = "codex-dry-run-readonly"

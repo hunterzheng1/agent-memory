@@ -104,6 +104,8 @@ REQUIRED_STATE_TABLES = {
     "memory_write_receipts",
     "memory_session_claims",
     "memory_file_observations",
+    "memory_deletion_observations",
+    "memory_committed_observations",
 }
 
 OPTIONAL_STATE_TABLES = {

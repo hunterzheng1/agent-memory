@@ -707,7 +707,7 @@ def redact_legacy_search_logs() -> dict[str, int]:
     return {"redacted": len(rows), "remaining_raw": remaining}
 
 
-def run_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
+def run_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str], bool]:
     started = time.monotonic()
     warnings: list[str] = []
     if STATE_DB.exists() and not bool(getattr(args, "no_log", False)):
@@ -716,27 +716,32 @@ def run_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]
                 memory_index.init_db(conn)
         except sqlite3.Error as exc:
             warnings.append(f"sqlite schema migration failed: {exc}")
-    tasks = []
+    result_groups: list[list[SearchResult]] = []
+    successful_backends: set[str] = set()
     with ThreadPoolExecutor(max_workers=3) as executor:
-        tasks.append(executor.submit(sqlite_search, args))
-        tasks.append(executor.submit(zvec_search, args))
+        tasks = {executor.submit(sqlite_search, args): "sqlite"}
+        if not bool(getattr(args, "no_zvec", False)):
+            tasks[executor.submit(zvec_search, args)] = "zvec"
         if args.force_rg:
-            tasks.append(executor.submit(rg_search, args))
+            tasks[executor.submit(rg_search, args)] = "rg"
         for future in as_completed(tasks):
+            backend = tasks[future]
             try:
                 rows, task_warnings = future.result()
             except Exception as exc:  # pragma: no cover
-                rows, task_warnings = [], [f"search task failed: {exc}"]
+                rows, task_warnings = [], [f"{backend} search task failed: {exc}"]
+            if rows or not task_warnings:
+                successful_backends.add(backend)
             warnings.extend(task_warnings)
-            future.rows = rows  # type: ignore[attr-defined]
-    rows = merge_results([getattr(task, "rows", []) for task in tasks])
+            result_groups.append(rows)
+    rows = merge_results(result_groups)
     rows = [row for row in rows if result_matches_filters(row, args)]
     for row in rows:
         annotate_result_policy(row, args)
     rows = rows[: args.limit]
     if not bool(getattr(args, "no_log", False)):
         log_search(args.query, rows, round((time.monotonic() - started) * 1000))
-    return rows, warnings
+    return rows, warnings, not successful_backends
 
 
 def print_human(query: str, rows: list[SearchResult], warnings: list[str]) -> None:
@@ -828,12 +833,12 @@ def main() -> int:
         else:
             print(f"redacted={payload['redacted']} remaining_raw={payload['remaining_raw']}")
         return 0
-    rows, warnings = run_search(args)
+    rows, warnings, all_enabled_backends_failed = run_search(args)
     if args.json:
         print(json.dumps({"query": args.query, "results": [row.to_dict() for row in rows], "warnings": warnings}, ensure_ascii=False, indent=2))
     else:
         print_human(args.query, rows, warnings)
-    return 0
+    return 2 if all_enabled_backends_failed and not rows else 0
 
 
 if __name__ == "__main__":

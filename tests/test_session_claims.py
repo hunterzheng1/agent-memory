@@ -72,7 +72,7 @@ class ActorSessionIsolationTest(unittest.TestCase):
     def test_claude_never_falls_back_to_inherited_codex_thread(self) -> None:
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "outer-codex-thread"}, clear=True):
             self.assertEqual(session_value(actor="claude"), "")
-            self.assertNotEqual(session_key({}, "claude"), "outer-codex-thread")
+            self.assertEqual(session_key({}, "claude"), "")
 
     def test_codebuddy_reads_native_session_env(self) -> None:
         env = {
@@ -91,8 +91,7 @@ class ActorSessionIsolationTest(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(session_value(actor="codebuddy"), "")
-            self.assertNotEqual(session_key({}, "codebuddy"), "claude-session")
-            self.assertNotEqual(session_key({}, "codebuddy"), "codex-thread")
+            self.assertEqual(session_key({}, "codebuddy"), "")
 
     def test_codebuddy_agent_memory_session_id_wins(self) -> None:
         with mock.patch.dict(
@@ -299,6 +298,75 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
             self.assertEqual(active, 0)
             self.assertEqual(completed, 2)
             self.assertEqual(observations, 2)
+
+            clean_noop_command = closeout_command("claude", "claude-clean-noop")
+            clean_noop_command[clean_noop_command.index("--commit")] = "--dry-run"
+            clean_noop = run(clean_noop_command, cwd=REPO_ROOT, env=env)
+            self.assertEqual(clean_noop.returncode, 0, clean_noop.stderr + clean_noop.stdout)
+            clean_payload = json.loads(clean_noop.stdout)
+            self.assertEqual(clean_payload["status"], "ok")
+            self.assertEqual(clean_payload["ownership_error"], "")
+            self.assertEqual(clean_payload["processed_files"], [])
+            self.assertIn("dry_run: no index refresh", "\n".join(clean_payload["info"]))
+
+            codex_file.write_text(
+                codex_file.read_text(encoding="utf-8") + "\nOther session owned change.\n",
+                encoding="utf-8",
+            )
+            other_claim = run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "agent_memory_claim.py"),
+                    "--actor",
+                    "codex",
+                    "--session-id",
+                    "codex-other-session",
+                    "--json",
+                    "claim",
+                    "--file",
+                    str(codex_file),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+            )
+            self.assertEqual(other_claim.returncode, 0, other_claim.stderr)
+
+            other_owned_command = closeout_command("claude", "claude-with-no-claim")
+            other_owned_command[other_owned_command.index("--commit")] = "--dry-run"
+            other_owned = run(other_owned_command, cwd=REPO_ROOT, env=env)
+            self.assertEqual(other_owned.returncode, 0, other_owned.stderr + other_owned.stdout)
+            other_payload = json.loads(other_owned.stdout)
+            self.assertEqual(other_payload["status"], "ok")
+            self.assertEqual(other_payload["ownership_error"], "")
+            self.assertEqual(other_payload["unclaimed_files"], [])
+            self.assertEqual(other_payload["other_session_files"], ["AgentMemory/项目/_模板-项目.md"])
+
+            other_closeout = run(
+                closeout_command("codex", "codex-other-session"),
+                cwd=REPO_ROOT,
+                env=env,
+            )
+            self.assertEqual(
+                other_closeout.returncode,
+                0,
+                other_closeout.stderr + other_closeout.stdout,
+            )
+
+            codex_file.write_text(
+                codex_file.read_text(encoding="utf-8") + "\nUnclaimed change.\n",
+                encoding="utf-8",
+            )
+            dirty_no_claim_command = closeout_command("claude", "claude-dirty-no-claim")
+            dirty_no_claim_command[dirty_no_claim_command.index("--commit")] = "--dry-run"
+            dirty_without_claim = run(dirty_no_claim_command, cwd=REPO_ROOT, env=env)
+            self.assertEqual(
+                dirty_without_claim.returncode,
+                2,
+                dirty_without_claim.stderr + dirty_without_claim.stdout,
+            )
+            dirty_payload = json.loads(dirty_without_claim.stdout)
+            self.assertEqual(dirty_payload["status"], "error")
+            self.assertIn("no active memory claims", dirty_payload["ownership_error"])
 
 
 if __name__ == "__main__":

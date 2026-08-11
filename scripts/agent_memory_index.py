@@ -467,6 +467,42 @@ def init_db(conn: sqlite3.Connection) -> None:
           observed_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS memory_deletion_observations (
+          observation_id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          sentinel TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          user_authorized INTEGER NOT NULL,
+          deletion_commit TEXT NOT NULL,
+          parent_commit TEXT NOT NULL,
+          prior_sha256 TEXT NOT NULL,
+          trash_sha256 TEXT NOT NULL,
+          trash_path_sha256 TEXT NOT NULL,
+          evidence_ref_sha256 TEXT NOT NULL,
+          evidence_ref_length INTEGER NOT NULL,
+          observed_at TEXT NOT NULL,
+          UNIQUE(path, deletion_commit)
+        );
+
+        CREATE TABLE IF NOT EXISTS memory_committed_observations (
+          observation_id TEXT PRIMARY KEY,
+          path TEXT NOT NULL,
+          rel_path TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          actor TEXT NOT NULL,
+          user_authorized INTEGER NOT NULL,
+          intent_id TEXT NOT NULL,
+          receipt_id TEXT NOT NULL,
+          proposal_commit TEXT NOT NULL,
+          observed_git_head TEXT NOT NULL,
+          audit_chain_sha256 TEXT NOT NULL,
+          evidence_ref_sha256 TEXT NOT NULL,
+          evidence_ref_length INTEGER NOT NULL,
+          observed_at TEXT NOT NULL,
+          UNIQUE(path, intent_id, proposal_commit)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_memory_docs_track ON memory_docs(track);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_type ON memory_docs(memory_type);
         CREATE INDEX IF NOT EXISTS idx_memory_docs_project ON memory_docs(project_id);
@@ -497,7 +533,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
         "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "7"))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "8"))
     conn.commit()
 
 
