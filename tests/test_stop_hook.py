@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -106,6 +107,76 @@ class StopHookProtocolTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(self.module.session_key({}, "codebuddy"), "cb-stop-session")
+
+    def test_auto_closeout_does_not_block_on_unclaimed_files_without_current_claims(self) -> None:
+        unrelated = Path("unrelated-session-memory.md").resolve()
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module,
+                "parse_args",
+                return_value=SimpleNamespace(
+                    actor="codebuddy",
+                    auto_closeout=True,
+                    protocol="claude",
+                    timeout=300,
+                ),
+            ),
+            mock.patch.object(self.module, "read_payload", return_value={}),
+            mock.patch.object(self.module, "pending_paths", return_value=[unrelated]),
+            mock.patch.object(self.module, "session_key", return_value="current-session"),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(self.module, "notify"),
+            mock.patch.object(self.module, "run_due_audit") as run_due_audit,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.main()
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        run_due_audit.assert_called_once_with()
+
+    def test_auto_closeout_still_blocks_when_current_claim_closeout_fails(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                self.module,
+                "parse_args",
+                return_value=SimpleNamespace(
+                    actor="codebuddy",
+                    auto_closeout=True,
+                    protocol="claude",
+                    timeout=300,
+                ),
+            ),
+            mock.patch.object(self.module, "read_payload", return_value={}),
+            mock.patch.object(self.module, "pending_paths", return_value=[]),
+            mock.patch.object(self.module, "session_key", return_value="current-session"),
+            mock.patch.object(
+                self.module,
+                "active_claim_rows",
+                return_value=[{"path": "current-session-memory.md"}],
+            ),
+            mock.patch.object(
+                self.module,
+                "run_closeout",
+                return_value={"status": "error", "error": "synthetic closeout failure"},
+            ),
+            mock.patch.object(self.module, "notify"),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(returncode, 0)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("synthetic closeout failure", payload["reason"])
+        self.assertEqual(stderr.getvalue(), "")
 
 
 class StopHookGitBaselineTests(unittest.TestCase):

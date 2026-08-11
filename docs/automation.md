@@ -48,9 +48,9 @@ Automatic closeout mode is appropriate when the Agent has already written and cl
 - CodeBuddy Bash already exports `CODEBUDDY_SESSION_ID`; **default: no SessionStart bridge**. Use `memoryctl --actor codebuddy` and Stop with `--actor codebuddy --protocol claude` (JSON `decision: block` on failure).
 - After each formal write, run `memoryctl --actor codex|claude|codebuddy claim --file <path>`.
 - Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
+- When the current session has no active claims, stay silent and leave shared unclaimed files untouched. Doctor, audit, or an explicit human closeout remains responsible for those files.
 - Treat claims older than 24 hours as abandoned for Stop-hook ownership checks. `doctor` reports them, and `memoryctl --actor human claims-expire` previews them before an explicit `--apply` changes only the SQLite ledger.
 - Treat a historical file as complete only when its current content hash matches `memory_file_observations`; a full SQLite scan alone is not closeout evidence.
-- If dirty memory is not claimed by any session, block silent completion and ask the Agent to claim or resolve it.
 - Pass `--actor codex`, `--actor claude`, or `--actor codebuddy` so logs and commits remain attributable.
 - Claude and CodeBuddy Stop may return `decision: block` when closeout fails (`--protocol claude`). Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
 - Claude / CodeBuddy SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.
@@ -68,10 +68,8 @@ on Stop:
   resolve the host session id
   if this session has active file claims:
     run claimed-only closeout
-  else if every pending file belongs to another claim updated within 24 hours:
-    stay silent
-  else if unclaimed pending memory exists:
-    block and request claim/review
+  else:
+    stay silent; do not adopt or block on shared unclaimed files
 
   run audit_autorun with a 7-day interval gate
 ```
