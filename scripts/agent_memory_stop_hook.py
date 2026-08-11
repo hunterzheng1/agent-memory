@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
-from agent_memory_claim import active_claim_rows, all_active_claim_rows
+from agent_memory_claim import active_claim_rows
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -282,19 +282,6 @@ def main() -> int:
     if args.auto_closeout and current_claims:
         result = run_closeout(payload, args.actor, args.timeout)
         return 0 if result.get("status") == "ok" else report_failure(args.protocol, result)
-    if args.auto_closeout and paths:
-        all_claimed_paths = {Path(row["path"]).resolve() for row in all_active_claim_rows(max_age_hours=24)}
-        unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
-        if unclaimed:
-            result = {
-                "status": "error",
-                "ownership_error": (
-                    f"{len(unclaimed)} changed memory file(s) are not claimed by any session; "
-                    f"run memoryctl --actor {args.actor} claim --file <path> for files owned by this session"
-                ),
-                "unclaimed_files": [str(path) for path in unclaimed],
-            }
-            return report_failure(args.protocol, result)
     if not args.auto_closeout and paths:
         state_mtime = STATE_DB.stat().st_mtime if STATE_DB.exists() else 0
         if historical_paths() or max(path.stat().st_mtime for path in paths) > state_mtime:
