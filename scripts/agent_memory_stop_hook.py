@@ -14,6 +14,7 @@ from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_claim import active_claim_rows, all_active_claim_rows
+from agent_memory_host import actor_names, resolve
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -40,11 +41,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Stop hook for Agent Memory shared by Claude Code, Codex, and CodeBuddy."
     )
-    parser.add_argument("--actor", choices=("codex", "claude", "codebuddy"), default="codex")
-    parser.add_argument("--protocol", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--actor", choices=actor_names(hook_only=True), default="codex")
+    parser.add_argument("--protocol", choices=("codex", "claude"), default=None)
     parser.add_argument("--auto-closeout", action="store_true")
     parser.add_argument("--timeout", type=int, default=300)
-    return parser.parse_args()
+    args = parser.parse_args()
+    expected_protocol = resolve(args.actor, env={}).hook_protocol
+    if args.protocol is None:
+        args.protocol = expected_protocol
+    elif args.protocol != expected_protocol:
+        parser.error(
+            f"--protocol {args.protocol!r} conflicts with --actor {args.actor!r}; "
+            f"expected {expected_protocol!r}"
+        )
+    return args
 
 
 def read_payload() -> dict[str, object]:
@@ -65,19 +75,9 @@ def clean_env() -> dict[str, str]:
 
 
 def session_key(payload: dict[str, object], actor: str) -> str:
-    for key in ("session_id", "sessionId", "thread_id", "threadId", "conversation_id", "conversationId"):
-        value = payload.get(key)
-        if value:
-            return str(value)
-    keys = {
-        "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
-        "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
-        "codebuddy": ("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
-    }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
-    for key in keys:
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
+    session_id = resolve(actor, payload=payload).session_id
+    if session_id:
+        return session_id
     return f"{payload.get('cwd') or actor}|{time.strftime('%Y-%m-%d')}"
 
 

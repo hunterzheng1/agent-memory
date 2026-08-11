@@ -54,6 +54,7 @@ class AgentScopeTests(unittest.TestCase):
             (workflow / "codex.md").write_text(memory("Codex", "codex", "codex"), encoding="utf-8")
             (workflow / "claude.md").write_text(memory("Claude", "claude", "claude"), encoding="utf-8")
             (workflow / "codebuddy.md").write_text(memory("CodeBuddy", "codebuddy", "codebuddy"), encoding="utf-8")
+            (workflow / "cursor.md").write_text(memory("Cursor", "cursor", "cursor"), encoding="utf-8")
             (workflow / "junk-scope.md").write_text(memory("Junk", "codebuddy", "not-a-scope"), encoding="utf-8")
 
             state_db = root / "config" / "state.sqlite"
@@ -79,11 +80,15 @@ class AgentScopeTests(unittest.TestCase):
                 junk = conn.execute(
                     "SELECT agent_scope FROM memory_docs WHERE rel_path='工作流/junk-scope.md'"
                 ).fetchone()
+                cursor = conn.execute(
+                    "SELECT agent_scope FROM memory_docs WHERE rel_path='工作流/cursor.md'"
+                ).fetchone()
             self.assertEqual(row, ("codex", "shared"))
             self.assertEqual(junk, ("shared",))
+            self.assertEqual(cursor, ("cursor",))
 
             visible: dict[str, set[str]] = {}
-            for actor in ("codex", "claude", "codebuddy"):
+            for actor in ("codex", "claude", "codebuddy", "cursor"):
                 result = run(
                     [
                         sys.executable,
@@ -107,6 +112,7 @@ class AgentScopeTests(unittest.TestCase):
             self.assertEqual(visible["codex"], {"shared.md", "codex.md", "junk-scope.md"})
             self.assertEqual(visible["claude"], {"shared.md", "claude.md", "junk-scope.md"})
             self.assertEqual(visible["codebuddy"], {"shared.md", "codebuddy.md", "junk-scope.md"})
+            self.assertEqual(visible["cursor"], {"shared.md", "cursor.md", "junk-scope.md"})
 
 
 if __name__ == "__main__":

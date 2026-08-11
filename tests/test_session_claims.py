@@ -16,6 +16,7 @@ SCRIPTS_PATH = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_PATH) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_PATH))
 
+from agent_memory_claim import parse_args as parse_claim_args
 from agent_memory_claim import session_value
 from agent_memory_stop_hook import session_key
 
@@ -40,6 +41,21 @@ def run(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 12
 
 
 class ActorSessionIsolationTest(unittest.TestCase):
+    def test_claim_parser_accepts_every_registered_actor(self) -> None:
+        actors = ("codex", "claude", "codebuddy", "cursor", "human", "migration", "test")
+        for actor in actors:
+            with self.subTest(actor=actor):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["agent_memory_claim.py", "--actor", actor, "list"],
+                ):
+                    try:
+                        args = parse_claim_args()
+                    except SystemExit as exc:
+                        self.fail(f"claim parser rejected registered actor {actor}: {exc}")
+                self.assertEqual(args.actor, actor)
+
     def test_actor_specific_environment_wins_over_inherited_other_host(self) -> None:
         env = {
             "CODEX_THREAD_ID": "codex-thread",

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_host import scope_names
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -492,7 +493,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--agent-id", default="", help="Filter all results by agent_id.")
     parser.add_argument(
         "--agent-scope",
-        choices=("codex", "claude", "codebuddy", "shared"),
+        choices=scope_names(),
         default="",
         help="Return shared memories plus memories scoped to this Agent.",
     )

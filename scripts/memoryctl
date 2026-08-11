@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from agent_memory_env import env_value
+from agent_memory_host import actor_names, resolve
 
 
 SCRIPT_ROOT = Path(__file__).resolve().parent
@@ -26,25 +27,11 @@ COMMANDS = {
     "check": SCRIPT_ROOT / "agent_memory_check.py",
 }
 
-
-def host_session_id(actor: str) -> str:
-    keys = {
-        "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
-        "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
-        "codebuddy": ("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
-    }.get(actor, ("AGENT_MEMORY_SESSION_ID",))
-    for key in keys:
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
-    return ""
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Platform-neutral Agent Memory Vault entrypoint.")
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "codebuddy", "human", "migration", "test"),
+        choices=actor_names(),
         default=os.environ.get("MEMORY_ACTOR", "codex"),
     )
     parser.add_argument("command", choices=(*COMMANDS.keys(), "prewrite", "version"))
@@ -54,6 +41,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    host = resolve(args.actor)
     if args.command == "version":
         config_root = Path(os.path.expandvars(env_value("CONFIG_ROOT", "$HOME/.config/agent-memory"))).expanduser()
         manifest_path = config_root / "config" / "runtime-manifest.json"
@@ -100,7 +88,7 @@ def main() -> int:
     if command_name == "closeout":
         global_mode = "--global" in forwarded
         forwarded = [item for item in forwarded if item != "--global"]
-        current_session = host_session_id(args.actor)
+        current_session = host.session_id
         if not global_mode and current_session and "--session-id" not in forwarded:
             forwarded.extend(["--session-id", current_session, "--claimed-only"])
         forwarded.extend(["--actor", args.actor])
@@ -110,10 +98,10 @@ def main() -> int:
             forwarded.append("--commit")
     elif (
         command_name == "search"
-        and args.actor in {"codex", "claude", "codebuddy"}
+        and host.search_scope
         and "--agent-scope" not in forwarded
     ):
-        forwarded.extend(["--agent-scope", args.actor])
+        forwarded.extend(["--agent-scope", host.search_scope])
     env = os.environ.copy()
     env["MEMORY_ACTOR"] = args.actor
     return subprocess.run([sys.executable, str(target), *forwarded], env=env, check=False).returncode

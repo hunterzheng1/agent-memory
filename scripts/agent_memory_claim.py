@@ -5,25 +5,17 @@ import argparse
 import datetime as dt
 import hashlib
 import json
-import os
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_host import actor_names, resolve
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[1]
 VAULT_ROOT = resolve_config_path(env_value("ROOT", str(RUNTIME_ROOT / "templates" / "vault")))
 STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
-ACTOR_SESSION_ENV_KEYS = {
-    "codex": ("AGENT_MEMORY_SESSION_ID", "CODEX_THREAD_ID"),
-    "claude": ("AGENT_MEMORY_SESSION_ID", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID"),
-    "codebuddy": ("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
-    "human": ("AGENT_MEMORY_SESSION_ID",),
-    "migration": ("AGENT_MEMORY_SESSION_ID",),
-    "test": ("AGENT_MEMORY_SESSION_ID",),
-}
 
 
 def utc_now() -> str:
@@ -39,13 +31,7 @@ def file_sha256(path: Path) -> str:
 
 
 def session_value(explicit: str = "", actor: str = "codex") -> str:
-    if explicit.strip():
-        return explicit.strip()
-    for key in ACTOR_SESSION_ENV_KEYS.get(actor, ("AGENT_MEMORY_SESSION_ID",)):
-        value = os.environ.get(key, "").strip()
-        if value:
-            return value
-    return ""
+    return resolve(actor, explicit_session_id=explicit).session_id
 
 
 def session_hash(value: str) -> str:
@@ -275,7 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Track per-session ownership of shared memory files.")
     parser.add_argument(
         "--actor",
-        choices=("codex", "claude", "codebuddy", "human", "migration", "test"),
+        choices=actor_names(),
         default="codex",
     )
     parser.add_argument("--session-id", default="")

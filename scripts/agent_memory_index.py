@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_host import scope_names
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ DEFAULT_USER_ID = env_value("USER_ID", "demo-user")
 DEFAULT_AGENT_ID = env_value("AGENT_ID", "shared")
 DEFAULT_APP_ID = env_value("APP_ID", "agent-memory")
 DEFAULT_LIMIT = 5
+_VALID_AGENT_SCOPES = frozenset(scope_names())
 
 
 @dataclass
@@ -281,6 +283,8 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
     headings = headings_from_markdown(text)
     keywords = as_text(meta.get("keywords"))
     open_loops = extract_open_loops(path, title, rel_path, text, indexed_at)
+    raw_agent_scope = as_text(meta.get("agent_scope"), "shared")
+    agent_scope = raw_agent_scope if raw_agent_scope in _VALID_AGENT_SCOPES else "shared"
     return (
         MemoryDoc(
             path=path,
@@ -293,9 +297,7 @@ def load_doc(path: Path, indexed_at: str) -> tuple[MemoryDoc, list[tuple[str, st
             app_id=as_text(meta.get("app_id"), DEFAULT_APP_ID),
             user_id=as_text(meta.get("user_id"), DEFAULT_USER_ID),
             agent_id=as_text(meta.get("agent_id"), DEFAULT_AGENT_ID),
-            agent_scope=as_text(meta.get("agent_scope"), "shared")
-            if as_text(meta.get("agent_scope"), "shared") in {"shared", "codex", "claude", "codebuddy"}
-            else "shared",
+            agent_scope=agent_scope,
             session_id=as_text(meta.get("session_id")),
             status=status,
             sensitivity=as_text(meta.get("sensitivity"), "private" if track == "user" else "normal"),

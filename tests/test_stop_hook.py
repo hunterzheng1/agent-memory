@@ -99,6 +99,47 @@ class StopHookProtocolTests(unittest.TestCase):
         self.assertIn("codebuddy closeout failed", payload["reason"])
         self.assertEqual(stderr.getvalue(), "")
 
+    def test_protocol_defaults_are_derived_for_every_hook_actor(self) -> None:
+        for actor, expected_protocol in (
+            ("codex", "codex"),
+            ("claude", "claude"),
+            ("codebuddy", "claude"),
+        ):
+            with self.subTest(actor=actor):
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["agent_memory_stop_hook.py", "--actor", actor],
+                ):
+                    args = self.module.parse_args()
+                self.assertEqual(args.protocol, expected_protocol)
+
+    def test_codebuddy_accepts_compatible_explicit_protocol(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["agent_memory_stop_hook.py", "--actor", "codebuddy", "--protocol", "claude"],
+        ):
+            args = self.module.parse_args()
+
+        self.assertEqual(args.protocol, "claude")
+
+    def test_codebuddy_rejects_conflicting_explicit_protocol(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                sys,
+                "argv",
+                ["agent_memory_stop_hook.py", "--actor", "codebuddy", "--protocol", "codex"],
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                self.module.parse_args()
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("conflicts", stderr.getvalue())
+
     def test_codebuddy_session_key_uses_native_env(self) -> None:
         with mock.patch.dict(
             "os.environ",

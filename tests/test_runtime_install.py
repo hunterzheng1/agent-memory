@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -35,6 +36,27 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertIn("requirements-vector.lock", payload["changed"])
             self.assertTrue(local_adapter.exists())
             self.assertTrue((root / "requirements-vector.lock").is_file())
+
+            runtime_env = os.environ.copy()
+            runtime_env["AGENT_MEMORY_CONFIG_ROOT"] = str(root)
+            runtime = subprocess.run(
+                [
+                    sys.executable,
+                    str(scripts / "memoryctl"),
+                    "--actor",
+                    "cursor",
+                    "version",
+                    "--json",
+                ],
+                cwd=root,
+                env=runtime_env,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(runtime.returncode, 0, runtime.stdout + runtime.stderr)
+            self.assertIn("source_commit", json.loads(runtime.stdout))
 
             verify = subprocess.run(
                 [sys.executable, str(INSTALLER), "--config-root", str(root), "--verify", "--json"],
