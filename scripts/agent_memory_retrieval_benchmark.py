@@ -114,6 +114,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-vector", action="store_true", help="Only run SQLite baseline.")
     parser.add_argument("--case-id", action="append", default=[], help="Run only this benchmark case id. Repeatable.")
     parser.add_argument("--benchmark-file", default="", help="Optional JSON array of benchmark cases.")
+    parser.add_argument(
+        "--lock-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for the serialized Zvec collection lock.",
+    )
     return parser.parse_args()
 
 
@@ -153,24 +159,37 @@ def main() -> int:
     if not args.no_vector:
         try:
             zvec_index = load_module("agent_memory_zvec_index_module", SCRIPT_ROOT / "agent_memory_zvec_index.py")
-            vector_conn = zvec_index.connect()
-            zvec_index.init_db(vector_conn)
-            store = zvec_index.ZvecStore(zvec_index.DEFAULT_COLLECTION_PATH, zvec_index.DEFAULT_EMBEDDING_DIM)
-            store.init()
-            embedder = zvec_index.EmbeddingGemmaEmbedder(
-                zvec_index.DEFAULT_MODEL,
-                zvec_index.DEFAULT_EMBEDDING_DIM,
-                zvec_index.DEFAULT_DEVICE,
-                "",
-            )
-            embedder.embed_query("benchmark preflight")
-            for record in records:
-                vector_results = run_vector(zvec_index, vector_conn, store, embedder, str(record["query"]), limit)
-                vector_rank = first_hit_rank(vector_results, list(record["expected"]))
-                vector_ranks.append(vector_rank)
-                record["vector_rank"] = vector_rank
-                record["vector_results"] = vector_results
-            vector_conn.close()
+            with zvec_index.zvec_lock(exclusive=True, timeout=max(float(args.lock_timeout), 0.0)):
+                vector_conn = zvec_index.connect()
+                try:
+                    zvec_index.init_db(vector_conn)
+                    store = zvec_index.ZvecStore(
+                        zvec_index.DEFAULT_COLLECTION_PATH,
+                        zvec_index.DEFAULT_EMBEDDING_DIM,
+                    )
+                    store.init()
+                    embedder = zvec_index.EmbeddingGemmaEmbedder(
+                        zvec_index.DEFAULT_MODEL,
+                        zvec_index.DEFAULT_EMBEDDING_DIM,
+                        zvec_index.DEFAULT_DEVICE,
+                        "",
+                    )
+                    embedder.embed_query("benchmark preflight")
+                    for record in records:
+                        vector_results = run_vector(
+                            zvec_index,
+                            vector_conn,
+                            store,
+                            embedder,
+                            str(record["query"]),
+                            limit,
+                        )
+                        vector_rank = first_hit_rank(vector_results, list(record["expected"]))
+                        vector_ranks.append(vector_rank)
+                        record["vector_rank"] = vector_rank
+                        record["vector_results"] = vector_results
+                finally:
+                    vector_conn.close()
         except Exception as exc:
             vector_error = str(exc)
 

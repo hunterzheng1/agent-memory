@@ -11,10 +11,38 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 import agent_memory_env
-from agent_memory_env import env_value, reset_config_cache
+from agent_memory_env import env_value, parse_toml_fallback, reset_config_cache
 
 
 class AgentMemoryEnvironmentTests(unittest.TestCase):
+    def test_toml_fallback_strips_comments_outside_strings(self) -> None:
+        payload = parse_toml_fallback(
+            'enabled = false # disabled\n'
+            'embedding_dim = 768 # model width\n'
+            'double_quoted = "keep # marker" # trailing comment\n'
+            "single_quoted = 'also # marker' # trailing comment\n"
+        )
+
+        self.assertIs(payload["enabled"], False)
+        self.assertEqual(payload["embedding_dim"], 768)
+        self.assertIsInstance(payload["embedding_dim"], int)
+        self.assertEqual(payload["double_quoted"], "keep # marker")
+        self.assertEqual(payload["single_quoted"], "also # marker")
+
+    def test_toml_fallback_parses_multiline_string_array_with_comments(self) -> None:
+        payload = parse_toml_fallback(
+            "[retrieval]\n"
+            "source_roots = [\n"
+            '  "project/#keep.md", # primary\n'
+            "  'workflow/notes.md', # secondary\n"
+            "] # trailing comma is valid\n"
+        )
+
+        self.assertEqual(
+            payload["retrieval"]["source_roots"],
+            ["project/#keep.md", "workflow/notes.md"],
+        )
+
     def test_agent_memory_value_is_used(self) -> None:
         with mock.patch.dict(
             "os.environ",

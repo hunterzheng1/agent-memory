@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.subprocess_env import isolated_subprocess_env
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -58,8 +59,7 @@ class AgentScopeTests(unittest.TestCase):
             (workflow / "junk-scope.md").write_text(memory("Junk", "codebuddy", "not-a-scope"), encoding="utf-8")
 
             state_db = root / "config" / "state.sqlite"
-            env = os.environ.copy()
-            env.update(
+            env = isolated_subprocess_env(
                 {
                     "AGENT_MEMORY_ROOT": str(vault),
                     "AGENT_MEMORY_GIT_ROOT": str(root),

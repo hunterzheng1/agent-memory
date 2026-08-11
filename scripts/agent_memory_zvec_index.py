@@ -4,11 +4,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
-    import msvcrt
 import hashlib
 import importlib.util
 import json
@@ -23,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_lock import try_lock, unlock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -103,24 +99,6 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
 
-
-def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
-    if fcntl is not None:
-        base = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        flags = base if blocking else base | fcntl.LOCK_NB
-        fcntl.flock(handle.fileno(), flags)
-        return
-    # Windows: shared locks are approximated with exclusive byte locks.
-    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-    msvcrt.locking(handle.fileno(), mode, 1)
-
-
-def unlock_file(handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-
 @contextlib.contextmanager
 def zvec_lock(exclusive: bool, timeout: float):
     DEFAULT_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -128,16 +106,17 @@ def zvec_lock(exclusive: bool, timeout: float):
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
-                lock_file(handle, blocking=False, exclusive=exclusive)
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
-                time.sleep(0.05)
+                if try_lock(handle, exclusive=exclusive):
+                    break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"zvec lock timed out: {DEFAULT_LOCK_PATH}")
+            time.sleep(0.05)
         try:
             yield
         finally:
-            unlock_file(handle)
+            unlock(handle)
 
 
 def sha256_text(text: str) -> str:
@@ -1054,9 +1033,8 @@ def main() -> int:
     args = parse_args()
     if not (args.init or args.scan or args.prune or args.report or args.changed_file or args.search):
         args.init = True
-    exclusive = bool(args.init or args.scan or args.prune or args.changed_file)
     try:
-        with zvec_lock(exclusive=exclusive, timeout=args.lock_timeout):
+        with zvec_lock(exclusive=True, timeout=args.lock_timeout):
             return run_locked(args)
     except TimeoutError as exc:
         if args.json:

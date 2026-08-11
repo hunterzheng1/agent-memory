@@ -100,11 +100,57 @@ def load_dotenv() -> dict[str, str]:
     return payload
 
 
+def _strip_toml_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(line):
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "#":
+            return line[:index]
+    return line
+
+
+def _toml_array_is_complete(value: str) -> bool:
+    quote: str | None = None
+    escaped = False
+    depth = 0
+    for char in value:
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == quote:
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+    return depth <= 0
+
+
 def parse_toml_fallback(text: str) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     section: tuple[str, ...] = ()
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
+    lines = iter(text.splitlines())
+    for raw_line in lines:
+        line = _strip_toml_comment(raw_line).strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]"):
@@ -115,6 +161,16 @@ def parse_toml_fallback(text: str) -> dict[str, Any]:
             continue
         key = key.strip()
         raw_value = raw_value.strip()
+        if raw_value.startswith("[") and not _toml_array_is_complete(raw_value):
+            value_lines = [raw_value]
+            for continuation in lines:
+                fragment = _strip_toml_comment(continuation).strip()
+                if fragment:
+                    value_lines.append(fragment)
+                joined = " ".join(value_lines)
+                if _toml_array_is_complete(joined):
+                    break
+            raw_value = " ".join(value_lines)
         try:
             value: object = ast.literal_eval(raw_value)
         except (SyntaxError, ValueError):

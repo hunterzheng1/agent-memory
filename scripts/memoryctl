@@ -104,7 +104,8 @@ def main() -> int:
         forwarded.extend(["--agent-scope", host.search_scope])
     env = os.environ.copy()
     env["MEMORY_ACTOR"] = args.actor
-    return subprocess.run([sys.executable, str(target), *forwarded], env=env, check=False).returncode
+    python = env_value("ZVEC_PYTHON", sys.executable) if command_name == "zvec" else sys.executable
+    return subprocess.run([python, str(target), *forwarded], env=env, check=False).returncode
 
 
 if __name__ == "__main__":

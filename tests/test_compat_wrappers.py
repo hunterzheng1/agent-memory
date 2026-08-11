@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tests.subprocess_env import isolated_subprocess_env
+
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
 
@@ -46,10 +48,12 @@ class TestCompatWrappers(unittest.TestCase):
             vault = root / "vault"
             (vault / "agent" / "cases").mkdir(parents=True)
             state_db = root / "state.sqlite"
-            env = os.environ | {
-                "AGENT_MEMORY_ROOT": str(vault),
-                "AGENT_MEMORY_STATE_DB": str(state_db),
-            }
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_ROOT": str(vault),
+                    "AGENT_MEMORY_STATE_DB": str(state_db),
+                }
+            )
             result = subprocess.run(
                 [sys.executable, str(script), "--init", "--scan", "--report"],
                 env=env,

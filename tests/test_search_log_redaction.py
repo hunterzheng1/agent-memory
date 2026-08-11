@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.subprocess_env import isolated_subprocess_env
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,13 +26,13 @@ class SearchLogRedactionTest(unittest.TestCase):
                 f'state_db = "{state_db.as_posix()}"\n',
                 encoding="utf-8",
             )
-            env = os.environ.copy()
-            for key in list(env):
-                if key.startswith("AGENT_MEMORY_") or key.startswith("CODEX_MEMORY_"):
-                    del env[key]
-            env["AGENT_MEMORY_CONFIG_FILE"] = str(config)
-            env["AGENT_MEMORY_ROOT"] = str(REPO_ROOT / "templates" / "vault")
-            env["AGENT_MEMORY_STATE_DB"] = str(state_db)
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": str(config),
+                    "AGENT_MEMORY_ROOT": str(REPO_ROOT / "templates" / "vault"),
+                    "AGENT_MEMORY_STATE_DB": str(state_db),
+                }
+            )
             initialized = subprocess.run(
                 [sys.executable, str(SCRIPTS / "agent_memory_index.py"), "--init"],
                 cwd=REPO_ROOT,

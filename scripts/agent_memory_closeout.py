@@ -4,11 +4,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - Windows fallback
-    fcntl = None
-    import msvcrt
 import hashlib
 import json
 import os
@@ -23,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_memory_env import env_value, resolve_config_path
+from agent_memory_lock import try_lock, unlock
 from agent_memory_claim import active_claim_rows, complete_claim_paths, record_file_observations
 
 
@@ -187,24 +183,6 @@ def run_command(
         }
 
 
-
-def lock_file(handle, blocking: bool = True, exclusive: bool = True) -> None:
-    if fcntl is not None:
-        base = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        flags = base if blocking else base | fcntl.LOCK_NB
-        fcntl.flock(handle.fileno(), flags)
-        return
-    # Windows: shared locks are approximated with exclusive byte locks.
-    mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-    msvcrt.locking(handle.fileno(), mode, 1)
-
-
-def unlock_file(handle) -> None:
-    if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return
-    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-
 @contextlib.contextmanager
 def closeout_lock(timeout: float = 15.0):
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -212,16 +190,17 @@ def closeout_lock(timeout: float = 15.0):
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             try:
-                lock_file(handle, blocking=False, exclusive=True)
-                break
-            except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
-                time.sleep(0.1)
+                if try_lock(handle):
+                    break
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"another memory closeout is still running: {LOCK_PATH}")
+            time.sleep(0.1)
         try:
             yield
         finally:
-            unlock_file(handle)
+            unlock(handle)
 
 
 def decode_status_line(line: str) -> GitEntry | None:

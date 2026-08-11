@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.subprocess_env import isolated_subprocess_env
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,7 +17,7 @@ def run(command: list[str], env: dict[str, str] | None = None) -> subprocess.Com
     return subprocess.run(
         command,
         cwd=REPO_ROOT,
-        env=env,
+        env=env if env is not None else isolated_subprocess_env(),
         text=True,
         capture_output=True,
         timeout=60,
@@ -42,8 +43,7 @@ class BootstrapIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
 
-            env = os.environ.copy()
-            env.update(
+            env = isolated_subprocess_env(
                 {
                     "AGENT_MEMORY_ROOT": str(vault),
                     "AGENT_MEMORY_GIT_ROOT": str(vault),

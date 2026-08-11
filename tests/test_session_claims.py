@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tests.subprocess_env import isolated_subprocess_env
+
 
 SCRIPTS_PATH = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_PATH) not in sys.path:
@@ -142,12 +144,12 @@ class SessionClaimConcurrencyTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            env = os.environ.copy()
-            for key in list(env):
-                if key.startswith("AGENT_MEMORY_") or key.startswith("CODEX_MEMORY_"):
-                    del env[key]
-            env["AGENT_MEMORY_CONFIG_FILE"] = str(config_path)
-            env["AGENT_MEMORY_ROOT"] = str(vault)
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": str(config_path),
+                    "AGENT_MEMORY_ROOT": str(vault),
+                }
+            )
 
             evolved = run(
                 [sys.executable, str(SCRIPTS / "agent_memory_evolution.py"), "--init", "--scan"],

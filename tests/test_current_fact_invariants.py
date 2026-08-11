@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import shutil
-import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.subprocess_env import isolated_subprocess_env
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -60,12 +61,12 @@ class CurrentFactInvariantTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            env = os.environ.copy()
-            for key in list(env):
-                if key.startswith("AGENT_MEMORY_") or key.startswith("CODEX_MEMORY_"):
-                    del env[key]
-            env["AGENT_MEMORY_CONFIG_FILE"] = str(config)
-            env["AGENT_MEMORY_ROOT"] = str(vault)
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": str(config),
+                    "AGENT_MEMORY_ROOT": str(vault),
+                }
+            )
             target = vault / "项目" / "current-facts.md"
             target.write_text(
                 """---

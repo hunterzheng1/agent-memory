@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from tests.subprocess_env import isolated_subprocess_env
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,12 +34,15 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             payload = json.loads(first.stdout)
             self.assertIn("memoryctl", payload["changed"])
+            self.assertIn("agent_memory_lock.py", payload["changed"])
             self.assertIn("requirements-vector.lock", payload["changed"])
             self.assertTrue(local_adapter.exists())
+            self.assertTrue((scripts / "agent_memory_lock.py").is_file())
             self.assertTrue((root / "requirements-vector.lock").is_file())
 
-            runtime_env = os.environ.copy()
-            runtime_env["AGENT_MEMORY_CONFIG_ROOT"] = str(root)
+            runtime_env = isolated_subprocess_env(
+                {"AGENT_MEMORY_CONFIG_ROOT": str(root)}
+            )
             runtime = subprocess.run(
                 [
                     sys.executable,
