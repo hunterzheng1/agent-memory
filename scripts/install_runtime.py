@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import datetime as dt
 import errno
 import hashlib
@@ -15,6 +16,8 @@ import tempfile
 import unicodedata
 from pathlib import Path
 from typing import Any, Iterator
+
+from ctypes import wintypes
 
 from agent_memory_lock import try_lock, unlock
 from agent_memory_state import (
@@ -84,6 +87,33 @@ DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
         getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
     }
 )
+WINDOWS_FILE_SHARE_READ = 0x00000001
+WINDOWS_FILE_SHARE_WRITE = 0x00000002
+WINDOWS_FILE_SHARE_DELETE = 0x00000004
+WINDOWS_GENERIC_WRITE = 0x40000000
+WINDOWS_OPEN_EXISTING = 3
+WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+WINDOWS_FILE_FLAG_WRITE_THROUGH = 0x80000000
+WINDOWS_MOVEFILE_REPLACE_EXISTING = 0x00000001
+WINDOWS_MOVEFILE_WRITE_THROUGH = 0x00000008
+WINDOWS_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+PROCESS_CRASH_RECOVERY = True
+POWER_LOSS_DURABILITY = "verified"
+
+
+class _WindowsByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("file_attributes", wintypes.DWORD),
+        ("creation_time", wintypes.FILETIME),
+        ("last_access_time", wintypes.FILETIME),
+        ("last_write_time", wintypes.FILETIME),
+        ("volume_serial_number", wintypes.DWORD),
+        ("file_size_high", wintypes.DWORD),
+        ("file_size_low", wintypes.DWORD),
+        ("number_of_links", wintypes.DWORD),
+        ("file_index_high", wintypes.DWORD),
+        ("file_index_low", wintypes.DWORD),
+    ]
 
 
 class RuntimeRollbackError(StateSecurityError):
@@ -108,6 +138,14 @@ class RuntimeRecoveryError(StateSecurityError):
         )
 
 
+class WindowsDurabilityError(StateSecurityError):
+    """The active Windows filesystem cannot provide the required barriers."""
+
+    def __init__(self, detail: str) -> None:
+        prefix = "windows_durability_unsupported: "
+        super().__init__(detail if detail.startswith(prefix) else prefix + detail)
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -124,8 +162,89 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
     return (int(metadata.st_dev), int(metadata.st_ino))
 
 
+def _windows_handle_identity_matches(
+    metadata: os.stat_result,
+    handle_identity: tuple[int, int],
+) -> bool:
+    """Match Win32 volume/file IDs across Python's old and widened st_dev forms."""
+
+    volume_serial, file_index = handle_identity
+    return (
+        int(metadata.st_ino) == file_index
+        and int(metadata.st_dev) & 0xFFFFFFFF == volume_serial
+    )
+
+
+def _windows_flush_path(path: Path, *, directory: bool) -> None:
+    if os.name != "nt":
+        raise WindowsDurabilityError("FlushFileBuffers is unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    flush_file_buffers = kernel32.FlushFileBuffers
+    flush_file_buffers.argtypes = [wintypes.HANDLE]
+    flush_file_buffers.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    flags = WINDOWS_FILE_FLAG_WRITE_THROUGH
+    if directory:
+        flags |= WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+    handle = create_file(
+        str(path),
+        WINDOWS_GENERIC_WRITE,
+        WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE,
+        None,
+        WINDOWS_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if handle == WINDOWS_INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        raise WindowsDurabilityError(
+            f"CreateFileW failed for {'directory' if directory else 'file'} "
+            f"{path}: {ctypes.FormatError(error).strip()} (winerror={error})"
+        )
+    try:
+        if not flush_file_buffers(handle):
+            error = ctypes.get_last_error()
+            raise WindowsDurabilityError(
+                f"FlushFileBuffers failed for {path}: "
+                f"{ctypes.FormatError(error).strip()} (winerror={error})"
+            )
+    finally:
+        close_handle(handle)
+
+
+def _windows_replace_write_through(source: Path, target: Path) -> None:
+    if os.name != "nt":
+        raise WindowsDurabilityError("MoveFileExW is unavailable")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    move_file = kernel32.MoveFileExW
+    move_file.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    move_file.restype = wintypes.BOOL
+    flags = WINDOWS_MOVEFILE_REPLACE_EXISTING | WINDOWS_MOVEFILE_WRITE_THROUGH
+    if not move_file(str(source), str(target), flags):
+        error = ctypes.get_last_error()
+        raise WindowsDurabilityError(
+            f"MoveFileExW failed for {source} -> {target}: "
+            f"{ctypes.FormatError(error).strip()} (winerror={error})"
+        )
+
+
 def _fsync_file(path: Path) -> None:
-    # Windows requires a writable descriptor for FlushFileBuffers/os.fsync.
+    if os.name == "nt":
+        _windows_flush_path(path, directory=False)
+        return
     with path.open("rb+") as handle:
         os.fsync(handle.fileno())
 
@@ -134,6 +253,7 @@ def _fsync_directory(path: Path) -> None:
     """Persist a directory entry where the platform exposes that operation."""
 
     if os.name == "nt":
+        _windows_flush_path(path, directory=True)
         return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     try:
@@ -150,6 +270,27 @@ def _fsync_directory(path: Path) -> None:
                 raise
     finally:
         os.close(descriptor)
+
+
+def _durable_replace(source: Path, target: Path) -> None:
+    """Replace a file only after durable content and namespace barriers."""
+
+    _fsync_file(source)
+    source_parent = source.parent
+    target_parent = target.parent
+    if os.name == "nt":
+        _windows_replace_write_through(source, target)
+    else:
+        os.replace(source, target)
+    _fsync_file(target)
+    _fsync_directory(source_parent)
+    if target_parent != source_parent:
+        _fsync_directory(target_parent)
+
+
+def _durable_unlink(path: Path) -> None:
+    path.unlink()
+    _fsync_directory(path.parent)
 
 
 def _fsync_directory_chain(path: Path, stop: Path) -> None:
@@ -177,8 +318,7 @@ def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
             os.fsync(handle.fileno())
         if POSIX_MODE_ENFORCED:
             temporary.chmod(PRIVATE_FILE_MODE)
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
+        _durable_replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -359,6 +499,8 @@ def expected_manifest(config_root: Path) -> dict[str, Any]:
         "template_inventory": template_inventory,
         "template_count": len(template_inventory),
         "integrity_model": INTEGRITY_MODEL,
+        "process_crash_recovery": PROCESS_CRASH_RECOVERY,
+        "power_loss_durability": POWER_LOSS_DURABILITY,
     }
 
 
@@ -544,7 +686,11 @@ def _unsafe_runtime_paths(config_root: Path) -> list[dict[str, Any]]:
     return issues
 
 
-def verify(config_root: Path) -> dict[str, Any]:
+def verify(
+    config_root: Path,
+    *,
+    allow_legacy_durability_contract: bool = False,
+) -> dict[str, Any]:
     config_root = absolute_path(config_root)
     manifest_path = config_root / "config" / "runtime-manifest.json"
     unsafe_paths = _unsafe_runtime_paths(config_root)
@@ -698,6 +844,19 @@ def verify(config_root: Path) -> dict[str, Any]:
 
     schema_valid = manifest.get("schema_version") == 2
     integrity_model_valid = manifest.get("integrity_model") == INTEGRITY_MODEL
+    legacy_durability_contract = (
+        allow_legacy_durability_contract
+        and "process_crash_recovery" not in manifest
+        and "power_loss_durability" not in manifest
+    )
+    process_crash_recovery_valid = (
+        manifest.get("process_crash_recovery") is PROCESS_CRASH_RECOVERY
+        or legacy_durability_contract
+    )
+    power_loss_durability_valid = (
+        manifest.get("power_loss_durability") == POWER_LOSS_DURABILITY
+        or legacy_durability_contract
+    )
     inventory_valid = (
         inventory_is_list
         and not inventory_invalid_entries
@@ -726,6 +885,8 @@ def verify(config_root: Path) -> dict[str, Any]:
         "ok": (
             schema_valid
             and integrity_model_valid
+            and process_crash_recovery_valid
+            and power_loss_durability_valid
             and isinstance(expected_raw, dict)
             and isinstance(support_expected_raw, dict)
             and isinstance(template_expected_raw, dict)
@@ -755,6 +916,10 @@ def verify(config_root: Path) -> dict[str, Any]:
         "manifest": str(manifest_path),
         "schema_version": manifest.get("schema_version"),
         "integrity_model": manifest.get("integrity_model", ""),
+        "process_crash_recovery": manifest.get("process_crash_recovery", False),
+        "power_loss_durability": manifest.get(
+            "power_loss_durability", "unsupported"
+        ),
         "source_commit": manifest.get("source_commit", ""),
         "source_dirty": bool(manifest.get("source_dirty")),
         "checked_files": len(expected),
@@ -813,6 +978,122 @@ def _raise_first_unsafe_path(config_root: Path) -> None:
     )
 
 
+def _strip_windows_device_prefix(path: str) -> str:
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\") or path.startswith("\\??\\"):
+        return path[4:]
+    return path
+
+
+def _windows_final_path_identity(path: Path) -> tuple[str, tuple[int, int]]:
+    """Return the final DOS path and stable identity for an existing object."""
+
+    if os.name != "nt":
+        raise OSError("Windows final-path lookup is unavailable on this platform")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    get_final_path.restype = wintypes.DWORD
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_WindowsByHandleFileInformation),
+    ]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(
+        str(path),
+        0,
+        WINDOWS_FILE_SHARE_READ | WINDOWS_FILE_SHARE_WRITE | WINDOWS_FILE_SHARE_DELETE,
+        None,
+        WINDOWS_OPEN_EXISTING,
+        WINDOWS_FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if handle == WINDOWS_INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        written = get_final_path(handle, buffer, len(buffer), 0)
+        if written == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written >= len(buffer):
+            raise OSError(f"canonical Windows path exceeds supported length: {path}")
+        information = _WindowsByHandleFileInformation()
+        if not get_information(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        identity = (
+            int(information.volume_serial_number),
+            (int(information.file_index_high) << 32)
+            | int(information.file_index_low),
+        )
+        return _strip_windows_device_prefix(buffer.value), identity
+    finally:
+        close_handle(handle)
+
+
+def _canonical_runtime_lock_material(config_root: Path) -> str:
+    """Canonicalize aliases while remaining stable as missing parents appear."""
+
+    path = absolute_path(config_root)
+    if os.name != "nt":
+        return os.path.normcase(os.path.normpath(os.fspath(path)))
+    missing: list[str] = []
+    cursor = path
+    while True:
+        try:
+            before = os.lstat(cursor)
+        except FileNotFoundError:
+            parent = cursor.parent
+            if parent == cursor:
+                raise StateSecurityError(
+                    f"runtime install lock cannot find an existing parent: {config_root}"
+                )
+            missing.append(cursor.name)
+            cursor = parent
+            continue
+        if _is_reparse(before):
+            raise StateSecurityError(
+                f"runtime install lock path is a reparse point: {cursor}"
+            )
+        if missing and not stat.S_ISDIR(before.st_mode):
+            raise StateSecurityError(
+                f"runtime install lock parent is not a directory: {cursor}"
+            )
+        final_path, handle_identity = _windows_final_path_identity(cursor)
+        after = os.lstat(cursor)
+        if (
+            _is_reparse(after)
+            or _metadata_identity(before) != _metadata_identity(after)
+            or not _windows_handle_identity_matches(after, handle_identity)
+        ):
+            raise StateSecurityError(
+                f"runtime install lock path changed during canonicalization: {cursor}"
+            )
+        canonical = os.path.join(final_path, *reversed(missing))
+        return os.path.normcase(os.path.normpath(canonical))
+
+
 @contextlib.contextmanager
 def _runtime_install_mutex(config_root: Path) -> Iterator[None]:
     """Serialize publishers with a process-owned lock that survives stale metadata."""
@@ -832,7 +1113,7 @@ def _runtime_install_mutex(config_root: Path) -> Iterator[None]:
             f"runtime install lock parent is unsafe: {lock_parent_issue['path']}"
         )
     lock_key = hashlib.sha256(
-        os.path.normcase(os.path.normpath(os.fspath(config_root))).encode("utf-8")
+        _canonical_runtime_lock_material(config_root).encode("utf-8")
     ).hexdigest()[:20]
     lock_path = lock_parent / f".agent-memory-runtime-install-{lock_key}.lock"
     try:
@@ -953,8 +1234,7 @@ def _remove_runtime_journal(config_root: Path) -> None:
         return
     if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
         raise StateSecurityError(f"runtime transaction journal is unsafe: {journal_path}")
-    journal_path.unlink()
-    _fsync_directory(config_root)
+    _durable_unlink(journal_path)
 
 
 def _valid_sha256(value: object, *, allow_none: bool = False) -> bool:
@@ -1136,7 +1416,6 @@ def _cleanup_orphan_stages(config_root: Path) -> None:
 
 def _cleanup_journal_temporaries(config_root: Path) -> None:
     prefix = f".{RUNTIME_JOURNAL_NAME}."
-    removed = False
     try:
         entries = list(os.scandir(config_root))
     except FileNotFoundError:
@@ -1148,10 +1427,7 @@ def _cleanup_journal_temporaries(config_root: Path) -> None:
         metadata = os.lstat(path)
         if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
             raise RuntimeRecoveryError(path, ["orphan journal temporary is unsafe"])
-        path.unlink()
-        removed = True
-    if removed:
-        _fsync_directory(config_root)
+        _durable_unlink(path)
 
 
 def _runtime_sources(manifest: dict[str, Any]) -> list[tuple[str, Path, int | None]]:
@@ -1362,8 +1638,7 @@ def _publish_staged_runtime(
         journal["actions"].append(action)
         _write_runtime_journal(config_root, journal)
         assert_managed_target(config_root, target)
-        os.replace(source, target)
-        _fsync_directory(target.parent)
+        _durable_replace(source, target)
         if mode is not None:
             target.chmod(mode)
         _fsync_file(target)
@@ -1415,8 +1690,7 @@ def _publish_staged_runtime(
             }
             journal["actions"].append(action)
             _write_runtime_journal(config_root, journal)
-            target.unlink()
-            _fsync_directory(target.parent)
+            _durable_unlink(target)
             action["status"] = "published"
             _write_runtime_journal(config_root, journal)
 
@@ -1485,8 +1759,7 @@ def _rollback_transaction_action(
         if current_digest is not None and current_digest not in allowed_current:
             raise StateSecurityError(f"runtime rollback target changed: {target}")
         assert_managed_target(config_root, target)
-        os.replace(backup, target)
-        _fsync_directory(target.parent)
+        _durable_replace(backup, target)
         if sha256(target) != backup_digest:
             raise StateSecurityError(f"runtime rollback restore mismatch: {target}")
         return
@@ -1494,8 +1767,7 @@ def _rollback_transaction_action(
         return
     if desired_digest is None or current_digest != desired_digest:
         raise StateSecurityError(f"runtime rollback target changed: {target}")
-    target.unlink()
-    _fsync_directory(target.parent)
+    _durable_unlink(target)
 
 
 def _verify_restored_transaction(
@@ -1518,7 +1790,7 @@ def _verify_restored_transaction(
         return
     if _action_target_digest(config_root, "config/runtime-manifest.json") != previous_manifest_digest:
         raise StateSecurityError("runtime rollback did not restore the previous manifest")
-    restored = verify(config_root)
+    restored = verify(config_root, allow_legacy_durability_contract=True)
     if not restored.get("ok"):
         raise StateSecurityError(
             "restored runtime closure failed verification: "
@@ -1616,6 +1888,7 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
                     allow_missing=False,
                 )
                 ensure_private_directory(config_root, harden_existing=True)
+                _fsync_directory(config_root)
                 recovered_transaction = _recover_stale_transaction(config_root)
                 _raise_first_unsafe_path(config_root)
                 manifest = expected_manifest(config_root)
@@ -1653,6 +1926,10 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
         "source_commit": manifest["source_commit"],
         "source_dirty": manifest["source_dirty"],
         "recovered_transaction": recovered_transaction,
+        "process_crash_recovery": PROCESS_CRASH_RECOVERY,
+        "power_loss_durability": (
+            "not_checked" if dry_run else POWER_LOSS_DURABILITY
+        ),
         "permissions": permissions,
     }
 
@@ -1672,7 +1949,18 @@ def main() -> int:
     try:
         payload = verify(config_root) if args.verify else install(config_root, args.dry_run)
     except (OSError, StateSecurityError) as exc:
-        payload = {"ok": False, "config_root": str(config_root), "error": type(exc).__name__, "detail": str(exc)}
+        payload = {
+            "ok": False,
+            "config_root": str(config_root),
+            "error": type(exc).__name__,
+            "detail": str(exc),
+            "process_crash_recovery": PROCESS_CRASH_RECOVERY,
+            "power_loss_durability": (
+                "unsupported"
+                if isinstance(exc, WindowsDurabilityError)
+                else "not_verified"
+            ),
+        }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

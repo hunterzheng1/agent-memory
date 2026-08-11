@@ -22,6 +22,28 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "scripts" / "install_runtime.py"
 
 
+def windows_short_path(path: Path) -> Path | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_short_path_name = kernel32.GetShortPathNameW
+    get_short_path_name.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    get_short_path_name.restype = ctypes.c_uint32
+    required = get_short_path_name(str(path), None, 0)
+    if required == 0:
+        return None
+    buffer = ctypes.create_unicode_buffer(required)
+    written = get_short_path_name(str(path), buffer, required)
+    if written == 0 or written >= required:
+        return None
+    shortened = Path(buffer.value)
+    if os.path.normcase(str(shortened)) == os.path.normcase(str(path)):
+        return None
+    return shortened
+
+
 def make_directory_reparse(link: Path, target: Path) -> None:
     if os.name == "nt":
         created = subprocess.run(
@@ -102,6 +124,217 @@ class RuntimeInstallTests(unittest.TestCase):
                     completed.stdout + completed.stderr,
                 )
 
+    @unittest.skipUnless(os.name == "nt", "Win32 durability primitives are Windows-specific")
+    def test_windows_durability_primitives_and_runtime_contract(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+
+            scripts_root, raw_root = sys.argv[1:]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            root = Path(raw_root)
+            source = root / "source.bin"
+            target = root / "target.bin"
+            source.write_bytes(b"durable-probe")
+            install_runtime._fsync_file(source)
+            install_runtime._fsync_directory(root)
+            install_runtime._durable_replace(source, target)
+            if source.exists() or target.read_bytes() != b"durable-probe":
+                raise SystemExit(3)
+            payload = install_runtime.install(root / "runtime", False)
+            manifest = json.loads(
+                (root / "runtime" / "config" / "runtime-manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            print(json.dumps({"payload": payload, "manifest": manifest}))
+            """
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe, str(REPO_ROOT / "scripts"), raw_root],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        observed = json.loads(completed.stdout)
+        for subject in (observed["payload"], observed["manifest"]):
+            self.assertIs(subject["process_crash_recovery"], True)
+            self.assertEqual(subject["power_loss_durability"], "verified")
+
+    @unittest.skipUnless(os.name == "nt", "Win32 durability primitives are Windows-specific")
+    def test_windows_durability_failure_is_fail_closed(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            scripts_root, raw_root = sys.argv[1:]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            def unsupported(*_args, **_kwargs):
+                raise install_runtime.WindowsDurabilityError(
+                    "windows_durability_unsupported: injected FlushFileBuffers failure"
+                )
+            install_runtime._windows_flush_path = unsupported
+            install_runtime.install(Path(raw_root) / "runtime", False)
+            """
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe, str(REPO_ROOT / "scripts"), raw_root],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn(
+            "windows_durability_unsupported",
+            completed.stdout + completed.stderr,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Win32 durability primitives are Windows-specific")
+    def test_windows_install_routes_critical_files_through_durable_wrappers(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import json
+            import os
+            import sys
+            from pathlib import Path
+
+            scripts_root, raw_root = sys.argv[1:]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            root = Path(raw_root) / "runtime"
+            install_runtime.install(root, False)
+            original_replace = install_runtime._durable_replace
+            original_fsync_file = install_runtime._fsync_file
+            replacements = []
+            flushed = []
+            def observed_replace(source, target):
+                replacements.append(os.fspath(target))
+                return original_replace(source, target)
+            def observed_fsync(path):
+                flushed.append(os.fspath(path))
+                return original_fsync_file(path)
+            install_runtime._durable_replace = observed_replace
+            install_runtime._fsync_file = observed_fsync
+            install_runtime.install(root, False)
+            print(json.dumps({"replacements": replacements, "flushed": flushed}))
+            """
+        )
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            completed = subprocess.run(
+                [sys.executable, "-c", probe, str(REPO_ROOT / "scripts"), raw_root],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            runtime_root = Path(raw_root) / "runtime"
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        observed = json.loads(completed.stdout)
+        replacement_targets = {
+            os.path.normcase(os.path.normpath(path)) for path in observed["replacements"]
+        }
+        self.assertIn(
+            os.path.normcase(str(runtime_root / ".runtime-install-journal.json")),
+            replacement_targets,
+        )
+        self.assertIn(
+            os.path.normcase(str(runtime_root / "scripts" / "install_runtime.py")),
+            replacement_targets,
+        )
+        self.assertIn(
+            os.path.normcase(str(runtime_root / "config" / "runtime-manifest.json")),
+            replacement_targets,
+        )
+        self.assertTrue(
+            any(f"{os.sep}.rollback{os.sep}" in path for path in observed["flushed"]),
+            observed,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Win32 durability primitives are Windows-specific")
+    def test_windows_durability_uses_required_win32_flags_and_checks_flush(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import json
+            import sys
+            from pathlib import Path
+
+            scripts_root = sys.argv[1]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            calls = []
+            class Function:
+                def __init__(self, name, result):
+                    self.name = name
+                    self.result = result
+                    self.argtypes = None
+                    self.restype = None
+                def __call__(self, *args):
+                    calls.append([self.name, *args])
+                    return self.result
+            class Kernel32:
+                def __init__(self):
+                    self.CreateFileW = Function("CreateFileW", 123)
+                    self.FlushFileBuffers = Function("FlushFileBuffers", 1)
+                    self.CloseHandle = Function("CloseHandle", 1)
+                    self.MoveFileExW = Function("MoveFileExW", 1)
+            kernel32 = Kernel32()
+            install_runtime.ctypes.WinDLL = lambda *_args, **_kwargs: kernel32
+            install_runtime._windows_flush_path(Path(r"C:\\durability-probe"), directory=True)
+            install_runtime._windows_replace_write_through(
+                Path(r"C:\\source.tmp"), Path(r"C:\\target.json")
+            )
+            kernel32.FlushFileBuffers.result = 0
+            rejected = False
+            try:
+                install_runtime._windows_flush_path(
+                    Path(r"C:\\durability-probe"), directory=True
+                )
+            except install_runtime.WindowsDurabilityError:
+                rejected = True
+            print(json.dumps({"calls": calls, "rejected": rejected}))
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(REPO_ROOT / "scripts")],
+            cwd=REPO_ROOT,
+            env=isolated_subprocess_env(),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        observed = json.loads(completed.stdout)
+        create_call = next(call for call in observed["calls"] if call[0] == "CreateFileW")
+        self.assertEqual(create_call[2], 0x40000000)
+        self.assertEqual(create_call[3], 0x00000007)
+        self.assertEqual(create_call[5], 3)
+        self.assertEqual(create_call[6] & 0x02000000, 0x02000000)
+        self.assertEqual(create_call[6] & 0x80000000, 0x80000000)
+        move_call = next(call for call in observed["calls"] if call[0] == "MoveFileExW")
+        self.assertEqual(move_call[3], 0x00000009)
+        self.assertTrue(observed["rejected"])
+
     def make_verified_old_runtime(self, root: Path) -> dict[str, bytes]:
         installed = subprocess.run(
             [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
@@ -167,7 +400,7 @@ class RuntimeInstallTests(unittest.TestCase):
             import install_runtime
 
             original_copy2 = install_runtime.shutil.copy2
-            original_replace = install_runtime.os.replace
+            original_replace = install_runtime._durable_replace
             original_write_journal = install_runtime._write_runtime_journal
             copy_count = 0
             publish_count = 0
@@ -238,7 +471,7 @@ class RuntimeInstallTests(unittest.TestCase):
                     os._exit(91)
 
             install_runtime.shutil.copy2 = injected_copy2
-            install_runtime.os.replace = injected_replace
+            install_runtime._durable_replace = injected_replace
             install_runtime._write_runtime_journal = injected_write_journal
             install_runtime.install(install_runtime.Path(config_root), False)
             """
@@ -401,6 +634,66 @@ class RuntimeInstallTests(unittest.TestCase):
                 (root / "scripts" / "local_adapter.py").read_bytes(),
                 b"LOCAL = True\n",
             )
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_recovers_legacy_manifest_after_process_dies_during_upgrade(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            installed = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            manifest_path = root / "config" / "runtime-manifest.json"
+            legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            legacy_manifest.pop("process_crash_recovery")
+            legacy_manifest.pop("power_loss_durability")
+            manifest_path.write_text(
+                json.dumps(legacy_manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            strict_verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--config-root",
+                    str(root),
+                    "--verify",
+                    "--json",
+                ],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertNotEqual(strict_verify.returncode, 0)
+
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            payload = json.loads(recovered.stdout)
+            self.assertTrue(payload["recovered_transaction"])
+            upgraded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertIs(upgraded_manifest["process_crash_recovery"], True)
+            self.assertEqual(upgraded_manifest["power_loss_durability"], "verified")
             self.assertFalse((root / ".runtime-install-journal.json").exists())
             self.assertFalse(list(root.glob(".runtime-stage-*")))
 
@@ -803,6 +1096,184 @@ class RuntimeInstallTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(after_release.returncode, 0, after_release.stdout + after_release.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "NTFS short aliases are Windows-specific")
+    def test_runtime_install_lock_unifies_real_long_and_short_path_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            workspace = Path(raw_root).resolve()
+            root = workspace / "Agent Memory Long Runtime Directory"
+            root.mkdir()
+            short_root = windows_short_path(root)
+            if short_root is None:
+                self.skipTest("the test volume does not expose an 8.3 alias")
+            self.assertIn("~", str(short_root))
+            ready = workspace / "alias-lock-ready"
+            release = workspace / "alias-lock-release"
+            holder_probe = textwrap.dedent(
+                """
+                import sys
+                import time
+                from pathlib import Path
+
+                scripts_root, config_root, ready_path, release_path = sys.argv[1:]
+                sys.path.insert(0, scripts_root)
+                import install_runtime
+
+                original_stage = install_runtime._stage_runtime
+                def blocking_stage(root, manifest):
+                    Path(ready_path).write_text("ready", encoding="utf-8")
+                    while not Path(release_path).exists():
+                        time.sleep(0.02)
+                    return original_stage(root, manifest)
+                install_runtime._stage_runtime = blocking_stage
+                install_runtime.install(Path(config_root), False)
+                """
+            )
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    holder_probe,
+                    str(REPO_ROOT / "scripts"),
+                    str(root),
+                    str(ready),
+                    str(release),
+                ],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            contender: subprocess.CompletedProcess[str] | None = None
+            try:
+                for _ in range(500):
+                    if ready.exists() or holder.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if not ready.exists():
+                    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+                    self.fail(holder_stdout + holder_stderr)
+                contender = subprocess.run(
+                    [
+                        sys.executable,
+                        str(INSTALLER),
+                        "--config-root",
+                        str(short_root),
+                        "--json",
+                    ],
+                    cwd=REPO_ROOT,
+                    env=isolated_subprocess_env(),
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+            finally:
+                release.write_text("release", encoding="utf-8")
+                holder_stdout, holder_stderr = holder.communicate(timeout=60)
+            self.assertEqual(holder.returncode, 0, holder_stdout + holder_stderr)
+            assert contender is not None
+            self.assertNotEqual(contender.returncode, 0, contender.stdout + contender.stderr)
+            self.assertIn("already in progress", contender.stdout)
+
+            after_release = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(short_root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(
+                after_release.returncode,
+                0,
+                after_release.stdout + after_release.stderr,
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows path canonicalization is Windows-specific")
+    def test_runtime_lock_material_uses_handle_final_path_in_mocked_fallback(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import os
+            import stat
+            import sys
+            from pathlib import Path
+            from types import SimpleNamespace
+
+            scripts_root = sys.argv[1]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            metadata = SimpleNamespace(
+                st_mode=stat.S_IFDIR,
+                st_dev=73,
+                st_ino=991,
+                st_file_attributes=0,
+            )
+            install_runtime.os.lstat = lambda _path: metadata
+            install_runtime._windows_final_path_identity = lambda _path: (
+                r"C:\\Canonical Parent\\Agent Memory Runtime",
+                (73, 991),
+            )
+            long_material = install_runtime._canonical_runtime_lock_material(
+                Path(r"C:\\Canonical Parent\\Agent Memory Runtime")
+            )
+            short_material = install_runtime._canonical_runtime_lock_material(
+                Path(r"C:\\CANONI~1\\AGENTM~1")
+            )
+            if long_material != short_material:
+                raise SystemExit(f"{long_material!r} != {short_material!r}")
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(REPO_ROOT / "scripts")],
+            cwd=REPO_ROOT,
+            env=isolated_subprocess_env(),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "Windows file identities are Windows-specific")
+    def test_windows_handle_identity_accepts_python_314_widened_device_id(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import sys
+            from types import SimpleNamespace
+
+            sys.path.insert(0, sys.argv[1])
+            import install_runtime
+
+            metadata = SimpleNamespace(
+                st_dev=0x0478680B5CCE3968,
+                st_ino=3096224748854910,
+            )
+            if not install_runtime._windows_handle_identity_matches(
+                metadata,
+                (0x5CCE3968, 3096224748854910),
+            ):
+                raise SystemExit("widened Python st_dev was not matched")
+            if install_runtime._windows_handle_identity_matches(
+                metadata,
+                (0x5CCE3968, 3096224748854911),
+            ):
+                raise SystemExit("different file index was accepted")
+            """
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(REPO_ROOT / "scripts")],
+            cwd=REPO_ROOT,
+            env=isolated_subprocess_env(),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
     def test_install_preserves_recovery_backup_when_rollback_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
