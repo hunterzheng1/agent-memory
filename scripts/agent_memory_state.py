@@ -229,7 +229,7 @@ def secure_sqlite_connect(
         if not path.parent.exists():
             raise StateSecurityError(f"SQLite parent directory is missing: {path.parent}")
     else:
-        ensure_private_directory(path.parent)
+        ensure_private_directory(path.parent, harden_existing=True)
     if path.is_symlink():
         raise StateSecurityError(f"SQLite database must not be a symlink: {path}")
     if read_only:

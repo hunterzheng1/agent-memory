@@ -16,9 +16,9 @@
     {
       "id": "sample-update",
       "input": "The sample runtime now uses the revised local index.",
-      "source_class": "local_verified",
+      "source_class": "manual_edit",
       "knowledge_kind": "fact",
-      "evidence_ref": "fixture://runtime-check",
+      "asserted_by": "human",
       "rows": [
         {
           "title": "Earlier sample runtime index",
@@ -69,9 +69,9 @@
     {
       "id": "sample-mark-outdated",
       "input": "The older fake runtime decision has passed its explicit validity window.",
-      "source_class": "local_verified",
+      "source_class": "manual_edit",
       "knowledge_kind": "fact",
-      "evidence_ref": "fixture://expiry-review",
+      "asserted_by": "human",
       "current_status": "active",
       "valid_until": "2025-12-31",
       "as_of": "2026-01-02",

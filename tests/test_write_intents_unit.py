@@ -117,6 +117,18 @@ class WriteIntentTests(unittest.TestCase):
         with self.assertRaisesRegex(self.module.IntentError, "symlink"):
             self.module.canonical_target("linked/note.md")
 
+    def test_protected_patterns_preserve_dot_directories_and_reject_invalid_config(self) -> None:
+        self.assertTrue(
+            self.module.is_protected_target(
+                self.vault / ".private" / "rules.md",
+                protected_paths=(".private/*.md",),
+            )
+        )
+        for pattern in ("/absolute/*.md", "../escape/*.md", "broken[*.md"):
+            with self.subTest(pattern=pattern), self.assertRaises(self.module.IntentError) as caught:
+                self.module.is_protected_target(self.note, protected_paths=(pattern,))
+            self.assertEqual(caught.exception.reason_code, "PROTECTED_PATH_PATTERN_INVALID")
+
     def test_proposal_must_be_outside_vault_valid_utf8_and_bounded(self) -> None:
         inside = self.vault / "proposal.tmp"
         inside.write_text("proposal", encoding="utf-8")
@@ -211,6 +223,47 @@ class WriteIntentTests(unittest.TestCase):
         self.assertEqual(snapshot, "# Rules\n\nUpdated.\n")
         self.assertEqual(audit_count, 3)
 
+    def test_evidence_digest_links_safety_intent_and_receipt_without_rehash(self) -> None:
+        digest = "cd" * 32
+        intent = self.module.create_intent(
+            actor="codex",
+            raw_session_id=self.session,
+            target=self.note,
+            proposal_file=self.proposal,
+            approval_required=False,
+            source_class="user_direct",
+            knowledge_kind="fact",
+            asserted_by="human",
+            evidence_ref_sha256=digest,
+        )
+        with closing(sqlite3.connect(self.module.STATE_DB)) as conn:
+            stored = conn.execute(
+                "SELECT i.evidence_ref_sha256, s.evidence_ref_sha256 "
+                "FROM memory_write_intents i JOIN memory_safety_log s "
+                "ON s.id=i.safety_audit_id WHERE i.intent_id=?",
+                (intent["intent_id"],),
+            ).fetchone()
+        self.assertEqual(stored, (digest, digest))
+        self.bind(intent)
+        self.note.write_bytes(self.proposal.read_bytes())
+        self.assertTrue(
+            self.module.validate_closeout(
+                intent["intent_id"],
+                actor="codex",
+                raw_session_id=self.session,
+                target=self.note,
+            )["ok"]
+        )
+        git(self.root, "add", "Agent记忆/关键/Rules.md")
+        git(self.root, "commit", "-qm", "evidence-linked update")
+        receipt = self.module.finalize_receipt(
+            intent["intent_id"],
+            actor="codex",
+            raw_session_id=self.session,
+            outcome="completed",
+        )
+        self.assertEqual(receipt["evidence_ref_sha256"], digest)
+
     def test_disabled_feature_allows_explicit_advisory_intent_but_never_enforces(self) -> None:
         self.module.INTENTS_ENABLED = False
         self.module.ENFORCEMENT_MODE = "enforce"
@@ -224,11 +277,13 @@ class WriteIntentTests(unittest.TestCase):
             intent_ids=[],
             enforcement_mode="enforce",
         )
-        self.assertTrue(gate["ok"])
+        self.assertFalse(gate["ok"])
         self.assertFalse(gate["enabled"])
         self.assertEqual(gate["requested_mode"], "enforce")
-        self.assertEqual(gate["mode"], "off")
-        self.assertTrue(gate["violations"])
+        self.assertEqual(gate["mode"], "enforce")
+        self.assertTrue(gate["blocking"])
+        self.assertEqual(gate["reason_code"], "TRUSTED_APPROVAL_VERIFIER_REQUIRED")
+        self.assertFalse(gate["can_authorize_action"])
 
     def test_schema_has_two_protocol_tables_and_active_target_is_unique_case_insensitively(self) -> None:
         first = self.create()
@@ -345,6 +400,9 @@ class WriteIntentTests(unittest.TestCase):
 
         approved = self.approve(intent)
         self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["approval_trust"], "self_attested")
+        self.assertEqual(approved["provenance_trust"], "self_attested")
+        self.assertFalse(approved["can_authorize_action"])
         self.assertTrue(approved["approval_binding_sha256"])
         self.assertFalse(approved["idempotent"])
         repeated = self.approve(intent)
@@ -455,6 +513,9 @@ class WriteIntentTests(unittest.TestCase):
         self.assertTrue(validation["receipt"]["approval_ref_sha256"])
         self.assertEqual(validation["receipt"]["source_class"], "user_direct")
         self.assertTrue(validation["receipt"]["asserted_by_sha256"])
+        self.assertEqual(validation["receipt"]["approval_trust"], "self_attested")
+        self.assertEqual(validation["receipt"]["provenance_trust"], "self_attested")
+        self.assertEqual(validation["receipt"]["can_authorize_action"], 0)
 
     def test_exact_validate_and_receipt_finalize_are_idempotent(self) -> None:
         intent = self.create()
@@ -674,12 +735,12 @@ class WriteIntentTests(unittest.TestCase):
         self.assertEqual(len(validation["version_chain"]), 1)
         self.assertEqual(self.module.show_intent(intent["intent_id"])["receipt"]["outcome"], "failed")
 
-    def test_protected_enforcement_blocks_bypass_and_path_misbinding(self) -> None:
+    def test_untrusted_enforcement_fails_closed_and_advisory_reports_path_issues(self) -> None:
         bypass = self.module.enforce_protected_changes(
             [self.note], actor="codex", raw_session_id=self.session
         )
         self.assertFalse(bypass["ok"])
-        self.assertEqual(bypass["violations"][0]["reason_code"], "PROTECTED_WRITE_WITHOUT_BOUND_INTENT")
+        self.assertEqual(bypass["reason_code"], "TRUSTED_APPROVAL_VERIFIER_REQUIRED")
 
         intent = self.create()
         self.bind(intent)
@@ -689,8 +750,8 @@ class WriteIntentTests(unittest.TestCase):
             raw_session_id=self.session,
             intent_ids=[intent["intent_id"]],
         )
-        self.assertTrue(matched["ok"])
-        self.assertEqual(matched["matched"][0]["intent_id"], intent["intent_id"])
+        self.assertFalse(matched["ok"])
+        self.assertEqual(matched["reason_code"], "TRUSTED_APPROVAL_VERIFIER_REQUIRED")
 
         explicitly_empty = self.module.enforce_protected_changes(
             [self.note],

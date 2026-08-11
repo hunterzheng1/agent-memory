@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import sqlite3
 import tempfile
@@ -9,8 +11,11 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
+from tests.subprocess_env import isolated_subprocess_env
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+REPO_ROOT = SCRIPTS.parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
@@ -154,7 +159,7 @@ class SourceSafetyTests(unittest.TestCase):
         self.assertEqual(result["decision"], "ASK_USER")
         self.assertFalse(result["can_reconcile"])
 
-    def test_verified_fact_requires_evidence_reference(self) -> None:
+    def test_self_attested_local_evidence_cannot_claim_verification(self) -> None:
         missing = assess_source(
             "Runtime check passed",
             source_class="local_verified",
@@ -167,8 +172,83 @@ class SourceSafetyTests(unittest.TestCase):
             evidence_ref="doctor-report:2026-07-19",
         )
         self.assertEqual(missing["decision"], "ASK_USER")
-        self.assertEqual(present["decision"], "ALLOW")
+        self.assertEqual(present["decision"], "ASK_USER")
+        self.assertEqual(present["reason_code"], "TRUSTED_VERIFICATION_RECEIPT_REQUIRED")
         self.assertTrue(present["has_evidence"])
+        self.assertEqual(present["provenance_trust"], "self_attested")
+        self.assertFalse(present["can_authorize_action"])
+
+    def test_direct_or_manual_source_rejects_obviously_conflicting_assertion(self) -> None:
+        for source_class in ("user_direct", "manual_edit"):
+            for asserted_by in ("remote-web-agent", "remote web agent", "external/web"):
+                with self.subTest(source_class=source_class, asserted_by=asserted_by):
+                    result = assess_source(
+                        "A harmless statement",
+                        source_class=source_class,
+                        knowledge_kind="fact",
+                        asserted_by=asserted_by,
+                    )
+                    self.assertEqual(result["decision"], "ASK_USER")
+                    self.assertEqual(result["reason_code"], "SOURCE_ASSERTION_CONFLICT")
+                    self.assertEqual(result["provenance_trust"], "self_attested")
+                    self.assertFalse(result["can_authorize_action"])
+
+    def test_prehashed_evidence_is_validated_and_not_hashed_again(self) -> None:
+        digest = "ab" * 32
+        result = assess_source(
+            "A harmless statement",
+            source_class="manual_edit",
+            knowledge_kind="fact",
+            asserted_by="human",
+            evidence_ref_sha256=digest,
+        )
+        self.assertEqual(result["evidence_ref_sha256"], digest)
+        with self.assertRaisesRegex(ValueError, "evidence_ref_sha256"):
+            assess_source(
+                "A harmless statement",
+                source_class="manual_edit",
+                knowledge_kind="fact",
+                asserted_by="human",
+                evidence_ref_sha256="not-a-digest",
+            )
+
+    def test_check_and_doctor_fail_closed_for_enforce_without_trusted_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            config = root / "agent-memory.toml"
+            config.write_text(
+                "[write_intents]\n"
+                "enabled = true\n"
+                "enforcement = \"enforce\"\n",
+                encoding="utf-8",
+            )
+            env = isolated_subprocess_env({"AGENT_MEMORY_CONFIG_FILE": str(config)})
+            checked = subprocess.run(
+                [sys.executable, str(SCRIPTS / "agent_memory_check.py"), "--skip-state-db"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            diagnosed = subprocess.run(
+                [sys.executable, str(SCRIPTS / "agent_memory_doctor.py"), "--json"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertNotEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertIn(
+            "TRUSTED_APPROVAL_VERIFIER_REQUIRED", checked.stdout + checked.stderr
+        )
+        doctor_payload = json.loads(diagnosed.stdout)
+        readiness = next(
+            item for item in doctor_payload["checks"] if item["name"] == "write_intent_enforcement"
+        )
+        self.assertEqual(readiness["status"], "fail")
+        self.assertEqual(readiness["detail"]["reason_code"], "TRUSTED_APPROVAL_VERIFIER_REQUIRED")
 
     def test_secret_material_is_blocked_and_not_echoed(self) -> None:
         candidate = "ａｐｉ_key = abcdefghijklmno\u200bpqrstuvwxyz123456"
@@ -264,6 +344,39 @@ class SourceSafetyTests(unittest.TestCase):
         self.assertEqual(payload["reconcile"]["status"], "skipped")
         self.assertNotIn("password", str(payload))
         self.assertNotIn("abcdefghijklmnopqrstuvwxyz", stored)
+
+    def test_prewrite_fails_closed_for_ambiguous_project_scope(self) -> None:
+        args = Namespace(
+            prewrite="A harmless scoped update",
+            source_class="manual_edit",
+            knowledge_kind="fact",
+            asserted_by="human",
+            evidence_ref="",
+            actor="codex",
+            trigger="test",
+            session_id="session",
+            limit=5,
+            no_zvec=True,
+            create_intent=False,
+            target_file="",
+            current_project="",
+        )
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            proposal = root / "proposal.md"
+            proposal.write_text(
+                "---\ntrack: project\nproject_id:\n  - project-a\n  - project-b\n---\n# Update\n",
+                encoding="utf-8",
+            )
+            args.proposal_file = str(proposal)
+            with mock.patch.object(closeout, "STATE_DB", root / "state.sqlite"), mock.patch.object(
+                closeout, "search_memory"
+            ) as search_mock:
+                payload = closeout.run_prewrite(args)
+        search_mock.assert_not_called()
+        self.assertEqual(payload["recommended_action"], "ASK_USER")
+        self.assertEqual(payload["reconcile"]["reason_code"], "AMBIGUOUS_PROJECT_SCOPE")
+        self.assertFalse(payload["safety"]["can_authorize_action"])
 
 
 if __name__ == "__main__":

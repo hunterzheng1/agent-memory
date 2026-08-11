@@ -72,6 +72,16 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def redacted_path_metadata(paths: list[str]) -> tuple[str, str, int]:
+    """Return non-reversible search-path metadata without retaining path text."""
+
+    normalized = sorted({str(path).strip() for path in paths if str(path).strip()})
+    if not normalized:
+        return "", "", 0
+    digest = sha256_text("\n".join(normalized))
+    return f"[redacted:{digest[:12]}]", digest, len(normalized)
+
+
 def parse_frontmatter(text: str) -> dict[str, object]:
     if not text.startswith("---\n"):
         return {}
@@ -409,6 +419,8 @@ def init_db(conn: sqlite3.Connection) -> None:
           query TEXT NOT NULL,
           result_count INTEGER NOT NULL,
           used_paths TEXT,
+          used_paths_sha256 TEXT,
+          used_path_count INTEGER,
           query_sha256 TEXT,
           query_length INTEGER,
           sources TEXT,
@@ -468,6 +480,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "memory_docs", "session_id", "TEXT DEFAULT ''")
     ensure_column(conn, "memory_search_log", "query_sha256", "TEXT")
     ensure_column(conn, "memory_search_log", "query_length", "INTEGER")
+    ensure_column(conn, "memory_search_log", "used_paths_sha256", "TEXT")
+    ensure_column(conn, "memory_search_log", "used_path_count", "INTEGER")
     ensure_column(conn, "memory_search_log", "sources", "TEXT")
     ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
     ensure_column(conn, "memory_session_claims", "intent_id", "TEXT NOT NULL DEFAULT ''")
@@ -851,16 +865,22 @@ def print_search(
             for kind, item in loops:
                 print(f"   open_loop[{kind}]: {item[:180]}")
     digest = sha256_text(query)
+    used_paths, used_paths_digest, used_path_count = redacted_path_metadata(
+        [str(row["rel_path"]) for row in rows]
+    )
     conn.execute(
         """
         INSERT INTO memory_search_log(
-          query, result_count, used_paths, query_sha256, query_length, sources, duration_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          query, result_count, used_paths, used_paths_sha256, used_path_count,
+          query_sha256, query_length, sources, duration_ms, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             f"[redacted:{digest[:12]}]",
             len(rows),
-            ",".join(row["rel_path"] for row in rows),
+            used_paths,
+            used_paths_digest,
+            used_path_count,
             digest,
             len(query),
             "sqlite",

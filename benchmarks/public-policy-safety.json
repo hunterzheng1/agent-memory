@@ -20,12 +20,12 @@
       "expected": "ALLOW"
     },
     {
-      "id": "sample-verified-evidence-allow",
+      "id": "sample-self-attested-verification-ask",
       "input": "The local sample check completed.",
       "source_class": "local_verified",
       "knowledge_kind": "fact",
       "evidence_ref": "fixture://local-check",
-      "expected": "ALLOW"
+      "expected": "ASK_USER"
     },
     {
       "id": "sample-unknown-ask",

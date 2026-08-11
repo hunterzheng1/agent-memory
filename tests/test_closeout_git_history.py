@@ -155,6 +155,32 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual(search.call_args.kwargs["current_project"], "project-a")
 
+    def test_postwrite_fails_closed_for_ambiguous_workflow_or_decision_scope(self) -> None:
+        for directory, memory_type in (("工作流", "workflow"), ("决策", "decision")):
+            with self.subTest(memory_type=memory_type):
+                note = self.vault / directory / f"ambiguous-{memory_type}.md"
+                note.parent.mkdir(parents=True, exist_ok=True)
+                note.write_text(
+                    "---\n"
+                    f"memory_type: {memory_type}\n"
+                    f"track: {memory_type}\n"
+                    "project_id:\n  - project-a\n  - project-b\n"
+                    "status: active\n---\n# Ambiguous\n",
+                    encoding="utf-8",
+                )
+                entry = self.module.GitEntry(
+                    status="A",
+                    repo_path=f"AgentMemory/{directory}/{note.name}",
+                    path=note,
+                )
+                args = Namespace(reconcile_all=False, limit=8, no_zvec=True, current_project="")
+                with mock.patch.object(self.module, "search_memory") as search:
+                    findings, warnings = self.module.postwrite_reconcile([entry], args)
+                search.assert_not_called()
+                self.assertEqual(findings[0]["action"], "ASK_USER")
+                self.assertEqual(findings[0]["reason_code"], "AMBIGUOUS_PROJECT_SCOPE")
+                self.assertIn("AMBIGUOUS_PROJECT_SCOPE", warnings)
+
     def test_frontmatter_boilerplate_is_not_used_as_fallback_summary(self) -> None:
         note = self.vault / "项目" / "new-project.md"
         note.write_text(
@@ -295,6 +321,44 @@ class CloseoutCommitSnapshotTests(unittest.TestCase):
         committed = git(self.root, "show", f"{result['commit']}:Agent记忆/AGENTS.md")
         self.assertEqual(committed, approved.decode("utf-8").strip())
         self.assertEqual(self.note.read_text(encoding="utf-8"), raced)
+
+    def test_isolated_commit_applies_repo_clean_filter_without_weakening_raw_cas(self) -> None:
+        filter_script = self.root / "fixture_clean_filter.py"
+        filter_script.write_text(
+            "import sys\n"
+            "payload = sys.stdin.buffer.read().replace(b'WORKTREE', b'FILTERED')\n"
+            "sys.stdout.buffer.write(payload)\n",
+            encoding="utf-8",
+        )
+        filter_command = f'"{sys.executable}" "{filter_script}"'
+        git(self.root, "config", "core.autocrlf", "true")
+        git(self.root, "config", "filter.fixture.clean", filter_command)
+        (self.root / ".gitattributes").write_text(
+            "Agent记忆/AGENTS.md filter=fixture text eol=lf\n",
+            encoding="utf-8",
+        )
+        git(self.root, "add", ".gitattributes")
+        git(self.root, "commit", "-qm", "configure clean filter")
+        self.baseline = git(self.root, "rev-parse", "HEAD")
+
+        approved = b"# WORKTREE\r\n\r\nApproved.\r\n"
+        self.note.write_bytes(approved)
+        expected_hash = hashlib.sha256(approved).hexdigest()
+        result = self.module.commit_files(
+            [self.note],
+            self.args,
+            expected_raw_sha256={self.note: expected_hash},
+            expected_head=self.baseline,
+        )
+        self.assertTrue(result["ok"], result)
+        completed = subprocess.run(
+            ["git", "-C", str(self.root), "show", f"{result['commit']}:Agent记忆/AGENTS.md"],
+            capture_output=True,
+            check=True,
+        )
+        self.assertEqual(completed.stdout, b"# FILTERED\n\nApproved.\n")
+        self.assertEqual(self.note.read_bytes(), approved)
+        self.assertEqual(result["snapshot_sha256"]["Agent记忆/AGENTS.md"], expected_hash)
 
     def test_full_closeout_rejects_ordinary_file_changed_after_check(self) -> None:
         checked = "# Rules\n\nChecked ordinary content.\n"

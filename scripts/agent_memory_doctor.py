@@ -34,6 +34,9 @@ if not isinstance(HOST_CONFIG, dict):
 SEMANTIC_CONFIG = load_config().get("semantic_retrieval", {})
 if not isinstance(SEMANTIC_CONFIG, dict):
     SEMANTIC_CONFIG = {}
+WRITE_INTENT_CONFIG = load_config().get("write_intents", {})
+if not isinstance(WRITE_INTENT_CONFIG, dict):
+    WRITE_INTENT_CONFIG = {}
 SEMANTIC_ENABLED = bool(SEMANTIC_CONFIG.get("enabled", False))
 ZVEC_PYTHON = resolve_config_path(env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python")))
 _EMBEDDING_MODEL_RAW = env_value("EMBEDDING_MODEL", "")
@@ -489,6 +492,26 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     ]
     missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
     add(checks, "runtime_files", "fail" if missing else "pass", "Runtime files complete." if not missing else "Runtime files missing.", {"missing": missing})
+    intent_enforcement = str(WRITE_INTENT_CONFIG.get("enforcement", "off")).strip().lower() or "off"
+    enforcement_status = "fail" if intent_enforcement == "enforce" else ("warn" if intent_enforcement == "advisory" else "pass")
+    add(
+        checks,
+        "write_intent_enforcement",
+        enforcement_status,
+        (
+            "Enforcement is unavailable until an independent trusted approval verifier is configured."
+            if enforcement_status == "fail"
+            else "Write intents are self-attested audit records and cannot authorize actions."
+        ),
+        {
+            "mode": intent_enforcement,
+            "provenance_trust": "self_attested",
+            "can_authorize_action": False,
+            "reason_code": (
+                "TRUSTED_APPROVAL_VERIFIER_REQUIRED" if intent_enforcement == "enforce" else ""
+            ),
+        },
+    )
     if REPO_ROOT.resolve() == CONFIG_ROOT.resolve():
         manifest = read_json_object(RUNTIME_MANIFEST)
         expected = manifest.get("files") if isinstance(manifest, dict) else None

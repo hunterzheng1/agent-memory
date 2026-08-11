@@ -391,6 +391,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           knowledge_kind TEXT NOT NULL DEFAULT '',
           asserted_by TEXT NOT NULL DEFAULT '',
           evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+          provenance_trust TEXT NOT NULL DEFAULT 'self_attested',
           safety_audit_id INTEGER NOT NULL DEFAULT 0,
           safety_run_id TEXT NOT NULL DEFAULT '',
           safety_decision TEXT NOT NULL DEFAULT '',
@@ -407,6 +408,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           approval_proposal_canonical_sha256 TEXT NOT NULL DEFAULT '',
           approval_ref_sha256 TEXT NOT NULL DEFAULT '',
           approval_binding_sha256 TEXT NOT NULL DEFAULT '',
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
           bound_at TEXT,
           claim_ref_sha256 TEXT NOT NULL DEFAULT '',
           bound_base_raw_sha256 TEXT NOT NULL DEFAULT '',
@@ -458,6 +461,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           safety_input_sha256 TEXT NOT NULL DEFAULT '',
           safety_input_length INTEGER NOT NULL DEFAULT 0,
           evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+          provenance_trust TEXT NOT NULL DEFAULT 'self_attested',
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
           detail_code TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           FOREIGN KEY(intent_id) REFERENCES memory_write_intents(intent_id)
@@ -479,6 +485,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "approval_proposal_raw_sha256": "TEXT NOT NULL DEFAULT ''",
         "approval_proposal_canonical_sha256": "TEXT NOT NULL DEFAULT ''",
         "approval_ref_sha256": "TEXT NOT NULL DEFAULT ''",
+        "provenance_trust": "TEXT NOT NULL DEFAULT 'self_attested'",
+        "approval_trust": "TEXT NOT NULL DEFAULT 'self_attested'",
+        "can_authorize_action": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in intent_migrations.items():
         _ensure_column(conn, "memory_write_intents", name, declaration)
@@ -493,6 +502,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "safety_input_sha256": "TEXT NOT NULL DEFAULT ''",
         "safety_input_length": "INTEGER NOT NULL DEFAULT 0",
         "evidence_ref_sha256": "TEXT NOT NULL DEFAULT ''",
+        "provenance_trust": "TEXT NOT NULL DEFAULT 'self_attested'",
+        "approval_trust": "TEXT NOT NULL DEFAULT 'self_attested'",
+        "can_authorize_action": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, declaration in receipt_migrations.items():
         _ensure_column(conn, "memory_write_receipts", name, declaration)
@@ -512,10 +524,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           input_sha256 TEXT NOT NULL,
           input_length INTEGER NOT NULL,
           evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+          provenance_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL
         )
         """
     )
+    for name, declaration in {
+        "provenance_trust": "TEXT NOT NULL DEFAULT 'self_attested'",
+        "can_authorize_action": "INTEGER NOT NULL DEFAULT 0",
+    }.items():
+        _ensure_column(conn, "memory_safety_log", name, declaration)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_write_intents_active_target "
         "ON memory_write_intents(target_key) "
@@ -812,7 +831,7 @@ def create_intent(
             source_class=normalized_source,
             knowledge_kind=normalized_kind,
             asserted_by=normalized_asserted_by,
-            evidence_ref=evidence_ref_sha256,
+            evidence_ref_sha256=evidence_ref_sha256,
         )
     except ValueError as exc:
         raise IntentError("SOURCE_METADATA_INVALID", str(exc)) from exc
@@ -904,7 +923,7 @@ def create_intent(
                     normalized_source,
                     normalized_kind,
                     normalized_asserted_by,
-                    _bounded_label(evidence_ref_sha256, limit=128),
+                    str(safety.get("evidence_ref_sha256", "")),
                     safety_audit_id,
                     safety_run_id,
                     str(safety["decision"]),
@@ -1645,9 +1664,22 @@ def _normalized_patterns(patterns: Sequence[str] | None = None) -> tuple[str, ..
     source = PROTECTED_PATHS if patterns is None else patterns
     normalized: list[str] = []
     for raw in source:
-        value = unicodedata.normalize("NFC", str(raw).strip().replace("\\", "/")).lstrip("./")
-        if not value or value.startswith("/") or ".." in Path(value).parts:
-            continue
+        value = unicodedata.normalize("NFC", str(raw).strip().replace("\\", "/"))
+        if value.startswith("./"):
+            value = value[2:]
+        invalid = (
+            not value
+            or value.startswith("/")
+            or Path(value).is_absolute()
+            or ".." in Path(value).parts
+            or value.count("[") != value.count("]")
+            or any(ord(character) < 32 for character in value)
+        )
+        if invalid:
+            raise IntentError(
+                "PROTECTED_PATH_PATTERN_INVALID",
+                "protected path patterns must be relative, bounded, and well formed",
+            )
         normalized.append(value.casefold())
     return tuple(normalized)
 
@@ -1678,6 +1710,24 @@ def enforce_protected_changes(
     requested_mode = (enforcement_mode or ENFORCEMENT_MODE).strip().lower()
     if requested_mode not in VALID_ENFORCEMENT_MODES:
         raise IntentError("ENFORCEMENT_MODE_INVALID", f"unsupported enforcement mode: {requested_mode}")
+    if requested_mode == "enforce":
+        return {
+            "ok": False,
+            "enabled": INTENTS_ENABLED,
+            "requested_mode": requested_mode,
+            "mode": "enforce",
+            "blocking": True,
+            "reason_code": "TRUSTED_APPROVAL_VERIFIER_REQUIRED",
+            "matched": [],
+            "violations": [
+                {
+                    "path": str(path),
+                    "reason_code": "TRUSTED_APPROVAL_VERIFIER_REQUIRED",
+                }
+                for path in paths
+            ],
+            "can_authorize_action": False,
+        }
     # An explicit `intent create` remains useful as an advisory/dry-run when
     # the feature flag is off, but it must never silently turn protection on.
     mode = requested_mode if INTENTS_ENABLED else "off"

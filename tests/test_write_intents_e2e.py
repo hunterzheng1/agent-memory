@@ -169,7 +169,7 @@ class IntentSandbox:
                     "",
                     "[write_intents]",
                     "enabled = true",
-                    'enforcement = "enforce"',
+                    'enforcement = "advisory"',
                     "ttl_hours = 24",
                     "max_proposal_bytes = 1048576",
                     "max_target_bytes = 1048576",
@@ -451,10 +451,17 @@ class WriteIntentEndToEndTests(unittest.TestCase):
             proposal_text.rstrip("\n"),
         )
 
-    def test_direct_protected_edit_without_prewrite_or_intent_is_rejected(self) -> None:
+    def test_enforce_mode_fails_closed_without_trusted_approval_verifier(self) -> None:
         session = "codex-direct-edit"
         target = self.box.vault / "工作流" / "Protected.md"
         target.write_text(self.box._memory_text("Protected", "direct unsafe edit"), encoding="utf-8")
+        self.box.config.write_text(
+            self.box.config.read_text(encoding="utf-8").replace(
+                'enforcement = "advisory"',
+                'enforcement = "enforce"',
+            ),
+            encoding="utf-8",
+        )
 
         claimed, claim_payload = self.box.claim(actor="codex", session=session, target=target)
         self.assertEqual(claimed.returncode, 2, claimed.stderr + claimed.stdout)
@@ -466,7 +473,8 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         )
         self.assertEqual(closed.returncode, 2, closed.stderr + closed.stdout)
         self.assertEqual(payload["status"], "error")
-        self.assertEqual(payload["intent_error"], "PROTECTED_WRITE_WITHOUT_BOUND_INTENT")
+        self.assertEqual(payload["intent_error"], "TRUSTED_APPROVAL_VERIFIER_REQUIRED")
+        self.assertFalse(payload["write_intent_gate"]["can_authorize_action"])
         self.assertEqual(
             git(self.box.git_root, "-c", "core.quotepath=false", "status", "--short"),
             "M AgentMemory/工作流/Protected.md",
@@ -748,7 +756,7 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         self.assertEqual(shown_payload["receipt"]["reason_code"], "PROPOSAL_CONTENT_MISMATCH")
         self.assertNotIn("proposal_canonical_snapshot", json.dumps(shown_payload, ensure_ascii=False))
 
-    def test_global_closeout_cannot_borrow_an_orphan_bound_intent(self) -> None:
+    def test_advisory_global_closeout_reports_orphan_bound_intent_without_committing(self) -> None:
         session = "codex-orphan-bound"
         target = self.box.vault / "工作流" / "Orphan.md"
         proposal = self.box.proposal("orphan", self.box._memory_text("Orphan", "bound without claim"))
@@ -786,9 +794,14 @@ class WriteIntentEndToEndTests(unittest.TestCase):
         closed, payload = self.box.closeout(
             actor="codex", session=session, global_mode=True, explicit_session=True
         )
-        self.assertEqual(closed.returncode, 2, closed.stderr + closed.stdout)
-        self.assertEqual(payload["status"], "error")
-        self.assertEqual(payload["intent_error"], "PROTECTED_WRITE_WITHOUT_BOUND_INTENT")
+        self.assertEqual(closed.returncode, 1, closed.stderr + closed.stdout)
+        self.assertEqual(payload["status"], "warning")
+        self.assertEqual(payload["intent_error"], "")
+        self.assertEqual(
+            payload["write_intent_gate"]["violations"][0]["reason_code"],
+            "PROTECTED_WRITE_WITHOUT_BOUND_INTENT",
+        )
+        self.assertFalse(payload["write_intent_gate"]["can_authorize_action"])
         self.assertEqual(payload["write_intent_receipts"], [])
         self.assertEqual(
             git(self.box.git_root, "-c", "core.quotepath=false", "status", "--short"),

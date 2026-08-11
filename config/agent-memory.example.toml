@@ -28,6 +28,7 @@ commit_scoped_memory_files = true
 # do not protect the entire vault or use broad wildcards as a first rollout.
 enabled = false
 enforcement = "off" # off | advisory | enforce
+# "enforce" is reserved and fails closed until an independent trusted approval verifier exists.
 ttl_hours = 24
 max_proposal_bytes = 2097152
 max_target_bytes = 8388608

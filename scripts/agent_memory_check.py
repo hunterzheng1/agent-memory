@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from agent_memory_env import env_value, resolve_config_path
+from agent_memory_env import env_value, load_config, resolve_config_path
 from agent_memory_safety import SECRET_PATTERNS, normalize_for_detection
 from agent_memory_state import secure_sqlite_connect
 
@@ -22,6 +22,9 @@ VAULT_ROOT = resolve_config_path(env_value("ROOT", str(DEFAULT_VAULT_ROOT)))
 GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
 STATE_DB = resolve_config_path(env_value("STATE_DB", "$HOME/.config/agent-memory/state.sqlite"))
 PUBLIC_TEMPLATE_MODE = DEFAULT_VAULT_ROOT.is_dir() and VAULT_ROOT == DEFAULT_VAULT_ROOT.resolve()
+WRITE_INTENT_CONFIG = load_config().get("write_intents", {})
+if not isinstance(WRITE_INTENT_CONFIG, dict):
+    WRITE_INTENT_CONFIG = {}
 
 
 COMMON_REQUIRED_DIRS = [
@@ -345,6 +348,14 @@ def main() -> int:
     warnings: list[str] = []
     mode = "public_template" if PUBLIC_TEMPLATE_MODE else "private_runtime"
     checks: list[str] = [f"mode={mode}", f"vault_root={VAULT_ROOT}", f"state_db={STATE_DB}"]
+    intent_enforcement = str(WRITE_INTENT_CONFIG.get("enforcement", "off")).strip().lower()
+    if intent_enforcement == "enforce":
+        failures.append("TRUSTED_APPROVAL_VERIFIER_REQUIRED write_intent_enforcement=enforce")
+    else:
+        checks.append(
+            "OK write_intent_enforcement="
+            f"{intent_enforcement or 'off'} provenance=self_attested can_authorize_action=false"
+        )
 
     required_dirs = COMMON_REQUIRED_DIRS + (PUBLIC_REQUIRED_DIRS if PUBLIC_TEMPLATE_MODE else [])
     required_files = COMMON_REQUIRED_FILES + (PUBLIC_REQUIRED_FILES if PUBLIC_TEMPLATE_MODE else [])

@@ -622,16 +622,20 @@ def log_search(query: str, rows: list[SearchResult], duration_ms: int) -> None:
             memory_index.init_db(conn)
             digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
             sources = sorted({source for row in rows for source in row.sources})
+            used_paths, used_paths_digest, used_path_count = memory_index.redacted_path_metadata(
+                [row.rel_path for row in rows]
+            )
             conn.execute(
                 """
                 INSERT INTO memory_search_log(
-                  query, result_count, used_paths, query_sha256, query_length,
-                  sources, duration_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  query, result_count, used_paths, used_paths_sha256, used_path_count,
+                  query_sha256, query_length, sources, duration_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    f"[redacted:{digest[:12]}]", len(rows), ",".join(row.rel_path for row in rows),
-                    digest, len(query), ",".join(sources), duration_ms, utc_now(),
+                    f"[redacted:{digest[:12]}]", len(rows), used_paths,
+                    used_paths_digest, used_path_count, digest, len(query),
+                    ",".join(sources), duration_ms, utc_now(),
                 ),
             )
     except sqlite3.Error:
@@ -642,30 +646,63 @@ def redact_legacy_search_logs() -> dict[str, int]:
     """Irreversibly remove legacy query text while retaining useful metadata."""
     with connect() as conn:
         memory_index.init_db(conn)
+        conn.execute("PRAGMA secure_delete=ON")
         conn.execute("BEGIN IMMEDIATE")
         rows = conn.execute(
             """
-            SELECT id, query, query_sha256, query_length
+            SELECT id, query, query_sha256, query_length,
+                   used_paths, used_paths_sha256, used_path_count
             FROM memory_search_log
             WHERE query NOT LIKE '[redacted:%'
+               OR (
+                    COALESCE(used_paths, '') <> ''
+                    AND used_paths NOT LIKE '[redacted:%'
+                  )
             ORDER BY id
             """
         ).fetchall()
         for row in rows:
             query = str(row["query"] or "")
-            digest = str(row["query_sha256"] or "") or hashlib.sha256(query.encode("utf-8")).hexdigest()
-            length = int(row["query_length"] or len(query))
+            query_is_redacted = query.startswith("[redacted:")
+            digest = str(row["query_sha256"] or "")
+            if not digest and not query_is_redacted:
+                digest = hashlib.sha256(query.encode("utf-8")).hexdigest()
+            length = int(row["query_length"] or (0 if query_is_redacted else len(query)))
+            redacted_query = query if query_is_redacted else f"[redacted:{digest[:12]}]"
+
+            used_paths = str(row["used_paths"] or "")
+            paths_are_redacted = not used_paths or used_paths.startswith("[redacted:")
+            paths_digest = str(row["used_paths_sha256"] or "")
+            path_count = int(row["used_path_count"] or 0)
+            redacted_paths = used_paths
+            if not paths_are_redacted:
+                redacted_paths, paths_digest, path_count = memory_index.redacted_path_metadata(
+                    used_paths.split(",")
+                )
             conn.execute(
                 """
                 UPDATE memory_search_log
-                SET query=?, query_sha256=?, query_length=?
+                SET query=?, query_sha256=?, query_length=?, used_paths=?,
+                    used_paths_sha256=?, used_path_count=?
                 WHERE id=?
                 """,
-                (f"[redacted:{digest[:12]}]", digest, length, int(row["id"])),
+                (
+                    redacted_query, digest, length, redacted_paths,
+                    paths_digest, path_count, int(row["id"]),
+                ),
             )
         conn.commit()
         remaining = int(
-            conn.execute("SELECT COUNT(*) FROM memory_search_log WHERE query NOT LIKE '[redacted:%'").fetchone()[0]
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM memory_search_log
+                WHERE query NOT LIKE '[redacted:%'
+                   OR (
+                        COALESCE(used_paths, '') <> ''
+                        AND used_paths NOT LIKE '[redacted:%'
+                      )
+                """
+            ).fetchone()[0]
         )
     return {"redacted": len(rows), "remaining_raw": remaining}
 

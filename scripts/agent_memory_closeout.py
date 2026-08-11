@@ -112,6 +112,12 @@ class CommitSnapshot:
     mode: str
 
 
+class ProjectScopeError(ValueError):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
 def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
 
@@ -452,13 +458,20 @@ def is_current_reconcile_target(path: Path) -> bool:
 
 
 def project_scope_for_file(path: Path, explicit_project: str = "") -> str:
-    if explicit_project.strip():
-        return explicit_project.strip()
     tracks = {value.casefold() for value in frontmatter_list(path, "track")}
-    if "project" not in tracks:
-        return ""
     project_ids = sorted(frontmatter_list(path, "project_id"))
-    return project_ids[0] if len(project_ids) == 1 else ""
+    if len(project_ids) > 1:
+        raise ProjectScopeError("AMBIGUOUS_PROJECT_SCOPE")
+    explicit = explicit_project.strip()
+    if explicit and project_ids and explicit.casefold() != project_ids[0].casefold():
+        raise ProjectScopeError("PROJECT_SCOPE_CONFLICT")
+    if explicit:
+        return explicit
+    if project_ids:
+        return project_ids[0]
+    if "project" in tracks:
+        raise ProjectScopeError("MISSING_PROJECT_SCOPE")
+    return ""
 
 
 def tokenize(text: str) -> set[str]:
@@ -632,10 +645,36 @@ def run_prewrite(args: argparse.Namespace) -> dict[str, Any]:
         }
     inferred_project = ""
     if getattr(args, "proposal_file", ""):
-        inferred_project = project_scope_for_file(
-            Path(args.proposal_file).expanduser(),
-            getattr(args, "current_project", ""),
-        )
+        try:
+            inferred_project = project_scope_for_file(
+                Path(args.proposal_file).expanduser(),
+                getattr(args, "current_project", ""),
+            )
+        except ProjectScopeError as exc:
+            return {
+                "time": utc_now(),
+                "run_id": run_id,
+                "actor": args.actor,
+                "trigger": args.trigger,
+                "session_hash": hashed_session,
+                "mode": "prewrite",
+                "input_sha256": safety["input_sha256"],
+                "input_length": safety["input_length"],
+                "safety": safety,
+                "reconcile": {"status": "skipped", "reason_code": exc.reason_code},
+                "recommended_action": "ASK_USER",
+                "recommended_target": None,
+                "recommendation_metrics": {
+                    "similarity": 0.0,
+                    "coverage": 0.0,
+                    "semantic_distance": None,
+                    "raw_semantic_distance": None,
+                },
+                "allowed_actions": sorted(RECONCILE_ACTIONS),
+                "candidates": [],
+                "warnings": [exc.reason_code],
+                "status": "warning",
+            }
     rows, warnings = search_memory(
         args.prewrite,
         limit=args.limit,
@@ -717,14 +756,29 @@ def postwrite_reconcile(entries: list[GitEntry], args: argparse.Namespace) -> tu
         query = reconcile_query_for_file(entry.path)
         if not query:
             continue
+        try:
+            current_project = project_scope_for_file(
+                entry.path,
+                getattr(args, "current_project", ""),
+            )
+        except ProjectScopeError as exc:
+            findings.append(
+                {
+                    "action": "ASK_USER",
+                    "file": str(entry.path),
+                    "rel_path": relative_to_vault(entry.path),
+                    "reason": "project_scope_requires_disambiguation",
+                    "reason_code": exc.reason_code,
+                    "candidates": [],
+                }
+            )
+            warnings.append(exc.reason_code)
+            continue
         rows, search_warnings = search_memory(
             query,
             limit=max(args.limit, 8),
             no_zvec=args.no_zvec,
-            current_project=project_scope_for_file(
-                entry.path,
-                getattr(args, "current_project", ""),
-            ),
+            current_project=current_project,
             read_only=bool(getattr(args, "dry_run", False)),
         )
         warnings.extend(search_warnings)
@@ -861,10 +915,13 @@ def run_audit_autorun(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def _hash_object_bytes(data: bytes) -> tuple[bool, str]:
+def _hash_object_bytes(data: bytes, repo_path: str) -> tuple[bool, str]:
     try:
         completed = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "hash-object", "-w", "--stdin"],
+            [
+                "git", "-C", str(REPO_ROOT), "hash-object", "-w",
+                f"--path={repo_path}", "--stdin",
+            ],
             input=data,
             capture_output=True,
             timeout=60,
@@ -953,7 +1010,7 @@ def _snapshot_commit_files(
                 "detail": "CONTENT_CHANGED_AFTER_CHECK",
                 "file": repo_path,
             }
-        object_ok, blob_oid = _hash_object_bytes(data)
+        object_ok, blob_oid = _hash_object_bytes(data, repo_path)
         if not object_ok:
             return [], {"ok": False, "stage": "hash_object", "detail": "git_blob_write_failed", "file": repo_path}
         snapshots.append(

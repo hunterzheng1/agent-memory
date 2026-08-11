@@ -21,6 +21,10 @@ SOURCE_CLASSES = {
     "unknown",
 }
 KNOWLEDGE_KINDS = {"fact", "preference", "rule", "inference", "hypothesis"}
+SELF_ATTESTED = "self_attested"
+_CONTRADICTORY_DIRECT_ASSERTION = re.compile(
+    r"(?i)(?:^|[^a-z0-9])(web|remote|agent)(?:$|[^a-z0-9])"
+)
 
 SECRET_PATTERNS = (
     re.compile(r"(?i)sk-[A-Za-z0-9][A-Za-z0-9_-]{16,}"),
@@ -81,6 +85,7 @@ def assess_source(
     knowledge_kind: str,
     asserted_by: str = "",
     evidence_ref: str = "",
+    evidence_ref_sha256: str = "",
 ) -> dict[str, Any]:
     """Classify whether content may proceed to reconciliation.
 
@@ -93,6 +98,13 @@ def assess_source(
         raise ValueError(f"unsupported source_class: {source}")
     if kind not in KNOWLEDGE_KINDS:
         raise ValueError(f"unsupported knowledge_kind: {kind}")
+    raw_evidence = evidence_ref.strip()
+    supplied_digest = evidence_ref_sha256.strip().lower()
+    if raw_evidence and supplied_digest:
+        raise ValueError("evidence_ref and evidence_ref_sha256 are mutually exclusive")
+    if supplied_digest and re.fullmatch(r"[0-9a-f]{64}", supplied_digest) is None:
+        raise ValueError("evidence_ref_sha256 must be exactly 64 hexadecimal characters")
+    evidence_digest = supplied_digest or (sha256_text(raw_evidence) if raw_evidence else "")
 
     decision = "ALLOW"
     reason_code = "SOURCE_ALLOWED"
@@ -112,12 +124,17 @@ def assess_source(
     elif source == "agent_inferred" and kind in {"fact", "preference", "rule"}:
         decision = "ASK_USER"
         reason_code = "INFERENCE_CANNOT_BECOME_AUTHORITATIVE_FACT"
+    elif source in {"user_direct", "manual_edit"} and _CONTRADICTORY_DIRECT_ASSERTION.search(
+        asserted_by.strip()
+    ):
+        decision = "ASK_USER"
+        reason_code = "SOURCE_ASSERTION_CONFLICT"
     elif source == "unknown":
         decision = "ASK_USER"
         reason_code = "SOURCE_UNKNOWN"
-    elif source == "local_verified" and kind == "fact" and not evidence_ref.strip():
+    elif source == "local_verified":
         decision = "ASK_USER"
-        reason_code = "VERIFICATION_EVIDENCE_REQUIRED"
+        reason_code = "TRUSTED_VERIFICATION_RECEIPT_REQUIRED"
 
     return {
         "decision": decision,
@@ -127,9 +144,11 @@ def assess_source(
         "asserted_by": bounded_identity_label(asserted_by),
         "input_sha256": sha256_text(text),
         "input_length": len(text),
-        "evidence_ref_sha256": sha256_text(evidence_ref.strip()) if evidence_ref.strip() else "",
-        "has_evidence": bool(evidence_ref.strip()),
+        "evidence_ref_sha256": evidence_digest,
+        "has_evidence": bool(evidence_digest),
         "non_authoritative": non_authoritative,
+        "provenance_trust": SELF_ATTESTED,
+        "verification_status": "unverified",
         "can_reconcile": decision == "ALLOW",
         "can_create_intent": decision == "ALLOW",
         "can_authorize_action": False,
@@ -164,10 +183,23 @@ def record_assessment(
               input_sha256 TEXT NOT NULL,
               input_length INTEGER NOT NULL,
               evidence_ref_sha256 TEXT NOT NULL DEFAULT '',
+              provenance_trust TEXT NOT NULL DEFAULT 'self_attested',
+              can_authorize_action INTEGER NOT NULL DEFAULT 0,
               created_at TEXT NOT NULL
             )
             """
         )
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(memory_safety_log)")}
+        if "provenance_trust" not in columns:
+            conn.execute(
+                "ALTER TABLE memory_safety_log ADD COLUMN provenance_trust "
+                "TEXT NOT NULL DEFAULT 'self_attested'"
+            )
+        if "can_authorize_action" not in columns:
+            conn.execute(
+                "ALTER TABLE memory_safety_log ADD COLUMN can_authorize_action "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
         cursor = conn.execute(
             """
             INSERT INTO memory_safety_log (

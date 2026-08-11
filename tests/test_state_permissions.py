@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.subprocess_env import isolated_subprocess_env
 
@@ -26,6 +27,7 @@ from agent_memory_state import (
     secure_sqlite_connect,
     sqlite_permission_report,
 )
+import agent_memory_state as state
 
 
 def mode(path: Path) -> int:
@@ -94,6 +96,29 @@ class StatePermissionTests(unittest.TestCase):
                 if POSIX_MODE_ENFORCED:
                     self.assertEqual(mode(sidecar), 0o600)
             connection.close()
+
+    def test_writable_connect_hardens_existing_parent_without_overclaiming_windows_acl(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            parent = Path(raw_root).resolve() / "existing"
+            parent.mkdir()
+            parent.chmod(0o777)
+            database = parent / "state.sqlite"
+            with mock.patch.object(
+                state,
+                "ensure_private_directory",
+                wraps=state.ensure_private_directory,
+            ) as ensure_mock:
+                connection = secure_sqlite_connect(database)
+                connection.close()
+
+            ensure_mock.assert_called_once_with(parent, harden_existing=True)
+            if POSIX_MODE_ENFORCED:
+                self.assertEqual(mode(parent), 0o700)
+            else:
+                report = sqlite_permission_report(database)
+                self.assertFalse(report["mode_enforced"])
+                self.assertEqual(report["permission_model"], "windows_acl_unverified")
+                self.assertIn("windows_acl_unverified", report["warnings"])
 
     def test_secure_connect_rejects_database_symlink(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
