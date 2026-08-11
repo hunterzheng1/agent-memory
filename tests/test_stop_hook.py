@@ -247,6 +247,91 @@ class StopHookProtocolTests(unittest.TestCase):
         self.assertEqual(payload["decision"], "block")
         self.assertIn("not claimed", payload["reason"])
 
+    def test_auto_closeout_stays_quiet_for_another_active_session_claim(self) -> None:
+        pending = Path("other-codebuddy-session.md").resolve()
+        args = types.SimpleNamespace(
+            actor="codebuddy",
+            protocol="claude",
+            event="stop-hook",
+            non_blocking=False,
+            auto_closeout=True,
+            timeout=300,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(
+                self.module,
+                "read_payload",
+                return_value={"session_id": "current-codebuddy-session"},
+            ),
+            mock.patch.object(self.module, "pending_paths", return_value=[pending]),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(
+                self.module,
+                "all_active_claim_rows",
+                return_value=[
+                    {
+                        "path": str(pending),
+                        "actor": "codebuddy",
+                        "session_hash": "other-session-hash",
+                    }
+                ],
+            ),
+            mock.patch.object(self.module, "run_due_audit") as run_due_audit,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.main()
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        run_due_audit.assert_called_once_with()
+
+    def test_auto_closeout_still_blocks_when_current_claim_closeout_fails(self) -> None:
+        args = types.SimpleNamespace(
+            actor="codebuddy",
+            protocol="claude",
+            event="stop-hook",
+            non_blocking=False,
+            auto_closeout=True,
+            timeout=300,
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(
+                self.module,
+                "read_payload",
+                return_value={"session_id": "current-codebuddy-session"},
+            ),
+            mock.patch.object(self.module, "pending_paths", return_value=[]),
+            mock.patch.object(
+                self.module,
+                "active_claim_rows",
+                return_value=[{"path": "current-session-memory.md"}],
+            ),
+            mock.patch.object(
+                self.module,
+                "run_closeout",
+                return_value={"status": "error", "error": "synthetic closeout failure"},
+            ),
+            mock.patch.object(self.module, "audit_lifecycle_failure"),
+            mock.patch.object(self.module, "notify"),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            returncode = self.module.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(returncode, 0)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("synthetic closeout failure", payload["reason"])
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_clean_session_end_is_nonblocking_and_skips_weekly_audit(self) -> None:
         args = types.SimpleNamespace(
             actor="claude",

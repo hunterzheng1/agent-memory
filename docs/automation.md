@@ -50,9 +50,9 @@ Automatic closeout mode is appropriate when the Agent has already written and cl
 - CodeBuddy Bash already exports `CODEBUDDY_SESSION_ID`; **default: no SessionStart bridge**. Use `memoryctl --actor codebuddy` and Stop with `--actor codebuddy --protocol claude` (JSON `decision: block` on failure).
 - After each formal write, run `memoryctl --actor codex|claude|codebuddy claim --file <path>`.
 - Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
+- When the current session has no active claims, stay silent only if every pending file is covered by another active claim. Truly unclaimed files still block silent completion and require claim or review.
 - Treat claims older than 24 hours as abandoned for Stop-hook ownership checks. `doctor` reports them, and `memoryctl --actor human claims-expire` previews them before an explicit `--apply` changes only the SQLite ledger.
 - Treat a historical file as complete only when its current content hash matches `memory_file_observations`; a full SQLite scan alone is not closeout evidence.
-- If dirty memory is not claimed by any session, block silent completion and ask the Agent to claim or resolve it.
 - Pass `--actor codex`, `--actor claude`, or `--actor codebuddy` so logs and commits remain attributable.
 - Claude and CodeBuddy Stop may return `decision: block` when closeout fails (`--protocol claude`). Codex Stop can request continuation by exiting with code `2` and writing a non-empty continuation prompt to stderr.
 - Claude / CodeBuddy SessionEnd can be a short non-blocking fallback. Codex currently has no direct SessionEnd equivalent.

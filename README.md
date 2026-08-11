@@ -120,7 +120,7 @@ python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/changed-
 python3 scripts/memoryctl --actor claude closeout
 ```
 
-写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session ID 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容哈希，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude`、`codebuddy` 或 `cursor`。
+写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session ID 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。当前会话没有有效认领，但所有待处理文件都能证明属于其他活跃会话时，Stop Hook 保持静默；真正未认领、同一 actor 无法确定会话或证据不完整时仍会阻止静默结束。成功 closeout 还会记录每个文件的内容哈希，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude`、`codebuddy` 或 `cursor`。
 
 异常退出可能留下旧认领。Stop Hook 不会继续信任超过 24 小时的认领，Doctor 会把它列为警告。清理时先预览，再显式应用；这只把 SQLite 账本状态改为 `expired`，不会删除或改写 Markdown：
 
