@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Iterator
 
+from agent_memory_lock import try_lock, unlock
 from agent_memory_state import (
     PRIVATE_DIRECTORY_MODE,
     PRIVATE_FILE_MODE,
@@ -71,6 +73,17 @@ SUPPORT_FILES = (
 )
 FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 INTEGRITY_MODEL = "sha256_drift_detection_not_authentication"
+RUNTIME_JOURNAL_NAME = ".runtime-install-journal.json"
+RUNTIME_JOURNAL_SCHEMA = 1
+RUNTIME_STAGE_PREFIX = ".runtime-stage-"
+DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
+    {
+        errno.EINVAL,
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+    }
+)
 
 
 class RuntimeRollbackError(StateSecurityError):
@@ -80,6 +93,17 @@ class RuntimeRollbackError(StateSecurityError):
         self.recovery_path = recovery_path
         super().__init__(
             "runtime install failed and rollback was incomplete; "
+            f"recovery_path={recovery_path}; errors=" + "; ".join(errors)
+        )
+
+
+class RuntimeRecoveryError(StateSecurityError):
+    """A durable transaction could not be safely recovered or cleaned."""
+
+    def __init__(self, recovery_path: Path, errors: list[str]) -> None:
+        self.recovery_path = recovery_path
+        super().__init__(
+            "runtime transaction recovery was incomplete; "
             f"recovery_path={recovery_path}; errors=" + "; ".join(errors)
         )
 
@@ -94,6 +118,70 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return (int(metadata.st_dev), int(metadata.st_ino))
+
+
+def _fsync_file(path: Path) -> None:
+    # Windows requires a writable descriptor for FlushFileBuffers/os.fsync.
+    with path.open("rb+") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a directory entry where the platform exposes that operation."""
+
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        if exc.errno in DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_chain(path: Path, stop: Path) -> None:
+    cursor = path
+    while True:
+        _fsync_directory(cursor)
+        if cursor == stop:
+            return
+        parent = cursor.parent
+        if parent == cursor or not _lexically_contains(stop, parent):
+            raise StateSecurityError(f"directory fsync path escapes transaction root: {path}")
+        cursor = parent
+
+
+def _atomic_json_write(path: Path, payload: dict[str, Any]) -> None:
+    descriptor, raw_temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(raw_temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if POSIX_MODE_ENFORCED:
+            temporary.chmod(PRIVATE_FILE_MODE)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
@@ -725,48 +813,345 @@ def _raise_first_unsafe_path(config_root: Path) -> None:
     )
 
 
-def _nearest_existing_directory(path: Path) -> Path:
-    cursor = absolute_path(path)
-    while True:
-        try:
-            metadata = os.lstat(cursor)
-        except FileNotFoundError:
-            parent = cursor.parent
-            if parent == cursor:
-                raise StateSecurityError(
-                    f"runtime install has no existing parent directory: {path}"
-                )
-            cursor = parent
-            continue
-        if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
-            raise StateSecurityError(
-                f"runtime install parent is unsafe: {cursor}"
-            )
-        return cursor
-
-
 @contextlib.contextmanager
 def _runtime_install_mutex(config_root: Path) -> Iterator[None]:
-    """Serialize publishers without placing a lock artifact in the runtime."""
+    """Serialize publishers with a process-owned lock that survives stale metadata."""
 
-    lock_parent = _nearest_existing_directory(config_root.parent)
+    # A system-temp anchor is stable even while a fresh install creates the
+    # config root's previously missing parents. The config-root digest keeps
+    # independent runtimes isolated without relying on a process identifier.
+    lock_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    lock_parent_issue = managed_path_issue(
+        lock_parent,
+        lock_parent,
+        expected_kind="directory",
+        allow_missing=False,
+    )
+    if lock_parent_issue is not None:
+        raise StateSecurityError(
+            f"runtime install lock parent is unsafe: {lock_parent_issue['path']}"
+        )
     lock_key = hashlib.sha256(
         os.path.normcase(os.path.normpath(os.fspath(config_root))).encode("utf-8")
     ).hexdigest()[:20]
     lock_path = lock_parent / f".agent-memory-runtime-install-{lock_key}.lock"
     try:
-        lock_path.mkdir()
-    except FileExistsError as exc:
+        existing = os.lstat(lock_path)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None and (
+        _is_reparse(existing) or not stat.S_ISREG(existing.st_mode)
+    ):
         raise StateSecurityError(
-            f"runtime install is already in progress: {config_root}"
-        ) from exc
+            f"runtime install lock path is unsafe: {lock_path}"
+        )
+    handle = lock_path.open("a+", encoding="utf-8")
+    locked = False
     try:
+        opened = os.fstat(handle.fileno())
+        current = os.lstat(lock_path)
+        if (
+            _is_reparse(opened)
+            or _is_reparse(current)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or _metadata_identity(opened) != _metadata_identity(current)
+        ):
+            raise StateSecurityError(f"runtime install lock path changed: {lock_path}")
+        if not try_lock(handle):
+            raise StateSecurityError(
+                f"runtime install is already in progress: {config_root}"
+            )
+        locked = True
+        current = os.lstat(lock_path)
+        if (
+            _is_reparse(current)
+            or not stat.S_ISREG(current.st_mode)
+            or _metadata_identity(opened) != _metadata_identity(current)
+        ):
+            raise StateSecurityError(f"runtime install lock path changed: {lock_path}")
         yield
     finally:
-        try:
-            lock_path.rmdir()
-        except FileNotFoundError:
-            pass
+        if locked:
+            unlock(handle)
+        handle.close()
+
+
+def _runtime_journal_path(config_root: Path) -> Path:
+    return config_root / RUNTIME_JOURNAL_NAME
+
+
+def _stable_json_read(path: Path) -> dict[str, Any]:
+    before = os.lstat(path)
+    if _is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise StateSecurityError(f"runtime transaction journal is unsafe: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            _is_reparse(opened)
+            or _is_reparse(current)
+            or not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or _metadata_identity(before) != _metadata_identity(opened)
+            or _metadata_identity(opened) != _metadata_identity(current)
+            or before.st_size != opened.st_size
+            or before.st_mtime_ns != opened.st_mtime_ns
+            or opened.st_size != current.st_size
+            or opened.st_mtime_ns != current.st_mtime_ns
+        ):
+            raise StateSecurityError(f"runtime transaction journal changed: {path}")
+        chunks: list[bytes] = []
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        after_open = os.fstat(descriptor)
+        after_path = os.lstat(path)
+        stable_fields = (
+            "st_size",
+            "st_mtime_ns",
+        )
+        if (
+            _metadata_identity(opened) != _metadata_identity(after_open)
+            or _metadata_identity(after_open) != _metadata_identity(after_path)
+            or any(getattr(opened, field) != getattr(after_open, field) for field in stable_fields)
+            or any(getattr(after_open, field) != getattr(after_path, field) for field in stable_fields)
+        ):
+            raise StateSecurityError(f"runtime transaction journal changed: {path}")
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StateSecurityError(f"runtime transaction journal is invalid: {path}") from exc
+    if not isinstance(payload, dict):
+        raise StateSecurityError(f"runtime transaction journal is invalid: {path}")
+    return payload
+
+
+def _write_runtime_journal(config_root: Path, payload: dict[str, Any]) -> None:
+    journal_path = _runtime_journal_path(config_root)
+    assert_managed_target(config_root, journal_path)
+    _atomic_json_write(journal_path, payload)
+    assert_managed_target(
+        config_root,
+        journal_path,
+        expected_kind="file",
+        allow_missing=False,
+    )
+
+
+def _remove_runtime_journal(config_root: Path) -> None:
+    journal_path = _runtime_journal_path(config_root)
+    try:
+        metadata = os.lstat(journal_path)
+    except FileNotFoundError:
+        return
+    if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise StateSecurityError(f"runtime transaction journal is unsafe: {journal_path}")
+    journal_path.unlink()
+    _fsync_directory(config_root)
+
+
+def _valid_sha256(value: object, *, allow_none: bool = False) -> bool:
+    if allow_none and value is None:
+        return True
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _journal_target_is_managed(relative: str) -> bool:
+    if relative == "config/runtime-manifest.json" or relative in SUPPORT_FILES:
+        return True
+    if relative.startswith("scripts/"):
+        return relative.removeprefix("scripts/") in CORE_FILES
+    return _template_name_is_safe(relative)
+
+
+def _validated_transaction(
+    config_root: Path,
+    payload: dict[str, Any],
+) -> tuple[Path, list[dict[str, Any]]]:
+    expected_payload_keys = {
+        "schema",
+        "config_root",
+        "stage",
+        "state",
+        "previous_manifest_sha256",
+        "actions",
+    }
+    if set(payload) != expected_payload_keys:
+        raise StateSecurityError("runtime transaction journal fields are invalid")
+    if payload.get("schema") != RUNTIME_JOURNAL_SCHEMA or payload.get("config_root") != ".":
+        raise StateSecurityError("runtime transaction journal schema is invalid")
+    state = payload.get("state")
+    if state not in {"staging", "publishing", "committed"}:
+        raise StateSecurityError("runtime transaction journal state is invalid")
+    stage_name = payload.get("stage")
+    if (
+        not isinstance(stage_name, str)
+        or not stage_name.startswith(RUNTIME_STAGE_PREFIX)
+        or not _manifest_segment_is_safe(stage_name)
+        or "/" in stage_name
+        or "\\" in stage_name
+    ):
+        raise StateSecurityError("runtime transaction stage is invalid")
+    previous_manifest = payload.get("previous_manifest_sha256")
+    if not _valid_sha256(previous_manifest, allow_none=True):
+        raise StateSecurityError("runtime transaction previous manifest digest is invalid")
+    actions_value = payload.get("actions")
+    if not isinstance(actions_value, list):
+        raise StateSecurityError("runtime transaction actions are invalid")
+    actions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_action in actions_value:
+        if not isinstance(raw_action, dict):
+            raise StateSecurityError("runtime transaction action is invalid")
+        if set(raw_action) != {
+            "relative",
+            "kind",
+            "existed",
+            "status",
+            "desired_sha256",
+            "backup_sha256",
+        }:
+            raise StateSecurityError("runtime transaction action fields are invalid")
+        relative = raw_action.get("relative")
+        kind = raw_action.get("kind")
+        existed = raw_action.get("existed")
+        status_value = raw_action.get("status")
+        desired_digest = raw_action.get("desired_sha256")
+        backup_digest = raw_action.get("backup_sha256")
+        if (
+            not isinstance(relative, str)
+            or not _manifest_name_is_safe(relative)
+            or not _journal_target_is_managed(relative)
+            or relative in seen
+            or kind not in {"publish", "remove"}
+            or type(existed) is not bool
+            or status_value not in {"prepared", "published"}
+            or not _valid_sha256(desired_digest, allow_none=kind == "remove")
+            or (kind == "remove" and desired_digest is not None)
+            or not _valid_sha256(backup_digest, allow_none=not existed)
+            or (existed and backup_digest is None)
+            or (not existed and backup_digest is not None)
+        ):
+            raise StateSecurityError("runtime transaction action is invalid")
+        seen.add(relative)
+        actions.append(raw_action)
+    if state == "staging" and actions:
+        raise StateSecurityError("staging runtime transaction must not contain actions")
+    manifest_positions = [
+        index
+        for index, action in enumerate(actions)
+        if action["relative"] == "config/runtime-manifest.json"
+    ]
+    if manifest_positions and manifest_positions != [len(actions) - 1]:
+        raise StateSecurityError("runtime transaction manifest action must be last")
+    if state == "committed" and (
+        not manifest_positions or actions[-1]["status"] != "published"
+    ):
+        raise StateSecurityError("committed runtime transaction is incomplete")
+    stage_root = config_root / stage_name
+    if stage_root.parent != config_root or not _lexically_contains(config_root, stage_root):
+        raise StateSecurityError("runtime transaction stage escapes config root")
+    try:
+        stage_metadata = os.lstat(stage_root)
+    except FileNotFoundError:
+        pass
+    else:
+        if _is_reparse(stage_metadata) or not stat.S_ISDIR(stage_metadata.st_mode):
+            raise StateSecurityError(f"runtime transaction stage is unsafe: {stage_root}")
+        _files, _directories, stage_issues = _scan_regular_tree(stage_root)
+        if stage_issues:
+            raise StateSecurityError(
+                "runtime transaction stage contains unsafe paths: "
+                f"{stage_issues[0]['path']}"
+            )
+    return stage_root, actions
+
+
+def _safe_remove_stage(config_root: Path, stage_root: Path) -> None:
+    if (
+        stage_root.parent != config_root
+        or not stage_root.name.startswith(RUNTIME_STAGE_PREFIX)
+        or not _manifest_segment_is_safe(stage_root.name)
+    ):
+        raise StateSecurityError(f"runtime transaction stage is unsafe: {stage_root}")
+    try:
+        metadata = os.lstat(stage_root)
+    except FileNotFoundError:
+        return
+    if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise StateSecurityError(f"runtime transaction stage is unsafe: {stage_root}")
+    _files, _directories, issues = _scan_regular_tree(stage_root)
+    if issues:
+        raise StateSecurityError(
+            f"runtime transaction stage contains unsafe paths: {issues[0]['path']}"
+        )
+    shutil.rmtree(stage_root)
+    _fsync_directory(config_root)
+
+
+def _cleanup_orphan_stages(config_root: Path) -> None:
+    try:
+        entries = list(os.scandir(config_root))
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if entry.name.startswith(RUNTIME_STAGE_PREFIX):
+            stage_root = Path(entry.path)
+            recovery_path = stage_root / ".rollback"
+            try:
+                recovery_metadata = os.lstat(recovery_path)
+            except FileNotFoundError:
+                pass
+            else:
+                if _is_reparse(recovery_metadata) or not stat.S_ISDIR(
+                    recovery_metadata.st_mode
+                ):
+                    raise RuntimeRecoveryError(
+                        recovery_path,
+                        ["orphan rollback path is unsafe"],
+                    )
+                recovery_files, _directories, recovery_issues = _scan_regular_tree(
+                    recovery_path
+                )
+                if recovery_issues or recovery_files:
+                    detail = (
+                        f"unsafe path: {recovery_issues[0]['path']}"
+                        if recovery_issues
+                        else "orphan rollback evidence requires manual recovery"
+                    )
+                    raise RuntimeRecoveryError(recovery_path, [detail])
+            _safe_remove_stage(config_root, stage_root)
+
+
+def _cleanup_journal_temporaries(config_root: Path) -> None:
+    prefix = f".{RUNTIME_JOURNAL_NAME}."
+    removed = False
+    try:
+        entries = list(os.scandir(config_root))
+    except FileNotFoundError:
+        return
+    for entry in entries:
+        if not (entry.name.startswith(prefix) and entry.name.endswith(".tmp")):
+            continue
+        path = Path(entry.path)
+        metadata = os.lstat(path)
+        if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeRecoveryError(path, ["orphan journal temporary is unsafe"])
+        path.unlink()
+        removed = True
+    if removed:
+        _fsync_directory(config_root)
 
 
 def _runtime_sources(manifest: dict[str, Any]) -> list[tuple[str, Path, int | None]]:
@@ -835,6 +1220,8 @@ def _create_managed_directory(
         assert_managed_target(config_root, candidate, expected_kind="directory")
         candidate.mkdir()
         created.append(candidate)
+        _fsync_directory(candidate)
+        _fsync_directory(candidate.parent)
         assert_managed_target(
             config_root,
             candidate,
@@ -846,21 +1233,43 @@ def _create_managed_directory(
 def _stage_runtime(
     config_root: Path,
     manifest: dict[str, Any],
-) -> Path:
-    stage_root = Path(tempfile.mkdtemp(prefix=".runtime-stage-", dir=config_root))
+) -> tuple[Path, dict[str, Any]]:
+    manifest_target = config_root / "config" / "runtime-manifest.json"
     try:
+        manifest_metadata = os.lstat(manifest_target)
+    except FileNotFoundError:
+        previous_manifest_digest = None
+    else:
+        if _is_reparse(manifest_metadata) or not stat.S_ISREG(manifest_metadata.st_mode):
+            raise StateSecurityError(f"managed runtime file is unsafe: {manifest_target}")
+        previous_manifest_digest = sha256(manifest_target)
+    stage_root = Path(tempfile.mkdtemp(prefix=RUNTIME_STAGE_PREFIX, dir=config_root))
+    journal: dict[str, Any] = {
+        "schema": RUNTIME_JOURNAL_SCHEMA,
+        "config_root": ".",
+        "stage": stage_root.name,
+        "state": "staging",
+        "previous_manifest_sha256": previous_manifest_digest,
+        "actions": [],
+    }
+    try:
+        _write_runtime_journal(config_root, journal)
         for relative, source, mode in _runtime_sources(manifest):
             target = stage_root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
             if mode is not None:
                 target.chmod(mode)
+            _fsync_file(target)
+            _fsync_directory_chain(target.parent, stage_root)
         manifest_path = stage_root / "config" / "runtime-manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        _fsync_file(manifest_path)
+        _fsync_directory_chain(manifest_path.parent, stage_root)
         harden_runtime_permissions(stage_root)
         staged_verification = verify(stage_root)
         if not staged_verification.get("ok"):
@@ -868,9 +1277,15 @@ def _stage_runtime(
                 "staged runtime closure failed verification: "
                 + json.dumps(staged_verification, ensure_ascii=False, sort_keys=True)
             )
-        return stage_root
+        journal["state"] = "publishing"
+        _write_runtime_journal(config_root, journal)
+        return stage_root, journal
     except BaseException:
-        shutil.rmtree(stage_root, ignore_errors=True)
+        try:
+            _safe_remove_stage(config_root, stage_root)
+            _remove_runtime_journal(config_root)
+        except OSError:
+            pass
         raise
 
 
@@ -886,15 +1301,24 @@ def _publish_staged_runtime(
     config_root: Path,
     stage_root: Path,
     manifest: dict[str, Any],
+    journal: dict[str, Any],
 ) -> None:
     backup_root = stage_root / ".rollback"
     backup_root.mkdir()
+    _fsync_directory(stage_root)
     created_directories: list[Path] = []
-    actions: list[dict[str, Any]] = []
 
     def publish(relative: str, mode: int | None = None) -> None:
         source = stage_root / relative
         target = config_root / relative
+        source_issue = managed_path_issue(
+            stage_root,
+            source,
+            expected_kind="file",
+            allow_missing=False,
+        )
+        if source_issue is not None:
+            raise StateSecurityError(f"staged runtime source is unsafe: {source_issue['path']}")
         assert_managed_target(config_root, target)
         _create_managed_directory(config_root, target.parent, created_directories)
         assert_managed_target(config_root, target)
@@ -908,15 +1332,43 @@ def _publish_staged_runtime(
             if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
                 raise StateSecurityError(f"managed runtime file is unsafe: {target}")
             existed = True
+            backup_issue = managed_path_issue(stage_root, backup)
+            if backup_issue is not None:
+                raise StateSecurityError(
+                    f"runtime rollback backup path is unsafe: {backup_issue['path']}"
+                )
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(target, backup)
-        action = {"target": target, "backup": backup, "existed": existed, "published": False}
-        actions.append(action)
+            backup_issue = managed_path_issue(
+                stage_root,
+                backup,
+                expected_kind="file",
+                allow_missing=False,
+            )
+            if backup_issue is not None:
+                raise StateSecurityError(
+                    f"runtime rollback backup path is unsafe: {backup_issue['path']}"
+                )
+            _fsync_file(backup)
+            _fsync_directory_chain(backup.parent, stage_root)
+        action = {
+            "relative": relative,
+            "kind": "publish",
+            "existed": existed,
+            "status": "prepared",
+            "desired_sha256": sha256(source),
+            "backup_sha256": sha256(backup) if existed else None,
+        }
+        journal["actions"].append(action)
+        _write_runtime_journal(config_root, journal)
         assert_managed_target(config_root, target)
         os.replace(source, target)
-        action["published"] = True
+        _fsync_directory(target.parent)
         if mode is not None:
             target.chmod(mode)
+        _fsync_file(target)
+        action["status"] = "published"
+        _write_runtime_journal(config_root, journal)
 
     try:
         manifest_relative = "config/runtime-manifest.json"
@@ -934,17 +1386,39 @@ def _publish_staged_runtime(
             target = config_root / relative
             assert_managed_target(config_root, target, allow_missing=False)
             backup = backup_root / relative
+            backup_issue = managed_path_issue(stage_root, backup)
+            if backup_issue is not None:
+                raise StateSecurityError(
+                    f"runtime rollback backup path is unsafe: {backup_issue['path']}"
+                )
             backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+            backup_issue = managed_path_issue(
+                stage_root,
+                backup,
+                expected_kind="file",
+                allow_missing=False,
+            )
+            if backup_issue is not None:
+                raise StateSecurityError(
+                    f"runtime rollback backup path is unsafe: {backup_issue['path']}"
+                )
+            _fsync_file(backup)
+            _fsync_directory_chain(backup.parent, stage_root)
             action = {
-                "target": target,
-                "backup": backup,
+                "relative": relative,
+                "kind": "remove",
                 "existed": True,
-                "published": False,
-                "removed": False,
+                "status": "prepared",
+                "desired_sha256": None,
+                "backup_sha256": sha256(backup),
             }
-            actions.append(action)
-            os.replace(target, backup)
-            action["removed"] = True
+            journal["actions"].append(action)
+            _write_runtime_journal(config_root, journal)
+            target.unlink()
+            _fsync_directory(target.parent)
+            action["status"] = "published"
+            _write_runtime_journal(config_root, journal)
 
         # The manifest is the commit marker and is always published last.
         publish(manifest_relative)
@@ -955,32 +1429,172 @@ def _publish_staged_runtime(
                 "published runtime closure failed verification: "
                 + json.dumps(installed_verification, ensure_ascii=False, sort_keys=True)
             )
+        journal["state"] = "committed"
+        _write_runtime_journal(config_root, journal)
     except BaseException as install_error:
+        try:
+            _recover_stale_transaction(config_root)
+        except (RuntimeRollbackError, RuntimeRecoveryError) as recovery_error:
+            raise recovery_error from install_error
+        _remove_empty_directories(created_directories)
+        raise
+
+
+def _action_target_digest(config_root: Path, relative: str) -> str | None:
+    target = config_root / relative
+    try:
+        metadata = os.lstat(target)
+    except FileNotFoundError:
+        return None
+    if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise StateSecurityError(f"managed runtime file is unsafe: {target}")
+    return sha256(target)
+
+
+def _rollback_transaction_action(
+    config_root: Path,
+    stage_root: Path,
+    action: dict[str, Any],
+) -> None:
+    relative = action["relative"]
+    target = config_root / relative
+    backup = stage_root / ".rollback" / relative
+    assert_managed_target(config_root, target)
+    backup_issue = managed_path_issue(stage_root, backup)
+    if backup_issue is not None:
+        raise StateSecurityError(
+            f"runtime rollback backup path is unsafe: {backup_issue['path']}"
+        )
+    current_digest = _action_target_digest(config_root, relative)
+    desired_digest = action["desired_sha256"]
+    backup_digest = action["backup_sha256"]
+    if action["existed"]:
+        try:
+            backup_metadata = os.lstat(backup)
+        except FileNotFoundError:
+            if current_digest == backup_digest:
+                return
+            raise StateSecurityError(f"runtime rollback backup is missing: {backup}")
+        if _is_reparse(backup_metadata) or not stat.S_ISREG(backup_metadata.st_mode):
+            raise StateSecurityError(f"runtime rollback backup is unsafe: {backup}")
+        if sha256(backup) != backup_digest:
+            raise StateSecurityError(f"runtime rollback backup digest mismatch: {backup}")
+        allowed_current = {backup_digest}
+        if desired_digest is not None:
+            allowed_current.add(desired_digest)
+        if current_digest is not None and current_digest not in allowed_current:
+            raise StateSecurityError(f"runtime rollback target changed: {target}")
+        assert_managed_target(config_root, target)
+        os.replace(backup, target)
+        _fsync_directory(target.parent)
+        if sha256(target) != backup_digest:
+            raise StateSecurityError(f"runtime rollback restore mismatch: {target}")
+        return
+    if current_digest is None:
+        return
+    if desired_digest is None or current_digest != desired_digest:
+        raise StateSecurityError(f"runtime rollback target changed: {target}")
+    target.unlink()
+    _fsync_directory(target.parent)
+
+
+def _verify_restored_transaction(
+    config_root: Path,
+    payload: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> None:
+    for action in actions:
+        current_digest = _action_target_digest(config_root, action["relative"])
+        expected_digest = action["backup_sha256"] if action["existed"] else None
+        if current_digest != expected_digest:
+            raise StateSecurityError(
+                f"runtime rollback verification failed: {action['relative']}"
+            )
+    previous_manifest_digest = payload["previous_manifest_sha256"]
+    manifest_path = config_root / "config" / "runtime-manifest.json"
+    if previous_manifest_digest is None:
+        if _action_target_digest(config_root, "config/runtime-manifest.json") is not None:
+            raise StateSecurityError("runtime rollback left an unexpected manifest")
+        return
+    if _action_target_digest(config_root, "config/runtime-manifest.json") != previous_manifest_digest:
+        raise StateSecurityError("runtime rollback did not restore the previous manifest")
+    restored = verify(config_root)
+    if not restored.get("ok"):
+        raise StateSecurityError(
+            "restored runtime closure failed verification: "
+            + json.dumps(restored, ensure_ascii=False, sort_keys=True)
+        )
+
+
+def _cleanup_runtime_transaction(config_root: Path, stage_root: Path) -> None:
+    _safe_remove_stage(config_root, stage_root)
+    _remove_runtime_journal(config_root)
+
+
+def _recover_stale_transaction(config_root: Path) -> bool:
+    journal_path = _runtime_journal_path(config_root)
+    try:
+        os.lstat(journal_path)
+    except FileNotFoundError:
+        _cleanup_orphan_stages(config_root)
+        _cleanup_journal_temporaries(config_root)
+        return False
+    payload = _stable_json_read(journal_path)
+    stage_root, actions = _validated_transaction(config_root, payload)
+    recovery_path = stage_root / ".rollback"
+    if payload["state"] == "committed":
+        committed = verify(config_root)
+        if not committed.get("ok"):
+            raise RuntimeRecoveryError(
+                recovery_path,
+                [
+                    "committed runtime closure failed verification: "
+                    + json.dumps(committed, ensure_ascii=False, sort_keys=True)
+                ],
+            )
+    else:
         rollback_errors: list[str] = []
         for action in reversed(actions):
-            target = action["target"]
-            backup = action["backup"]
             try:
-                if action.get("existed") and backup.exists():
-                    os.replace(backup, target)
-                elif action.get("published"):
-                    target.unlink(missing_ok=True)
-            except OSError as exc:
-                rollback_errors.append(f"{target}: {exc}")
-        _remove_empty_directories(created_directories)
+                _rollback_transaction_action(config_root, stage_root, action)
+            except (OSError, StateSecurityError) as exc:
+                rollback_errors.append(f"{action['relative']}: {exc}")
+        if not rollback_errors:
+            try:
+                _verify_restored_transaction(config_root, payload, actions)
+            except (OSError, StateSecurityError) as exc:
+                rollback_errors.append(str(exc))
         if rollback_errors:
-            raise RuntimeRollbackError(backup_root, rollback_errors) from install_error
-        raise
+            raise RuntimeRollbackError(recovery_path, rollback_errors)
+    try:
+        _cleanup_runtime_transaction(config_root, stage_root)
+        _cleanup_orphan_stages(config_root)
+        _cleanup_journal_temporaries(config_root)
+    except (OSError, StateSecurityError) as exc:
+        raise RuntimeRecoveryError(recovery_path, [str(exc)]) from exc
+    return True
 
 
 def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
     config_root = absolute_path(config_root)
     _raise_first_unsafe_path(config_root)
-    manifest = expected_manifest(config_root)
-    for name in manifest["template_inventory"]:
-        assert_managed_target(config_root, config_root / name)
-    changed, unchanged = _change_report(config_root, manifest)
-    if not dry_run:
+    recovered_transaction = False
+    if dry_run:
+        try:
+            journal_metadata = os.lstat(_runtime_journal_path(config_root))
+        except FileNotFoundError:
+            pass
+        else:
+            if _is_reparse(journal_metadata) or not stat.S_ISREG(journal_metadata.st_mode):
+                raise StateSecurityError("runtime transaction journal is unsafe")
+            raise StateSecurityError(
+                "runtime transaction recovery requires a non-dry install"
+            )
+        manifest = expected_manifest(config_root)
+        for name in manifest["template_inventory"]:
+            assert_managed_target(config_root, config_root / name)
+        changed, unchanged = _change_report(config_root, manifest)
+    else:
         root_created = False
         with _runtime_install_mutex(config_root):
             _raise_first_unsafe_path(config_root)
@@ -1002,17 +1616,16 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
                     allow_missing=False,
                 )
                 ensure_private_directory(config_root, harden_existing=True)
-                stage_root = _stage_runtime(config_root, manifest)
-                preserve_stage = False
-                try:
-                    _raise_first_unsafe_path(config_root)
-                    _publish_staged_runtime(config_root, stage_root, manifest)
-                except RuntimeRollbackError:
-                    preserve_stage = True
-                    raise
-                finally:
-                    if not preserve_stage:
-                        shutil.rmtree(stage_root, ignore_errors=True)
+                recovered_transaction = _recover_stale_transaction(config_root)
+                _raise_first_unsafe_path(config_root)
+                manifest = expected_manifest(config_root)
+                for name in manifest["template_inventory"]:
+                    assert_managed_target(config_root, config_root / name)
+                changed, unchanged = _change_report(config_root, manifest)
+                stage_root, journal = _stage_runtime(config_root, manifest)
+                _raise_first_unsafe_path(config_root)
+                _publish_staged_runtime(config_root, stage_root, manifest, journal)
+                _cleanup_runtime_transaction(config_root, stage_root)
             except BaseException:
                 if root_created:
                     try:
@@ -1039,6 +1652,7 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
         "unchanged": unchanged,
         "source_commit": manifest["source_commit"],
         "source_dirty": manifest["source_dirty"],
+        "recovered_transaction": recovered_transaction,
         "permissions": permissions,
     }
 

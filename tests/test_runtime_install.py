@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import hashlib
 import os
@@ -10,6 +11,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -45,6 +47,61 @@ def remove_directory_reparse(link: Path) -> None:
 
 
 class RuntimeInstallTests(unittest.TestCase):
+    def test_directory_fsync_only_ignores_explicitly_unsupported_errors(self) -> None:
+        probe = textwrap.dedent(
+            """
+            import sys
+            from pathlib import Path
+
+            scripts_root, raw_errno, expectation = sys.argv[1:]
+            sys.path.insert(0, scripts_root)
+            import install_runtime
+
+            error_number = int(raw_errno)
+            probe_path = Path(".")
+            install_runtime.os.name = "posix"
+            install_runtime.os.open = lambda *_args, **_kwargs: 123
+            install_runtime.os.close = lambda _descriptor: None
+            def fail_fsync(_descriptor):
+                raise OSError(error_number, "injected directory fsync failure")
+            install_runtime.os.fsync = fail_fsync
+            try:
+                install_runtime._fsync_directory(probe_path)
+            except OSError as exc:
+                if expectation == "raise" and exc.errno == error_number:
+                    raise SystemExit(0)
+                raise SystemExit(2)
+            raise SystemExit(0 if expectation == "ignore" else 3)
+            """
+        )
+        for error_number, expectation in (
+            (errno.EIO, "raise"),
+            (errno.EINVAL, "ignore"),
+            (errno.ENOTSUP, "ignore"),
+        ):
+            with self.subTest(error_number=error_number):
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        probe,
+                        str(REPO_ROOT / "scripts"),
+                        str(error_number),
+                        expectation,
+                    ],
+                    cwd=REPO_ROOT,
+                    env=isolated_subprocess_env(),
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    completed.stdout + completed.stderr,
+                )
+
     def make_verified_old_runtime(self, root: Path) -> dict[str, bytes]:
         installed = subprocess.run(
             [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
@@ -111,6 +168,7 @@ class RuntimeInstallTests(unittest.TestCase):
 
             original_copy2 = install_runtime.shutil.copy2
             original_replace = install_runtime.os.replace
+            original_write_journal = install_runtime._write_runtime_journal
             copy_count = 0
             publish_count = 0
             failed = False
@@ -119,6 +177,9 @@ class RuntimeInstallTests(unittest.TestCase):
             def injected_copy2(source, target, *args, **kwargs):
                 global copy_count, failed
                 copy_count += 1
+                if fault == "hard-exit-stage-copy-2" and copy_count == 2 and not failed:
+                    original_copy2(source, target, *args, **kwargs)
+                    os._exit(91)
                 if fault == "stage-copy-2" and copy_count == 2 and not failed:
                     failed = True
                     raise OSError("injected second staged copy failure")
@@ -129,22 +190,38 @@ class RuntimeInstallTests(unittest.TestCase):
                 target_path = os.path.abspath(os.fspath(target))
                 root_path = os.path.abspath(config_root)
                 manifest_path = os.path.join(root_path, "config", "runtime-manifest.json")
+                journal_path = os.path.join(root_path, ".runtime-install-journal.json")
                 source_path = os.path.abspath(os.fspath(source))
+                if fault == "hard-exit-before-first-journal-replace" and target_path == journal_path:
+                    os._exit(91)
                 is_publish = (
                     os.path.commonpath((root_path, target_path)) == root_path
                     and ".runtime-stage-" in source_path
                 )
                 if is_publish and target_path != manifest_path:
                     publish_count += 1
+                if fault == "hard-exit-publish-2" and publish_count == 2 and not failed:
+                    original_replace(source, target, *args, **kwargs)
+                    os._exit(91)
                 if fault == "publish-middle" and publish_count == 2 and not failed:
                     failed = True
                     raise OSError("injected middle publish failure")
                 if fault == "manifest-replace" and target_path == manifest_path and not failed:
                     failed = True
                     raise OSError("injected manifest replace failure")
+                if fault == "hard-exit-after-manifest" and target_path == manifest_path and not failed:
+                    original_replace(source, target, *args, **kwargs)
+                    os._exit(91)
                 if fault == "publish-and-rollback" and publish_count == 2 and not failed:
                     failed = True
                     raise OSError("injected publish failure before rollback")
+                if (
+                    fault == "hard-exit-recovery-1"
+                    and ".rollback" in source_path
+                    and not rollback_failed
+                ):
+                    original_replace(source, target, *args, **kwargs)
+                    os._exit(92)
                 if (
                     fault == "publish-and-rollback"
                     and failed
@@ -155,8 +232,14 @@ class RuntimeInstallTests(unittest.TestCase):
                     raise OSError("injected rollback failure")
                 return original_replace(source, target, *args, **kwargs)
 
+            def injected_write_journal(root, payload):
+                original_write_journal(root, payload)
+                if fault == "hard-exit-after-committed" and payload.get("state") == "committed":
+                    os._exit(91)
+
             install_runtime.shutil.copy2 = injected_copy2
             install_runtime.os.replace = injected_replace
+            install_runtime._write_runtime_journal = injected_write_journal
             install_runtime.install(install_runtime.Path(config_root), False)
             """
         )
@@ -234,6 +317,492 @@ class RuntimeInstallTests(unittest.TestCase):
             result = self.run_runtime_install_with_fault(root, "manifest-replace")
 
             self.assert_failed_install_preserved_old_runtime(root, before, result)
+
+    def test_install_recovers_after_process_dies_during_publish(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            before = self.make_verified_old_runtime(root)
+
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            self.assertEqual(
+                (root / "config" / "runtime-manifest.json").read_bytes(),
+                before["config/runtime-manifest.json"],
+            )
+            self.assertNotEqual(
+                (root / "scripts" / "agent_memory_audit.py").read_bytes(),
+                before["scripts/agent_memory_audit.py"],
+            )
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(journal["schema"], 1)
+            self.assertEqual(journal["config_root"], ".")
+            self.assertEqual(journal["state"], "publishing")
+            self.assertEqual(
+                set(journal),
+                {
+                    "schema",
+                    "config_root",
+                    "stage",
+                    "state",
+                    "previous_manifest_sha256",
+                    "actions",
+                },
+            )
+            self.assertEqual(
+                [action["status"] for action in journal["actions"]],
+                ["published", "prepared"],
+            )
+            self.assertTrue(
+                all(
+                    set(action)
+                    == {
+                        "relative",
+                        "kind",
+                        "existed",
+                        "status",
+                        "desired_sha256",
+                        "backup_sha256",
+                    }
+                    for action in journal["actions"]
+                )
+            )
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue(json.loads(recovered.stdout)["recovered_transaction"])
+            verified = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--config-root",
+                    str(root),
+                    "--verify",
+                    "--json",
+                ],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+            self.assertEqual(
+                (root / "scripts" / "local_adapter.py").read_bytes(),
+                b"LOCAL = True\n",
+            )
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_recovers_after_process_dies_after_manifest_replace(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            before = self.make_verified_old_runtime(root)
+
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-after-manifest")
+
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(journal["state"], "publishing")
+            self.assertEqual(
+                journal["actions"][-1]["relative"],
+                "config/runtime-manifest.json",
+            )
+            self.assertEqual(journal["actions"][-1]["status"], "prepared")
+            self.assertNotEqual(
+                (root / "config" / "runtime-manifest.json").read_bytes(),
+                before["config/runtime-manifest.json"],
+            )
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue(json.loads(recovered.stdout)["recovered_transaction"])
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_cleans_staging_transaction_after_process_dies(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            before = self.make_verified_old_runtime(root)
+
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-stage-copy-2")
+
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(journal["state"], "staging")
+            self.assertEqual(journal["actions"], [])
+            for relative, content in before.items():
+                self.assertEqual((root / relative).read_bytes(), content)
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue(json.loads(recovered.stdout)["recovered_transaction"])
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_cleans_stage_and_journal_temp_when_first_journal_replace_dies(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            self.make_verified_old_runtime(root)
+
+            crashed = self.run_runtime_install_with_fault(
+                root,
+                "hard-exit-before-first-journal-replace",
+            )
+
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertTrue(list(root.glob(".runtime-stage-*")))
+            self.assertTrue(list(root.glob("..runtime-install-journal.json.*.tmp")))
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+            self.assertFalse(list(root.glob("..runtime-install-journal.json.*.tmp")))
+
+    def test_install_cleans_committed_transaction_after_process_dies(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            self.make_verified_old_runtime(root)
+
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-after-committed")
+
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(journal["state"], "committed")
+            verified_before_cleanup = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALLER),
+                    "--config-root",
+                    str(root),
+                    "--verify",
+                    "--json",
+                ],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(
+                verified_before_cleanup.returncode,
+                0,
+                verified_before_cleanup.stdout + verified_before_cleanup.stderr,
+            )
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue(json.loads(recovered.stdout)["recovered_transaction"])
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_recovery_is_idempotent_after_second_process_dies(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            self.make_verified_old_runtime(root)
+            first_crash = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+            self.assertEqual(first_crash.returncode, 91, first_crash.stdout + first_crash.stderr)
+
+            recovery_crash = self.run_runtime_install_with_fault(root, "hard-exit-recovery-1")
+
+            self.assertEqual(
+                recovery_crash.returncode,
+                92,
+                recovery_crash.stdout + recovery_crash.stderr,
+            )
+            self.assertTrue((root / ".runtime-install-journal.json").is_file())
+            recovered = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertTrue(json.loads(recovered.stdout)["recovered_transaction"])
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_recovery_rejects_escaping_journal_action(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            workspace = Path(raw_root).resolve()
+            root = workspace / "runtime"
+            external = workspace / "outside.txt"
+            external.write_bytes(b"outside-sentinel")
+            self.make_verified_old_runtime(root)
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal_path = root / ".runtime-install-journal.json"
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            journal["actions"][0]["relative"] = "../outside.txt"
+            journal_path.write_text(
+                json.dumps(journal, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            rejected = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("transaction action is invalid", rejected.stdout)
+            self.assertEqual(external.read_bytes(), b"outside-sentinel")
+            self.assertTrue(journal_path.is_file())
+            self.assertTrue(list(root.glob(".runtime-stage-*")))
+
+    def test_install_recovery_rejects_stage_reparse_without_traversal(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            workspace = Path(raw_root).resolve()
+            root = workspace / "runtime"
+            external = workspace / "external-stage"
+            external.mkdir()
+            sentinel = external / "sentinel.txt"
+            sentinel.write_bytes(b"external-stage-sentinel")
+            self.make_verified_old_runtime(root)
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            stage = root / journal["stage"]
+            shutil.rmtree(stage)
+            make_directory_reparse(stage, external)
+            try:
+                rejected = subprocess.run(
+                    [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                    cwd=REPO_ROOT,
+                    env=isolated_subprocess_env(),
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+                self.assertIn("transaction stage is unsafe", rejected.stdout)
+                self.assertEqual(sentinel.read_bytes(), b"external-stage-sentinel")
+            finally:
+                remove_directory_reparse(stage)
+
+    def test_install_recovery_rejects_nested_backup_parent_reparse(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            workspace = Path(raw_root).resolve()
+            root = workspace / "runtime"
+            before = self.make_verified_old_runtime(root)
+            crashed = self.run_runtime_install_with_fault(root, "hard-exit-publish-2")
+            self.assertEqual(crashed.returncode, 91, crashed.stdout + crashed.stderr)
+            journal = json.loads(
+                (root / ".runtime-install-journal.json").read_text(encoding="utf-8")
+            )
+            stage = root / journal["stage"]
+            backup_scripts = stage / ".rollback" / "scripts"
+            shutil.rmtree(backup_scripts)
+            external = workspace / "external-backups"
+            external.mkdir()
+            expected_external: dict[str, bytes] = {}
+            for action in journal["actions"]:
+                relative = action["relative"]
+                if relative.startswith("scripts/"):
+                    name = relative.removeprefix("scripts/")
+                    content = before[relative]
+                    (external / name).write_bytes(content)
+                    expected_external[name] = content
+            make_directory_reparse(backup_scripts, external)
+            try:
+                rejected = subprocess.run(
+                    [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                    cwd=REPO_ROOT,
+                    env=isolated_subprocess_env(),
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+                self.assertIn("unsafe", rejected.stdout)
+                for name, content in expected_external.items():
+                    self.assertEqual((external / name).read_bytes(), content)
+            finally:
+                remove_directory_reparse(backup_scripts)
+
+    def test_install_cleans_safe_orphan_stage_without_journal(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            self.make_verified_old_runtime(root)
+            orphan = root / ".runtime-stage-orphan"
+            orphan.mkdir()
+            (orphan / "partial.bin").write_bytes(b"partial-stage")
+
+            installed = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            self.assertFalse(orphan.exists())
+            self.assertFalse((root / ".runtime-install-journal.json").exists())
+            self.assertFalse(list(root.glob(".runtime-stage-*")))
+
+    def test_install_preserves_orphan_rollback_evidence_without_journal(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve() / "runtime"
+            self.make_verified_old_runtime(root)
+            recovery = root / ".runtime-stage-orphan" / ".rollback"
+            recovery.mkdir(parents=True)
+            evidence = recovery / "prior-runtime.bin"
+            evidence.write_bytes(b"rollback-evidence")
+
+            rejected = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertNotEqual(rejected.returncode, 0, rejected.stdout + rejected.stderr)
+            self.assertIn("recovery_path=", rejected.stdout)
+            self.assertEqual(evidence.read_bytes(), b"rollback-evidence")
+
+    def test_live_runtime_install_lock_rejects_concurrent_process(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            workspace = Path(raw_root).resolve()
+            root = workspace / "missing" / "nested" / "runtime"
+            ready = workspace / "ready"
+            release = workspace / "release"
+            holder_probe = textwrap.dedent(
+                """
+                import sys
+                import time
+                from pathlib import Path
+
+                scripts_root, config_root, ready_path, release_path = sys.argv[1:]
+                sys.path.insert(0, scripts_root)
+                import install_runtime
+
+                original_stage = install_runtime._stage_runtime
+                def blocking_stage(root, manifest):
+                    Path(ready_path).write_text("ready", encoding="utf-8")
+                    while not Path(release_path).exists():
+                        time.sleep(0.02)
+                    return original_stage(root, manifest)
+                install_runtime._stage_runtime = blocking_stage
+                install_runtime.install(Path(config_root), False)
+                """
+            )
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    holder_probe,
+                    str(REPO_ROOT / "scripts"),
+                    str(root),
+                    str(ready),
+                    str(release),
+                ],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                for _ in range(500):
+                    if ready.exists():
+                        break
+                    if holder.poll() is not None:
+                        break
+                    time.sleep(0.02)
+                if not ready.exists():
+                    if holder.poll() is None:
+                        self.fail("runtime install lock holder did not reach the barrier")
+                    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+                    self.fail(holder_stdout + holder_stderr)
+                contender = subprocess.run(
+                    [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                    cwd=REPO_ROOT,
+                    env=isolated_subprocess_env(),
+                    text=True,
+                    capture_output=True,
+                    timeout=60,
+                    check=False,
+                )
+                self.assertNotEqual(contender.returncode, 0, contender.stdout + contender.stderr)
+                self.assertIn("already in progress", contender.stdout)
+            finally:
+                release.write_text("release", encoding="utf-8")
+            holder_stdout, holder_stderr = holder.communicate(timeout=60)
+            self.assertEqual(holder.returncode, 0, holder_stdout + holder_stderr)
+            after_release = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(after_release.returncode, 0, after_release.stdout + after_release.stderr)
 
     def test_install_preserves_recovery_backup_when_rollback_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
