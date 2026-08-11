@@ -78,7 +78,10 @@ def file_sha256(path: Path) -> str:
 def deleted_observation_sentinel(deletion_commit: str, prior_sha256: str) -> str:
     value = f"deleted:{deletion_commit.strip().lower()}:{prior_sha256.strip().lower()}"
     if parse_deleted_observation(value) is None:
-        raise ValueError("deleted observation requires a 40-hex commit and 64-hex prior SHA-256")
+        raise ValueError(
+            "deleted observation requires a 40-or-64-hex Git object id "
+            "and 64-hex prior SHA-256"
+        )
     return value
 
 

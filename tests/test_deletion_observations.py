@@ -22,7 +22,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import agent_memory_claim as claim
-from agent_memory_claim import parse_deleted_observation
+from agent_memory_claim import deleted_observation_sentinel, parse_deleted_observation
 
 
 def git(root: Path, *args: str) -> str:
@@ -515,6 +515,10 @@ class TrashPathClassificationTests(unittest.TestCase):
 
 
 class Sha256RepositoryObservationTests(unittest.TestCase):
+    def test_invalid_sentinel_diagnostic_describes_both_object_id_lengths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "40-or-64-hex Git object id"):
+            deleted_observation_sentinel("not-an-object-id", "a" * 64)
+
     def test_sha256_repository_commit_and_sentinel_are_supported(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp).resolve()

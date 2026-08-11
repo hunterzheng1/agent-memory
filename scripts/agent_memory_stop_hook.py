@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -113,15 +114,80 @@ def vault_target() -> str:
         return str(VAULT_ROOT)
 
 
-def normalize_path(repo_path: str) -> Path | None:
-    path = (GIT_ROOT / repo_path).resolve()
+def lexical_absolute(raw_path: str | os.PathLike[str], *, base: Path | None = None) -> Path:
+    """Normalize dot segments without resolving symlinks or junction targets."""
+
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base or GIT_ROOT) / candidate
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def lexical_path_key(raw_path: str | os.PathLike[str]) -> str:
+    """Return a platform-aware identity key without filesystem traversal."""
+
+    return os.path.normcase(os.path.normpath(os.fspath(lexical_absolute(raw_path))))
+
+
+def lexical_path_within(path: Path, root: Path) -> bool:
+    path_key = lexical_path_key(path)
+    root_key = lexical_path_key(root)
     try:
-        path.relative_to(VAULT_ROOT)
+        return os.path.commonpath((path_key, root_key)) == root_key
     except ValueError:
+        return False
+
+
+def lexical_repo_path(path: Path) -> str | None:
+    candidate = lexical_absolute(path)
+    git_root = lexical_absolute(GIT_ROOT)
+    if not lexical_path_within(candidate, git_root):
         return None
-    if path.suffix.lower() != ".md" or (path.exists() and not path.is_file()):
+    relative = os.path.relpath(os.fspath(candidate), os.fspath(git_root))
+    if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+        return None
+    return Path(relative).as_posix()
+
+
+def normalize_path(repo_path: str) -> Path | None:
+    path = lexical_absolute(repo_path, base=GIT_ROOT)
+    if not lexical_path_within(path, lexical_absolute(VAULT_ROOT)):
+        return None
+    if path.suffix.lower() != ".md":
         return None
     return path
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    unique: dict[str, Path] = {}
+    for path in paths:
+        unique.setdefault(lexical_path_key(path), lexical_absolute(path))
+    return list(unique.values())
+
+
+def parse_porcelain_z(output: str) -> list[str]:
+    """Parse porcelain-v1 -z, including the second rename/copy path."""
+
+    items = output.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(items):
+        item = items[index]
+        index += 1
+        if not item:
+            continue
+        if len(item) < 4 or item[2] != " ":
+            continue
+        status = item[:2]
+        destination = item[3:]
+        paths.append(destination)
+        change_kind = next((value for value in status if value in {"R", "C"}), "")
+        if change_kind and index < len(items):
+            source = items[index]
+            index += 1
+            if change_kind == "R" and source:
+                paths.append(source)
+    return paths
 
 
 def dirty_paths() -> list[Path]:
@@ -129,12 +195,11 @@ def dirty_paths() -> list[Path]:
     if not result or result.returncode != 0:
         return []
     paths: list[Path] = []
-    for item in (part for part in result.stdout.split("\0") if len(part) >= 4):
-        repo_path = item[3:].split(" -> ", 1)[-1]
+    for repo_path in parse_porcelain_z(result.stdout):
         path = normalize_path(repo_path)
         if path:
             paths.append(path)
-    return list(dict.fromkeys(paths))
+    return dedupe_paths(paths)
 
 
 def last_observed_head() -> str:
@@ -163,19 +228,219 @@ def historical_paths() -> list[Path]:
     ancestor = run_git(["merge-base", "--is-ancestor", baseline, head])
     if not ancestor or ancestor.returncode != 0:
         return []
-    diff = run_git(["diff", "--name-only", "-z", f"{baseline}..{head}", "--", vault_target()])
+    diff = run_git(
+        [
+            "diff",
+            "--find-renames",
+            "--find-copies",
+            "--name-status",
+            "-z",
+            f"{baseline}..{head}",
+            "--",
+            vault_target(),
+        ]
+    )
     if not diff or diff.returncode != 0:
         return []
-    paths = [normalize_path(item) for item in diff.stdout.split("\0") if item]
-    return list(dict.fromkeys(path for path in paths if path is not None))
+    items = diff.stdout.split("\0")
+    paths: list[Path] = []
+    index = 0
+    while index < len(items):
+        status = items[index]
+        index += 1
+        if not status:
+            continue
+        path_count = 2 if status[0] in {"R", "C"} else 1
+        changed = items[index : index + path_count]
+        index += path_count
+        selected = changed if status[0] == "R" else changed[-1:]
+        for repo_path in selected:
+            path = normalize_path(repo_path)
+            if path is not None:
+                paths.append(path)
+    return dedupe_paths(paths)
+
+
+def path_is_safe_regular(path: Path) -> bool:
+    """Reject missing, non-regular, and symlinked path components lexically."""
+
+    candidate = lexical_absolute(path)
+    vault = lexical_absolute(VAULT_ROOT)
+    if not lexical_path_within(candidate, vault):
+        return False
+    relative = os.path.relpath(os.fspath(candidate), os.fspath(vault))
+    components = () if relative == os.curdir else Path(relative).parts
+    current = vault
+    chain = [vault]
+    for component in components:
+        current = current / component
+        chain.append(current)
+    for index, component_path in enumerate(chain):
+        try:
+            metadata = os.lstat(component_path)
+        except OSError:
+            return False
+        if stat.S_ISLNK(metadata.st_mode) or os.path.islink(component_path):
+            return False
+        if index < len(chain) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            return False
+        if index == len(chain) - 1 and not stat.S_ISREG(metadata.st_mode):
+            return False
+    return bool(components)
+
+
+def run_git_bytes(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess[bytes] | None:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(GIT_ROOT), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def git_oid_length() -> int | None:
+    result = run_git(["rev-parse", "--show-object-format"])
+    if not result or result.returncode != 0:
+        return None
+    object_format = result.stdout.strip().lower()
+    if object_format == "sha1":
+        return 40
+    if object_format == "sha256":
+        return 64
+    return None
+
+
+def git_oid_is_valid(value: str) -> bool:
+    length = git_oid_length()
+    return bool(length and len(value) == length and all(character in "0123456789abcdef" for character in value))
+
+
+def git_tree_entry(revision: str, repo_path: str) -> tuple[str, str, str] | None:
+    result = run_git_bytes(["ls-tree", "-z", revision, "--", repo_path])
+    if not result or result.returncode != 0:
+        return None
+    entries = [item for item in result.stdout.split(b"\0") if item]
+    if len(entries) != 1:
+        return None
+    metadata, separator, raw_path = entries[0].partition(b"\t")
+    fields = metadata.split()
+    try:
+        mode = fields[0].decode("ascii", errors="strict")
+        object_type = fields[1].decode("ascii", errors="strict")
+        oid = fields[2].decode("ascii", errors="strict").lower()
+        decoded_path = raw_path.decode("utf-8", errors="strict")
+    except (IndexError, UnicodeDecodeError):
+        return None
+    if separator != b"\t" or decoded_path != repo_path or not git_oid_is_valid(oid):
+        return None
+    return mode, object_type, oid
+
+
+def git_head() -> str:
+    result = run_git(["rev-parse", "--verify", "HEAD^{commit}"])
+    if not result or result.returncode != 0:
+        return ""
+    value = result.stdout.strip().lower()
+    return value if git_oid_is_valid(value) else ""
+
+
+def latest_path_commit(revision: str, repo_path: str) -> str:
+    result = run_git(["log", "-1", "--format=%H", revision, "--", repo_path])
+    if not result or result.returncode != 0:
+        return ""
+    value = result.stdout.strip().lower()
+    return value if git_oid_is_valid(value) else ""
+
+
+def observation_matches_git(path: Path, observation: dict[str, str]) -> bool:
+    repo_path = lexical_repo_path(path)
+    if repo_path is None:
+        return False
+    head = git_head()
+    current_entry = git_tree_entry(head, repo_path) if head else None
+    if current_entry is None or current_entry[:2] not in {
+        ("100644", "blob"),
+        ("100755", "blob"),
+    }:
+        return False
+
+    commit = observation.get("git_commit", "").strip().lower()
+    blob_oid = observation.get("git_blob_oid", "").strip().lower()
+    blob_sha256 = observation.get("git_blob_sha256", "").strip().lower()
+    if (
+        not git_oid_is_valid(commit)
+        or not git_oid_is_valid(blob_oid)
+        or len(blob_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in blob_sha256)
+    ):
+        return False
+    ancestry = run_git(["merge-base", "--is-ancestor", commit, head])
+    if not ancestry or ancestry.returncode != 0:
+        return False
+    observed_entry = git_tree_entry(commit, repo_path)
+    if (
+        observed_entry is None
+        or observed_entry[:2] not in {("100644", "blob"), ("100755", "blob")}
+        or observed_entry[2] != blob_oid
+        or current_entry[2] != blob_oid
+    ):
+        return False
+    blob = run_git_bytes(["cat-file", "blob", blob_oid])
+    if (
+        not blob
+        or blob.returncode != 0
+        or hashlib.sha256(blob.stdout).hexdigest() != blob_sha256
+    ):
+        return False
+    observed_latest = latest_path_commit(commit, repo_path)
+    return bool(
+        observed_latest
+        and observed_latest == latest_path_commit(head, repo_path)
+    )
 
 
 def file_sha256(path: Path) -> str:
+    candidate = lexical_absolute(path)
+    if not path_is_safe_regular(candidate):
+        raise OSError(f"unsafe memory path: {candidate}")
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(candidate, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not path_is_safe_regular(candidate):
+            raise OSError(f"unsafe memory path: {candidate}")
+        current = os.stat(candidate, follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise OSError(f"memory path identity changed: {candidate}")
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
             digest.update(block)
+        if not path_is_safe_regular(candidate):
+            raise OSError(f"memory path identity changed: {candidate}")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
+
+
+def safe_path_mtime(path: Path) -> float | None:
+    candidate = lexical_absolute(path)
+    if not path_is_safe_regular(candidate):
+        return None
+    try:
+        metadata = os.lstat(candidate)
+    except OSError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or not path_is_safe_regular(candidate):
+        return None
+    return metadata.st_mtime
 
 
 def unobserved_paths(paths: list[Path]) -> list[Path]:
@@ -188,39 +453,65 @@ def unobserved_paths(paths: list[Path]) -> list[Path]:
                 str(row[1])
                 for row in conn.execute("PRAGMA table_info(memory_file_observations)")
             }
-            actor_expression = "actor" if "actor" in columns else "'' AS actor"
+            selected_columns = [
+                name if name in columns else f"'' AS {name}"
+                for name in (
+                    "actor",
+                    "git_commit",
+                    "git_blob_oid",
+                    "git_blob_sha256",
+                )
+            ]
             rows = conn.execute(
-                f"SELECT path, sha256, {actor_expression} FROM memory_file_observations"
+                "SELECT path, sha256, "
+                + ", ".join(selected_columns)
+                + " FROM memory_file_observations"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return paths
-    indexed = {
-        str(Path(str(path)).resolve()): (str(digest), str(actor))
-        for path, digest, actor in rows
-    }
+    indexed: dict[str, dict[str, str] | None] = {}
+    for row in rows:
+        key = lexical_path_key(str(row[0]))
+        record = {
+            "sha256": str(row[1]),
+            "actor": str(row[2]),
+            "git_commit": str(row[3]),
+            "git_blob_oid": str(row[4]),
+            "git_blob_sha256": str(row[5]),
+        }
+        indexed[key] = None if key in indexed else record
     stale: list[Path] = []
-    for path in paths:
+    for raw_path in paths:
+        path = lexical_absolute(raw_path)
+        observation = indexed.get(lexical_path_key(path))
+        if (
+            not isinstance(observation, dict)
+            or observation.get("actor") == "human"
+            or not path_is_safe_regular(path)
+            or not observation_matches_git(path, observation)
+        ):
+            stale.append(path)
+            continue
         try:
             current = file_sha256(path)
         except OSError:
             stale.append(path)
             continue
-        observation = indexed.get(str(path.resolve()))
-        if observation is None or observation[0] != current or observation[1] == "human":
+        if observation.get("sha256") != current:
             stale.append(path)
-    return stale
+    return dedupe_paths(stale)
 
 
 def pending_paths() -> list[Path]:
     # A prior committed observation can explain Git history, never a currently
     # dirty worktree. Keeping dirty paths unconditional closes the post-commit
     # race where stale observation state otherwise silenced a new edit.
-    dirty = list(dict.fromkeys(dirty_paths()))
-    dirty_set = {path.resolve() for path in dirty}
+    dirty = dedupe_paths(dirty_paths())
+    dirty_set = {lexical_path_key(path) for path in dirty}
     historical = [
-        path for path in historical_paths() if path.resolve() not in dirty_set
+        path for path in historical_paths() if lexical_path_key(path) not in dirty_set
     ]
-    return list(dict.fromkeys([*dirty, *unobserved_paths(historical)]))
+    return dedupe_paths([*dirty, *unobserved_paths(historical)])
 
 
 def notify(message: str) -> None:
@@ -394,11 +685,11 @@ def main() -> int:
         if not raw_session_id:
             ambiguous_paths: list[Path] = []
             for path in paths:
-                resolved = path.resolve()
+                path_key = lexical_path_key(path)
                 covering = [
                     row
                     for row in active_rows
-                    if Path(str(row.get("path", ""))).resolve() == resolved
+                    if lexical_path_key(str(row.get("path", ""))) == path_key
                 ]
                 proven_other_actor = bool(covering) and all(
                     str(row.get("actor", ""))
@@ -427,8 +718,12 @@ def main() -> int:
             if args.event != "session-end":
                 run_due_audit()
             return 0
-        all_claimed_paths = {Path(row["path"]).resolve() for row in active_rows}
-        unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
+        all_claimed_paths = {
+            lexical_path_key(str(row["path"])) for row in active_rows
+        }
+        unclaimed = [
+            path for path in paths if lexical_path_key(path) not in all_claimed_paths
+        ]
         if not unclaimed:
             if args.event != "session-end":
                 run_due_audit()
@@ -453,10 +748,9 @@ def main() -> int:
         state_mtime = STATE_DB.stat().st_mtime if STATE_DB.exists() else 0
         path_mtimes: list[float] = []
         for path in paths:
-            try:
-                path_mtimes.append(path.stat().st_mtime)
-            except OSError:
-                continue
+            modified_at = safe_path_mtime(path)
+            if modified_at is not None:
+                path_mtimes.append(modified_at)
         if historical_paths() or len(path_mtimes) < len(paths) or max(path_mtimes, default=0) > state_mtime:
             STAMP_ROOT.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha1(session_key(payload, args.actor).encode("utf-8")).hexdigest()[:16]

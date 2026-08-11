@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -404,9 +406,233 @@ class StopHookGitBaselineTests(unittest.TestCase):
             # Windows may briefly keep SQLite handles open after context exit.
             pass
 
+    def record_bound_observation(
+        self,
+        path: Path,
+        *,
+        actor: str = "codex",
+        commit: str | None = None,
+    ) -> None:
+        relative = path.relative_to(self.root).as_posix()
+        observed_commit = commit or git(self.root, "rev-parse", "HEAD")
+        blob_oid = git(self.root, "rev-parse", f"{observed_commit}:{relative}")
+        blob_bytes = subprocess.run(
+            ["git", "-C", str(self.root), "cat-file", "blob", blob_oid],
+            capture_output=True,
+            check=True,
+        ).stdout
+        with sqlite3.connect(self.module.STATE_DB) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS memory_file_observations ("
+                "path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, actor TEXT NOT NULL, "
+                "session_hash TEXT NOT NULL DEFAULT '', git_commit TEXT NOT NULL, "
+                "git_blob_oid TEXT NOT NULL, git_blob_sha256 TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_file_observations VALUES (?, ?, ?, 'session', ?, ?, ?)",
+                (
+                    str(path),
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                    actor,
+                    observed_commit,
+                    blob_oid,
+                    hashlib.sha256(blob_bytes).hexdigest(),
+                ),
+            )
+
     def test_dirty_markdown_is_detected_under_renamed_vault(self) -> None:
         self.note.write_text("# Agent Memory\n\nChanged.\n", encoding="utf-8")
         self.assertEqual(self.module.dirty_paths(), [self.note.resolve()])
+
+    def test_lexical_identity_preserves_unicode_and_windows_case_rules(self) -> None:
+        unicode_path = self.vault / "项目" / "记忆-ß.md"
+        normalized = self.module.normalize_path("Agent记忆/项目/记忆-ß.md")
+        self.assertEqual(normalized, unicode_path.absolute())
+        self.assertEqual(
+            self.module.lexical_path_key(normalized),
+            self.module.lexical_path_key(unicode_path),
+        )
+        case_variant = Path(str(unicode_path.parent).upper()) / unicode_path.name
+        if os.name == "nt":
+            self.assertEqual(
+                self.module.lexical_path_key(case_variant),
+                self.module.lexical_path_key(unicode_path),
+            )
+        else:
+            self.assertNotEqual(
+                self.module.lexical_path_key(case_variant),
+                self.module.lexical_path_key(unicode_path),
+            )
+
+    def test_observation_lookup_uses_platform_lexical_case_key(self) -> None:
+        self.record_bound_observation(self.note, commit=self.baseline)
+        stored_path = self.note
+        if os.name == "nt":
+            stored_path = Path(str(self.note.parent).upper()) / self.note.name
+            with sqlite3.connect(self.module.STATE_DB) as conn:
+                conn.execute(
+                    "UPDATE memory_file_observations SET path=?",
+                    (str(stored_path),),
+                )
+
+        self.assertEqual(self.module.unobserved_paths([self.note.absolute()]), [])
+
+    def test_porcelain_z_rename_keeps_lexical_old_and_new_paths(self) -> None:
+        old_path = self.vault / "项目" / "旧记忆.md"
+        new_path = self.vault / "项目" / "新记忆.md"
+        old_path.parent.mkdir()
+        old_path.write_text("# Rename me\n", encoding="utf-8")
+        git(self.root, "add", "Agent记忆/项目/旧记忆.md")
+        git(self.root, "commit", "-qm", "add rename source")
+        rename_baseline = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "mv", "Agent记忆/项目/旧记忆.md", "Agent记忆/项目/新记忆.md")
+
+        self.assertEqual(
+            {self.module.lexical_path_key(path) for path in self.module.dirty_paths()},
+            {
+                self.module.lexical_path_key(old_path),
+                self.module.lexical_path_key(new_path),
+            },
+        )
+        self.assertEqual(
+            self.module.parse_porcelain_z(
+                "C  Agent记忆/项目/副本.md\0Agent记忆/项目/源.md\0"
+            ),
+            ["Agent记忆/项目/副本.md"],
+        )
+        git(self.root, "commit", "-qm", "rename memory")
+        self.log_path.write_text(
+            json.dumps({"git_observed_through": rename_baseline}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            {self.module.lexical_path_key(path) for path in self.module.historical_paths()},
+            {
+                self.module.lexical_path_key(old_path),
+                self.module.lexical_path_key(new_path),
+            },
+        )
+
+    def test_dirty_symlink_escape_keeps_lexical_path_pending_without_reading_target(self) -> None:
+        external = self.root / "outside.md"
+        external.write_text("# Outside target\n", encoding="utf-8")
+        self.note.unlink()
+        try:
+            self.note.symlink_to(external)
+        except OSError as exc:
+            self.note.write_text("# Agent Memory\n", encoding="utf-8")
+            self.skipTest(f"filesystem symlink unavailable: {exc}")
+        self.assertIn(
+            "T",
+            git(self.root, "status", "--porcelain=v1", "--", "Agent记忆/AGENTS.md")[:2],
+        )
+
+        with mock.patch.object(
+            self.module,
+            "file_sha256",
+            side_effect=AssertionError("dirty symlink target must never be read"),
+        ), mock.patch.object(
+            self.module,
+            "parse_args",
+            return_value=types.SimpleNamespace(
+                actor="claude",
+                protocol="claude",
+                event="stop-hook",
+                non_blocking=False,
+                auto_closeout=True,
+                timeout=30,
+            ),
+        ), mock.patch.object(
+            self.module,
+            "read_payload",
+            return_value={"session_id": "symlink-stop-session"},
+        ), mock.patch.object(
+            self.module,
+            "active_claim_rows",
+            return_value=[],
+        ), mock.patch.object(
+            self.module,
+            "all_active_claim_rows",
+            return_value=[],
+        ), mock.patch.object(
+            self.module,
+            "audit_lifecycle_failure",
+        ), mock.patch.object(
+            self.module,
+            "notify",
+        ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(self.module.dirty_paths(), [self.note.absolute()])
+            self.assertEqual(self.module.pending_paths(), [self.note.absolute()])
+            self.assertIsNone(self.module.safe_path_mtime(self.note.absolute()))
+            self.assertEqual(self.module.main(), 0)
+        decision = json.loads(stdout.getvalue())
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("not claimed", decision["reason"])
+
+    def test_parent_component_symlink_escape_is_pending_when_supported(self) -> None:
+        project = self.vault / "项目"
+        note = project / "note.md"
+        project.mkdir()
+        note.write_text("# Project note\n", encoding="utf-8")
+        git(self.root, "add", "Agent记忆/项目/note.md")
+        git(self.root, "commit", "-qm", "add project note")
+        external = self.root / "outside-project"
+        external.mkdir()
+        (external / "note.md").write_text("# External project note\n", encoding="utf-8")
+        shutil.rmtree(project)
+        try:
+            project.symlink_to(external, target_is_directory=True)
+        except OSError as exc:
+            project.mkdir()
+            note.write_text("# Project note\n", encoding="utf-8")
+            self.skipTest(f"directory symlink unavailable: {exc}")
+
+        with mock.patch.object(
+            self.module,
+            "file_sha256",
+            side_effect=AssertionError("parent symlink target must never be read"),
+        ):
+            self.assertIn(note.absolute(), self.module.dirty_paths())
+            self.assertIn(note.absolute(), self.module.pending_paths())
+
+    def test_historical_regular_to_symlink_mode_stays_pending_with_matching_bytes(self) -> None:
+        self.record_bound_observation(self.note, commit=self.baseline)
+        old_blob = git(self.root, "rev-parse", f"{self.baseline}:Agent记忆/AGENTS.md")
+        git(self.root, "update-index", "--cacheinfo", f"120000,{old_blob},Agent记忆/AGENTS.md")
+        git(self.root, "commit", "-qm", "change note to symlink mode")
+        git(self.root, "config", "core.symlinks", "false")
+        git(self.root, "checkout", "-f", "HEAD")
+        self.assertEqual(
+            git(self.root, "status", "--porcelain=v1", "--", "Agent记忆/AGENTS.md"),
+            "",
+        )
+        self.assertTrue(
+            git(self.root, "ls-tree", "HEAD", "--", "Agent记忆/AGENTS.md").startswith(
+                "120000 blob "
+            )
+        )
+        self.log_path.write_text(
+            json.dumps({"git_observed_through": self.baseline}) + "\n",
+            encoding="utf-8",
+        )
+
+        lexical_note = self.note.absolute()
+        self.assertEqual(self.module.historical_paths(), [lexical_note])
+        self.assertEqual(self.module.unobserved_paths([lexical_note]), [lexical_note])
+        self.assertIn(lexical_note, self.module.pending_paths())
+
+    def test_historical_regular_to_gitlink_mode_stays_pending(self) -> None:
+        self.record_bound_observation(self.note, commit=self.baseline)
+        git(self.root, "update-index", "--cacheinfo", f"160000,{self.baseline},Agent记忆/AGENTS.md")
+        git(self.root, "commit", "-qm", "change note to gitlink mode")
+        self.log_path.write_text(
+            json.dumps({"git_observed_through": self.baseline}) + "\n",
+            encoding="utf-8",
+        )
+
+        lexical_note = self.note.absolute()
+        self.assertEqual(self.module.historical_paths(), [lexical_note])
+        self.assertEqual(self.module.unobserved_paths([lexical_note]), [lexical_note])
 
     def test_missing_markdown_path_is_not_silently_dropped(self) -> None:
         missing = self.vault / "missing.md"
@@ -435,13 +661,7 @@ class StopHookGitBaselineTests(unittest.TestCase):
             json.dumps({"git_observed_through": self.baseline}) + "\n",
             encoding="utf-8",
         )
-        digest = hashlib.sha256(self.note.read_bytes()).hexdigest()
-        with sqlite3.connect(self.module.STATE_DB) as conn:
-            conn.execute("CREATE TABLE memory_file_observations (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)")
-            conn.execute(
-                "INSERT INTO memory_file_observations(path, sha256) VALUES (?, ?)",
-                (str(self.note), digest),
-            )
+        self.record_bound_observation(self.note)
 
         self.assertEqual(self.module.historical_paths(), [self.note.resolve()])
         self.assertEqual(self.module.pending_paths(), [])
