@@ -284,7 +284,13 @@ class StopHookProtocolTests(unittest.TestCase):
             mock.patch.object(
                 self.module,
                 "all_active_claim_rows",
-                return_value=[{"path": str(pending)}],
+                return_value=[
+                    {
+                        "path": str(pending),
+                        "actor": "codex",
+                        "session_hash": "1" * 16,
+                    }
+                ],
             ),
             mock.patch.object(self.module, "run_due_audit") as audit,
             contextlib.redirect_stdout(stdout),
@@ -293,6 +299,81 @@ class StopHookProtocolTests(unittest.TestCase):
         self.assertEqual(returncode, 0)
         self.assertEqual(stdout.getvalue(), "")
         audit.assert_called_once()
+
+    def test_missing_session_same_actor_claim_blocks_claude_and_codebuddy_first_stop(self) -> None:
+        pending = Path("/tmp/same-actor-session-unknown.md").resolve()
+        for actor in ("claude", "codebuddy"):
+            with self.subTest(actor=actor):
+                args = types.SimpleNamespace(
+                    actor=actor,
+                    protocol="claude",
+                    event="stop-hook",
+                    non_blocking=False,
+                    auto_closeout=True,
+                    timeout=300,
+                )
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(self.module, "parse_args", return_value=args),
+                    mock.patch.object(self.module, "read_payload", return_value={}),
+                    mock.patch.object(self.module, "pending_paths", return_value=[pending]),
+                    mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+                    mock.patch.object(
+                        self.module,
+                        "all_active_claim_rows",
+                        return_value=[
+                            {
+                                "path": str(pending),
+                                "actor": actor,
+                                "session_hash": "2" * 16,
+                            }
+                        ],
+                    ),
+                    mock.patch.object(self.module, "notify"),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    returncode = self.module.main()
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(returncode, 0)
+                self.assertEqual(payload["decision"], "block")
+                self.assertIn("session id", payload["reason"])
+
+    def test_missing_session_same_actor_session_end_audits_and_notifies_nonblocking(self) -> None:
+        pending = Path("/tmp/session-end-session-unknown.md").resolve()
+        args = types.SimpleNamespace(
+            actor="claude",
+            protocol="claude",
+            event="session-end",
+            non_blocking=True,
+            auto_closeout=True,
+            timeout=55,
+        )
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(self.module, "parse_args", return_value=args),
+            mock.patch.object(self.module, "read_payload", return_value={}),
+            mock.patch.object(self.module, "pending_paths", return_value=[pending]),
+            mock.patch.object(self.module, "active_claim_rows", return_value=[]),
+            mock.patch.object(
+                self.module,
+                "all_active_claim_rows",
+                return_value=[
+                    {
+                        "path": str(pending),
+                        "actor": "claude",
+                        "session_hash": "3" * 16,
+                    }
+                ],
+            ),
+            mock.patch.object(self.module, "notify") as notified,
+            mock.patch.object(self.module, "audit_lifecycle_failure") as audited,
+            contextlib.redirect_stdout(stdout),
+        ):
+            returncode = self.module.main()
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        notified.assert_called_once()
+        audited.assert_called_once()
 
 
 class StopHookGitBaselineTests(unittest.TestCase):
@@ -366,6 +447,29 @@ class StopHookGitBaselineTests(unittest.TestCase):
         self.assertEqual(self.module.pending_paths(), [])
 
         self.note.write_text("# Agent Memory\n\nChanged again.\n", encoding="utf-8")
+        self.assertEqual(self.module.pending_paths(), [self.note.resolve()])
+
+    def test_matching_self_attested_human_observation_cannot_silence_stop(self) -> None:
+        self.note.write_text("# Agent Memory\n\nCommitted externally.\n", encoding="utf-8")
+        git(self.root, "add", "Agent记忆/AGENTS.md")
+        git(self.root, "commit", "-qm", "external commit")
+        self.log_path.write_text(
+            json.dumps({"git_observed_through": self.baseline}) + "\n",
+            encoding="utf-8",
+        )
+        digest = hashlib.sha256(self.note.read_bytes()).hexdigest()
+        with sqlite3.connect(self.module.STATE_DB) as conn:
+            conn.execute(
+                "CREATE TABLE memory_file_observations ("
+                "path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, actor TEXT NOT NULL, "
+                "session_hash TEXT NOT NULL DEFAULT '')"
+            )
+            conn.execute(
+                "INSERT INTO memory_file_observations(path, sha256, actor, session_hash) "
+                "VALUES (?, ?, 'human', '')",
+                (str(self.note), digest),
+            )
+
         self.assertEqual(self.module.pending_paths(), [self.note.resolve()])
 
 

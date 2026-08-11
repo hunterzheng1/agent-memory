@@ -15,6 +15,7 @@ from typing import Any
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_claim import active_claim_rows, all_active_claim_rows
 from agent_memory_host import actor_names, resolve
+from agent_memory_state import secure_append_text
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ LOG_PATH = resolve_config_path(env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs
 CLOSEOUT_SCRIPT = REPO_ROOT / "scripts" / "agent_memory_closeout.py"
 AUDIT_AUTORUN = REPO_ROOT / "scripts" / "agent_memory_audit_autorun.py"
 STAMP_ROOT = CONFIG_ROOT / "hooks"
+HOOK_AUDIT_LOG = CONFIG_ROOT / "logs" / "stop-hook.jsonl"
 
 
 def default_git_root() -> Path:
@@ -182,10 +184,20 @@ def unobserved_paths(paths: list[Path]) -> list[Path]:
     try:
         with sqlite3.connect(STATE_DB, timeout=5) as conn:
             conn.execute("PRAGMA busy_timeout=5000")
-            rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(memory_file_observations)")
+            }
+            actor_expression = "actor" if "actor" in columns else "'' AS actor"
+            rows = conn.execute(
+                f"SELECT path, sha256, {actor_expression} FROM memory_file_observations"
+            ).fetchall()
     except (OSError, sqlite3.Error):
         return paths
-    indexed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    indexed = {
+        str(Path(str(path)).resolve()): (str(digest), str(actor))
+        for path, digest, actor in rows
+    }
     stale: list[Path] = []
     for path in paths:
         try:
@@ -193,14 +205,22 @@ def unobserved_paths(paths: list[Path]) -> list[Path]:
         except OSError:
             stale.append(path)
             continue
-        if indexed.get(str(path.resolve())) != current:
+        observation = indexed.get(str(path.resolve()))
+        if observation is None or observation[0] != current or observation[1] == "human":
             stale.append(path)
     return stale
 
 
 def pending_paths() -> list[Path]:
-    candidates = list(dict.fromkeys([*historical_paths(), *dirty_paths()]))
-    return unobserved_paths(candidates)
+    # A prior committed observation can explain Git history, never a currently
+    # dirty worktree. Keeping dirty paths unconditional closes the post-commit
+    # race where stale observation state otherwise silenced a new edit.
+    dirty = list(dict.fromkeys(dirty_paths()))
+    dirty_set = {path.resolve() for path in dirty}
+    historical = [
+        path for path in historical_paths() if path.resolve() not in dirty_set
+    ]
+    return list(dict.fromkeys([*dirty, *unobserved_paths(historical)]))
 
 
 def notify(message: str) -> None:
@@ -289,11 +309,49 @@ def handle_failure(
     event: str,
     non_blocking: bool,
 ) -> int:
+    audit_lifecycle_failure(
+        protocol,
+        result,
+        payload=payload,
+        event=event,
+    )
     return report_failure(
         protocol,
         result,
         non_blocking=non_blocking or event == "session-end" or stop_hook_reentry(payload, event),
     )
+
+
+def audit_lifecycle_failure(
+    protocol: str,
+    result: dict[str, Any],
+    *,
+    payload: dict[str, object],
+    event: str,
+) -> None:
+    """Persist a privacy-safe lifecycle failure, including non-blocking SessionEnd."""
+
+    actor = str(result.get("actor", ""))
+    session_id = str(payload.get("session_id") or payload.get("sessionId") or "")
+    record = {
+        "time": int(time.time()),
+        "event": event,
+        "protocol": protocol,
+        "actor": actor,
+        "status": str(result.get("status", "error")),
+        "reason": failure_reason(result),
+        "session_present": bool(session_id),
+        "session_hash": hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+        if session_id
+        else "",
+    }
+    try:
+        secure_append_text(
+            HOOK_AUDIT_LOG,
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+    except OSError:
+        return
 
 
 def run_due_audit() -> None:
@@ -332,26 +390,49 @@ def main() -> int:
             non_blocking=args.non_blocking,
         )
     if args.auto_closeout and paths:
-        all_claimed_paths = {Path(row["path"]).resolve() for row in all_active_claim_rows(max_age_hours=24)}
+        active_rows = all_active_claim_rows(max_age_hours=24, read_only=True)
+        if not raw_session_id:
+            ambiguous_paths: list[Path] = []
+            for path in paths:
+                resolved = path.resolve()
+                covering = [
+                    row
+                    for row in active_rows
+                    if Path(str(row.get("path", ""))).resolve() == resolved
+                ]
+                proven_other_actor = bool(covering) and all(
+                    str(row.get("actor", ""))
+                    and str(row.get("actor", "")) != args.actor
+                    for row in covering
+                )
+                if not proven_other_actor:
+                    ambiguous_paths.append(path)
+            if ambiguous_paths:
+                result = {
+                    "status": "error",
+                    "actor": args.actor,
+                    "ownership_error": (
+                        "MISSING_HOST_SESSION_ID: host hook payload has no session id; "
+                        "same-actor or unclaimed memory changes cannot be attributed safely"
+                    ),
+                    "ambiguous_path_count": len(ambiguous_paths),
+                }
+                return handle_failure(
+                    args.protocol,
+                    result,
+                    payload=payload,
+                    event=args.event,
+                    non_blocking=args.non_blocking,
+                )
+            if args.event != "session-end":
+                run_due_audit()
+            return 0
+        all_claimed_paths = {Path(row["path"]).resolve() for row in active_rows}
         unclaimed = [path for path in paths if path.resolve() not in all_claimed_paths]
         if not unclaimed:
             if args.event != "session-end":
                 run_due_audit()
             return 0
-        if not raw_session_id:
-            result = {
-                "status": "error",
-                "ownership_error": (
-                    "host hook payload has no session id; refusing an unscoped memory closeout"
-                ),
-            }
-            return handle_failure(
-                args.protocol,
-                result,
-                payload=payload,
-                event=args.event,
-                non_blocking=args.non_blocking,
-            )
         if unclaimed:
             result = {
                 "status": "error",

@@ -10,9 +10,10 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, Callable
 
 from agent_memory_env import env_value, resolve_config_path
 from agent_memory_host import actor_names, resolve
@@ -46,8 +47,20 @@ FORMAL_TOP_LEVEL_FILES = {
     "README.md",
     "STRUCTURE.md",
 }
-DELETED_OBSERVATION_RE = re.compile(r"^deleted:([0-9a-f]{40}):([0-9a-f]{64})$")
+DELETED_OBSERVATION_RE = re.compile(
+    r"^deleted:((?:[0-9a-f]{40}|[0-9a-f]{64})):([0-9a-f]{64})$"
+)
 DELETION_OBSERVATION_LOCK = CONFIG_ROOT / "locks" / "closeout.lock"
+SELF_ATTESTED_APPROVAL = "self_attested"
+TRUSTED_APPROVAL = "trusted_verifier"
+TRUSTED_APPROVAL_REQUIRED = "TRUSTED_APPROVAL_VERIFIER_REQUIRED"
+ApprovalVerifier = Callable[[dict[str, Any]], dict[str, Any]]
+StoredApprovalVerifier = Callable[[dict[str, Any]], bool]
+
+# Deliberately not configurable through CLI/environment. A future independently
+# trusted verifier may install this process-local seam; same-privilege actors
+# cannot turn self-attestation into authorization.
+TRUSTED_STORED_APPROVAL_VERIFIER: StoredApprovalVerifier | None = None
 
 
 def utc_now() -> str:
@@ -125,6 +138,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           sha256 TEXT NOT NULL,
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL DEFAULT '',
+          git_commit TEXT NOT NULL DEFAULT '',
+          git_blob_oid TEXT NOT NULL DEFAULT '',
+          git_blob_sha256 TEXT NOT NULL DEFAULT '',
           observed_at TEXT NOT NULL
         )
         """
@@ -138,6 +154,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           sentinel TEXT NOT NULL,
           actor TEXT NOT NULL,
           user_authorized INTEGER NOT NULL,
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
+          approval_receipt_sha256 TEXT NOT NULL DEFAULT '',
           deletion_commit TEXT NOT NULL,
           parent_commit TEXT NOT NULL,
           prior_sha256 TEXT NOT NULL,
@@ -159,6 +178,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           sha256 TEXT NOT NULL,
           actor TEXT NOT NULL,
           user_authorized INTEGER NOT NULL,
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
+          approval_receipt_sha256 TEXT NOT NULL DEFAULT '',
           intent_id TEXT NOT NULL,
           receipt_id TEXT NOT NULL,
           proposal_commit TEXT NOT NULL,
@@ -182,40 +204,189 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
         "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
     )
+    for table in ("memory_deletion_observations", "memory_committed_observations"):
+        recovery_columns = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for name, definition in (
+            ("approval_trust", "TEXT NOT NULL DEFAULT 'self_attested'"),
+            ("can_authorize_action", "INTEGER NOT NULL DEFAULT 0"),
+            ("approval_receipt_sha256", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in recovery_columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+    file_observation_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(memory_file_observations)")
+    }
+    for name in ("git_commit", "git_blob_oid", "git_blob_sha256"):
+        if name not in file_observation_columns:
+            conn.execute(
+                f"ALTER TABLE memory_file_observations ADD COLUMN {name} "
+                "TEXT NOT NULL DEFAULT ''"
+            )
     write_intent.ensure_schema(conn)
     conn.commit()
 
 
-def record_file_observations(raw_session_id: str, actor: str, paths: list[Path]) -> int:
-    rows: list[tuple[str, str, str]] = []
+def _trusted_observation(
+    observation: dict[str, Any],
+    approval_verifier: ApprovalVerifier | None,
+) -> dict[str, Any]:
+    """Upgrade a preview only through an independently supplied verifier seam."""
+
+    if approval_verifier is None:
+        raise ValueError(TRUSTED_APPROVAL_REQUIRED)
+    subject = {
+        key: observation[key]
+        for key in sorted(observation)
+        if key not in {"approval_trust", "can_authorize_action", "approval_receipt_sha256"}
+    }
+    try:
+        verdict = approval_verifier(subject)
+    except Exception as exc:
+        raise ValueError(TRUSTED_APPROVAL_REQUIRED) from exc
+    if not isinstance(verdict, dict):
+        raise ValueError(TRUSTED_APPROVAL_REQUIRED)
+    trust = str(verdict.get("approval_trust", ""))
+    can_authorize = verdict.get("can_authorize_action") is True
+    receipt_sha256 = str(verdict.get("receipt_sha256", "")).strip().lower()
+    if (
+        trust != TRUSTED_APPROVAL
+        or not can_authorize
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+    ):
+        raise ValueError(TRUSTED_APPROVAL_REQUIRED)
+    trusted = dict(observation)
+    trusted.update(
+        {
+            "approval_trust": trust,
+            "can_authorize_action": True,
+            "approval_receipt_sha256": receipt_sha256,
+        }
+    )
+    return trusted
+
+
+def stored_observation_has_trusted_approval(
+    observation_kind: str,
+    record: dict[str, Any],
+    *,
+    verifier: StoredApprovalVerifier | None = None,
+) -> bool:
+    """Fail closed unless a process-local verifier validates the stored receipt."""
+
+    selected = verifier or TRUSTED_STORED_APPROVAL_VERIFIER
+    receipt_sha256 = str(record.get("approval_receipt_sha256", "")).strip().lower()
+    if (
+        observation_kind not in {"deletion", "committed"}
+        or str(record.get("approval_trust", "")) != TRUSTED_APPROVAL
+        or record.get("can_authorize_action") not in {1, True}
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+        or selected is None
+    ):
+        return False
+    subject = dict(record)
+    subject["observation_kind"] = observation_kind
+    try:
+        return selected(subject) is True
+    except Exception:
+        return False
+
+
+def record_file_observations(
+    raw_session_id: str,
+    actor: str,
+    paths: list[Path],
+    *,
+    committed_bindings: dict[str, dict[str, str]] | None = None,
+) -> int:
+    """Record immutable commit snapshots after a final raw-worktree CAS."""
+
+    bindings = committed_bindings or {}
+    rows: list[tuple[str, str, str, str, str, str]] = []
     for raw_path in paths:
-        path = raw_path.resolve()
-        if not path.is_file() or path.suffix.lower() != ".md":
-            continue
+        # Preserve the lexical path so a post-commit replacement with a
+        # symlink cannot redirect either the CAS read or the binding lookup.
+        path = Path(os.path.abspath(str(raw_path.expanduser())))
         try:
-            rel_path = path.relative_to(VAULT_ROOT).as_posix()
-        except ValueError:
-            continue
-        rows.append((str(path), rel_path, file_sha256(path)))
+            rel_path = path.relative_to(VAULT_ROOT.resolve(strict=False)).as_posix()
+        except ValueError as exc:
+            raise ValueError("COMMITTED_OBSERVATION_PATH_OUTSIDE_VAULT") from exc
+        if path.suffix.lower() != ".md":
+            raise ValueError(f"COMMITTED_OBSERVATION_PATH_INVALID: {rel_path}")
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"CONTENT_CHANGED_AFTER_COMMIT: {rel_path}")
+        binding = bindings.get(str(path))
+        if not isinstance(binding, dict):
+            raise ValueError(f"COMMITTED_OBSERVATION_BINDING_REQUIRED: {rel_path}")
+        expected_raw_sha256 = str(binding.get("raw_sha256", "")).strip().lower()
+        commit = str(binding.get("git_commit", "")).strip().lower()
+        expected_blob_oid = str(binding.get("git_blob_oid", "")).strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", expected_raw_sha256) is None:
+            raise ValueError(f"COMMITTED_OBSERVATION_BINDING_INVALID: {rel_path}")
+        try:
+            repo_path = path.relative_to(GIT_ROOT).as_posix()
+            resolved_commit = _resolved_commit(commit)
+            actual_blob_oid = _git_blob_oid(resolved_commit, repo_path)
+        except ValueError as exc:
+            raise ValueError(f"COMMITTED_OBSERVATION_BINDING_INVALID: {rel_path}") from exc
+        if actual_blob_oid != expected_blob_oid:
+            raise ValueError(f"COMMITTED_OBSERVATION_BLOB_CHANGED: {rel_path}")
+        blob_result = _run_git("cat-file", "blob", actual_blob_oid)
+        if blob_result.returncode != 0:
+            raise ValueError(f"COMMITTED_OBSERVATION_BLOB_UNREADABLE: {rel_path}")
+        try:
+            current_bytes = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"CONTENT_CHANGED_AFTER_COMMIT: {rel_path}") from exc
+        current_raw_sha256 = hashlib.sha256(current_bytes).hexdigest()
+        if current_raw_sha256 != expected_raw_sha256:
+            raise ValueError(f"CONTENT_CHANGED_AFTER_COMMIT: {rel_path}")
+        if _clean_filtered_blob_oid(current_bytes, repo_path) != actual_blob_oid:
+            raise ValueError(f"COMMITTED_OBSERVATION_BLOB_MISMATCH: {rel_path}")
+        rows.append(
+            (
+                str(path),
+                rel_path,
+                expected_raw_sha256,
+                resolved_commit,
+                actual_blob_oid,
+                hashlib.sha256(blob_result.stdout).hexdigest(),
+            )
+        )
     if not rows:
         return 0
     now = utc_now()
     hashed = session_hash(raw_session_id)
     with connect() as conn:
-        for path, rel_path, digest in rows:
+        for path, rel_path, digest, git_commit, git_blob_oid, git_blob_sha256 in rows:
             conn.execute(
                 """
                 INSERT INTO memory_file_observations (
-                  path, rel_path, sha256, actor, session_hash, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                  path, rel_path, sha256, actor, session_hash,
+                  git_commit, git_blob_oid, git_blob_sha256, observed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                   rel_path=excluded.rel_path,
                   sha256=excluded.sha256,
                   actor=excluded.actor,
                   session_hash=excluded.session_hash,
+                  git_commit=excluded.git_commit,
+                  git_blob_oid=excluded.git_blob_oid,
+                  git_blob_sha256=excluded.git_blob_sha256,
                   observed_at=excluded.observed_at
                 """,
-                (path, rel_path, digest, actor, hashed, now),
+                (
+                    path,
+                    rel_path,
+                    digest,
+                    actor,
+                    hashed,
+                    git_commit,
+                    git_blob_oid,
+                    git_blob_sha256,
+                    now,
+                ),
             )
         conn.commit()
     return len(rows)
@@ -286,30 +457,111 @@ def _path_is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def _is_recognized_trash_path(path: Path) -> bool:
-    """Accept real platform Trash roots, never a lookalike path component."""
+def _configured_trash_root() -> Path | None:
+    raw = os.environ.get("AGENT_MEMORY_TRASH_ROOT", "").strip()
+    if not raw:
+        return None
+    lexical = Path(raw).expanduser()
+    if not lexical.is_absolute() or lexical.is_symlink():
+        return None
+    try:
+        root = lexical.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not root.is_dir() or root == Path(root.anchor):
+        return None
+    # A configured recovery root must not alias the repository or vault where
+    # the deletion occurred.
+    git_root = GIT_ROOT.resolve(strict=False)
+    vault_root = VAULT_ROOT.resolve(strict=False)
+    if any(
+        (
+            root == git_root,
+            root == vault_root,
+            _path_is_within(root, git_root),
+            _path_is_within(git_root, root),
+            _path_is_within(root, vault_root),
+            _path_is_within(vault_root, root),
+        )
+    ):
+        return None
+    return root
 
-    home_trash = (Path.home() / ".Trash").resolve(strict=False)
-    if _path_is_within(path, home_trash):
-        return True
-    xdg_root = Path(
-        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-    ).expanduser().resolve(strict=False)
-    if _path_is_within(path, xdg_root / "Trash" / "files"):
-        return True
-    if os.name == "nt":
-        recycle_root = Path(path.anchor) / "$Recycle.Bin"
-        return bool(path.anchor) and _path_is_within(path, recycle_root)
-    if hasattr(os, "getuid"):
+
+def _pure_is_within(path: PurePosixPath, root: PurePosixPath) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _is_recognized_trash_path(
+    path: Path,
+    *,
+    platform: str | None = None,
+    configured_root: Path | None = None,
+    home: Path | None = None,
+    xdg_data_home: Path | None = None,
+    uid: int | None = None,
+) -> bool:
+    """Classify platform Trash layouts; default to rejection on ambiguity."""
+
+    selected_platform = (platform or sys.platform).lower()
+    selected_configured = configured_root if configured_root is not None else _configured_trash_root()
+    if selected_configured is not None:
         try:
-            volume_relative = path.relative_to(Path("/Volumes"))
-        except ValueError:
-            volume_relative = None
-        if volume_relative is not None:
-            parts = volume_relative.parts
-            if len(parts) >= 4 and parts[1:3] == (".Trashes", str(os.getuid())):
-                return True
-    return False
+            configured = selected_configured.resolve(strict=True)
+        except (OSError, RuntimeError):
+            configured = None
+        if configured is not None and configured.is_dir() and _path_is_within(path, configured):
+            return True
+
+    if selected_platform.startswith("win"):
+        candidate = PureWindowsPath(str(path))
+        parts = candidate.parts
+        return bool(
+            re.fullmatch(r"[A-Za-z]:", candidate.drive)
+            and len(parts) >= 4
+            and parts[1].casefold() == "$recycle.bin"
+            and re.fullmatch(r"s-\d+(?:-\d+)+", parts[2], re.IGNORECASE)
+            and parts[3] not in {"", ".", ".."}
+        )
+
+    candidate = PurePosixPath(path.as_posix())
+    selected_home = PurePosixPath((home or Path.home()).as_posix())
+    selected_uid = uid
+    if selected_uid is None and hasattr(os, "getuid"):
+        try:
+            selected_uid = int(os.getuid())
+        except (OSError, ValueError):
+            selected_uid = None
+
+    if selected_platform == "darwin":
+        if _pure_is_within(candidate, selected_home / ".Trash"):
+            return True
+        parts = candidate.parts
+        return bool(
+            selected_uid is not None
+            and len(parts) >= 6
+            and parts[1] == "Volumes"
+            and parts[3] == ".Trashes"
+            and parts[4] == str(selected_uid)
+        )
+
+    selected_xdg = PurePosixPath(
+        (xdg_data_home or (home or Path.home()) / ".local" / "share").as_posix()
+    )
+    if _pure_is_within(candidate, selected_xdg / "Trash" / "files"):
+        return True
+    if selected_uid is None:
+        return False
+    parts = candidate.parts
+    return any(
+        part == f".Trash-{selected_uid}"
+        or (part == ".Trash" and index + 1 < len(parts) and parts[index + 1] == str(selected_uid))
+        for index, part in enumerate(parts[:-1])
+    )
 
 
 def _normalize_trash_file(raw: str) -> Path:
@@ -346,6 +598,29 @@ def _run_git(
         raise ValueError("Git validation could not be completed") from exc
 
 
+def git_object_format(*, git_root: Path | None = None) -> str:
+    result = _run_git("rev-parse", "--show-object-format", git_root=git_root)
+    object_format = result.stdout.decode("ascii", errors="ignore").strip().lower()
+    if result.returncode != 0 or object_format not in {"sha1", "sha256"}:
+        raise ValueError("Git object format could not be verified")
+    return object_format
+
+
+def git_oid_length(*, git_root: Path | None = None) -> int:
+    return 64 if git_object_format(git_root=git_root) == "sha256" else 40
+
+
+def git_oid_matches(
+    value: str,
+    *,
+    git_root: Path | None = None,
+    allow_abbreviation: bool = False,
+) -> bool:
+    length = git_oid_length(git_root=git_root)
+    minimum = 7 if allow_abbreviation else length
+    return re.fullmatch(rf"[0-9a-f]{{{minimum},{length}}}", str(value).lower()) is not None
+
+
 def _require_clean_git_path(repo_path: str) -> None:
     result = _run_git(
         "-c",
@@ -365,7 +640,7 @@ def _require_clean_git_path(repo_path: str) -> None:
 
 def _resolved_commit(raw_commit: str, *, git_root: Path | None = None) -> str:
     candidate = raw_commit.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{7,40}", candidate):
+    if not git_oid_matches(candidate, git_root=git_root, allow_abbreviation=True):
         raise ValueError("commit must be a hexadecimal Git commit id")
     result = _run_git(
         "rev-parse",
@@ -374,9 +649,94 @@ def _resolved_commit(raw_commit: str, *, git_root: Path | None = None) -> str:
         git_root=git_root,
     )
     resolved = result.stdout.decode("ascii", errors="ignore").strip().lower()
-    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", resolved):
+    if result.returncode != 0 or not git_oid_matches(resolved, git_root=git_root):
         raise ValueError("commit cannot be resolved")
     return resolved
+
+
+def _git_tree_entry(
+    commit: str,
+    repo_path: str,
+    *,
+    git_root: Path | None = None,
+) -> tuple[str, str, str]:
+    """Return an exact NUL-delimited tree entry without following its type."""
+
+    result = _run_git("ls-tree", "-z", commit, "--", repo_path, git_root=git_root)
+    entries = [entry for entry in result.stdout.split(b"\0") if entry]
+    if result.returncode != 0 or len(entries) != 1:
+        raise ValueError("Git tree entry could not be resolved exactly")
+    metadata, separator, raw_path = entries[0].partition(b"\t")
+    fields = metadata.split()
+    try:
+        decoded_path = raw_path.decode("utf-8", errors="strict")
+        mode = fields[0].decode("ascii", errors="strict")
+        object_type = fields[1].decode("ascii", errors="strict")
+        oid = fields[2].decode("ascii", errors="strict").lower()
+    except (IndexError, UnicodeDecodeError) as exc:
+        raise ValueError("Git tree entry is malformed") from exc
+    if (
+        separator != b"\t"
+        or decoded_path != repo_path
+        or not git_oid_matches(oid, git_root=git_root)
+    ):
+        raise ValueError("Git tree entry is malformed")
+    return mode, object_type, oid
+
+
+def _diff_marks_true_deletion(
+    parent_commit: str,
+    deletion_commit: str,
+    repo_path: str,
+    *,
+    git_root: Path | None = None,
+) -> bool:
+    result = _run_git(
+        "-c",
+        "core.quotepath=false",
+        "diff",
+        "--find-renames",
+        "--find-copies",
+        "--name-status",
+        "-z",
+        parent_commit,
+        deletion_commit,
+        "--",
+        git_root=git_root,
+    )
+    if result.returncode != 0:
+        raise ValueError("deletion commit diff could not be verified")
+    parts = [part for part in result.stdout.split(b"\0") if part]
+    index = 0
+    deleted = False
+    while index < len(parts):
+        try:
+            status = parts[index].decode("ascii", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("deletion commit diff is malformed") from exc
+        index += 1
+        if not status:
+            raise ValueError("deletion commit diff is malformed")
+        path_count = 2 if status[0] in {"R", "C"} else 1
+        if index + path_count > len(parts):
+            raise ValueError("deletion commit diff is malformed")
+        try:
+            changed_paths = [
+                part.decode("utf-8", errors="strict")
+                for part in parts[index : index + path_count]
+            ]
+        except UnicodeDecodeError as exc:
+            raise ValueError("deletion commit diff path is not UTF-8") from exc
+        index += path_count
+        if repo_path not in changed_paths:
+            continue
+        if status[0] in {"R", "C"}:
+            raise ValueError("target change is a rename/copy, not a true deletion")
+        if status == "D" and changed_paths == [repo_path]:
+            deleted = True
+        else:
+            raise ValueError("target path change is not a true deletion")
+    return deleted
 
 
 def _deletion_parent_and_prior_sha(
@@ -404,37 +764,20 @@ def _deletion_parent_and_prior_sha(
     ).returncode == 0:
         raise ValueError("deletion commit still contains the target path")
     for parent_commit in tokens[1:]:
-        status_result = _run_git(
-            "-c",
-            "core.quotepath=false",
-            "diff",
-            "--no-renames",
-            "--name-status",
-            "-z",
+        if not _diff_marks_true_deletion(
             parent_commit,
             deletion_commit,
-            "--",
+            repo_path,
+            git_root=git_root,
+        ):
+            continue
+        mode, object_type, blob_oid = _git_tree_entry(
+            parent_commit,
             repo_path,
             git_root=git_root,
         )
-        parts = [part for part in status_result.stdout.split(b"\0") if part]
-        if status_result.returncode != 0 or len(parts) < 2:
-            continue
-        try:
-            changed_path = parts[1].decode("utf-8", errors="strict")
-        except UnicodeDecodeError:
-            continue
-        if parts[0] != b"D" or changed_path != repo_path:
-            continue
-        blob_result = _run_git(
-            "rev-parse",
-            "--verify",
-            f"{parent_commit}:{repo_path}",
-            git_root=git_root,
-        )
-        blob_oid = blob_result.stdout.decode("ascii", errors="ignore").strip().lower()
-        if blob_result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", blob_oid):
-            continue
+        if mode not in {"100644", "100755"} or object_type != "blob":
+            raise ValueError("deletion parent target is not a regular blob mode")
         content_result = _run_git("cat-file", "blob", blob_oid, git_root=git_root)
         if content_result.returncode == 0:
             return parent_commit, hashlib.sha256(content_result.stdout).hexdigest()
@@ -518,6 +861,9 @@ def validate_deletion_observation(
         "sentinel": sentinel,
         "actor": actor,
         "user_authorized": 1,
+        "approval_trust": SELF_ATTESTED_APPROVAL,
+        "can_authorize_action": False,
+        "approval_receipt_sha256": "",
         "deletion_commit": resolved_commit,
         "parent_commit": parent_commit,
         "prior_sha256": prior_sha256,
@@ -557,6 +903,9 @@ def _store_deletion_observation(observation: dict[str, Any]) -> int:
         "sentinel",
         "actor",
         "user_authorized",
+        "approval_trust",
+        "can_authorize_action",
+        "approval_receipt_sha256",
         "deletion_commit",
         "parent_commit",
         "prior_sha256",
@@ -570,6 +919,7 @@ def _store_deletion_observation(observation: dict[str, Any]) -> int:
         existing = conn.execute(
             """
             SELECT observation_id, path, rel_path, sentinel, actor, user_authorized,
+                   approval_trust, can_authorize_action, approval_receipt_sha256,
                    deletion_commit, parent_commit, prior_sha256, trash_sha256,
                    trash_path_sha256, evidence_ref_sha256, evidence_ref_length
             FROM memory_deletion_observations WHERE path=? AND deletion_commit=?
@@ -593,9 +943,10 @@ def _store_deletion_observation(observation: dict[str, Any]) -> int:
                 """
                 INSERT INTO memory_deletion_observations (
                   observation_id, path, rel_path, sentinel, actor, user_authorized,
+                  approval_trust, can_authorize_action, approval_receipt_sha256,
                   deletion_commit, parent_commit, prior_sha256, trash_sha256,
                   trash_path_sha256, evidence_ref_sha256, evidence_ref_length, observed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*expected, now),
             )
@@ -632,6 +983,7 @@ def apply_deletion_observation(
     deletion_commit: str,
     evidence_ref: str,
     user_authorized: bool,
+    approval_verifier: ApprovalVerifier | None = None,
 ) -> int:
     with deletion_observation_lock():
         refreshed = validate_deletion_observation(
@@ -644,7 +996,8 @@ def apply_deletion_observation(
         )
         if refreshed != observation:
             raise ValueError("deletion evidence changed between preview and apply")
-        return _store_deletion_observation(refreshed)
+        trusted = _trusted_observation(refreshed, approval_verifier)
+        return _store_deletion_observation(trusted)
 
 
 def safe_deletion_observation_payload(observation: dict[str, Any]) -> dict[str, Any]:
@@ -655,6 +1008,8 @@ def safe_deletion_observation_payload(observation: dict[str, Any]) -> dict[str, 
             "sentinel",
             "actor",
             "user_authorized",
+            "approval_trust",
+            "can_authorize_action",
             "deletion_commit",
             "parent_commit",
             "prior_sha256",
@@ -678,10 +1033,12 @@ def _normalize_existing_formal_path(raw: str) -> tuple[Path, str, str]:
 
 
 def _git_blob_oid(commit: str, repo_path: str) -> str:
-    result = _run_git("rev-parse", "--verify", f"{commit}:{repo_path}")
-    oid = result.stdout.decode("ascii", errors="ignore").strip().lower()
-    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
-        raise ValueError("committed target blob could not be resolved")
+    try:
+        mode, object_type, oid = _git_tree_entry(commit, repo_path)
+    except ValueError as exc:
+        raise ValueError("committed target blob could not be resolved") from exc
+    if mode not in {"100644", "100755"} or object_type != "blob":
+        raise ValueError("committed target is not a regular blob mode")
     return oid
 
 
@@ -705,7 +1062,7 @@ def _clean_filtered_blob_oid(data: bytes, repo_path: str) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError("Git clean-filter validation could not be completed") from exc
     oid = result.stdout.decode("ascii", errors="ignore").strip().lower()
-    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+    if result.returncode != 0 or not git_oid_matches(oid):
         raise ValueError("Git clean-filter validation could not be completed")
     return oid
 
@@ -719,7 +1076,7 @@ def _git_commit_matches_worktree(commit: str, repo_path: str, data: bytes) -> bo
 def _current_git_head() -> str:
     result = _run_git("rev-parse", "--verify", "HEAD^{commit}")
     head = result.stdout.decode("ascii", errors="ignore").strip().lower()
-    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", head):
+    if result.returncode != 0 or not git_oid_matches(head):
         raise ValueError("current Git HEAD could not be resolved")
     return head
 
@@ -779,6 +1136,7 @@ def validate_committed_observation(
     current_sha256 = current_digest.raw_sha256
     current_canonical_sha256 = current_digest.canonical_sha256
     head = _current_git_head()
+    object_oid_length = git_oid_length()
     if not _git_commit_matches_worktree(head, repo_path, current_bytes):
         raise ValueError("target content does not match the current HEAD blob")
 
@@ -865,10 +1223,10 @@ def validate_committed_observation(
         and str(intent.get("safety_input_sha256", "")).lower() == current_sha256
         and int(intent.get("safety_input_length", 0)) > 0
         and re.fullmatch(r"[0-9a-f]{64}", original_evidence) is not None
-        and re.fullmatch(r"[0-9a-f]{40}", proposal_commit) is not None
-        and re.fullmatch(r"[0-9a-f]{40}", base_head) is not None
+        and re.fullmatch(rf"[0-9a-f]{{{object_oid_length}}}", proposal_commit) is not None
+        and re.fullmatch(rf"[0-9a-f]{{{object_oid_length}}}", base_head) is not None
         and base_head != proposal_commit
-        and re.fullmatch(r"[0-9a-f]{40}", validated_head) is not None
+        and re.fullmatch(rf"[0-9a-f]{{{object_oid_length}}}", validated_head) is not None
         and created_at is not None
         and validated_at is not None
         and expires_at is not None
@@ -971,6 +1329,9 @@ def validate_committed_observation(
         "sha256": current_sha256,
         "actor": actor,
         "user_authorized": 1,
+        "approval_trust": SELF_ATTESTED_APPROVAL,
+        "can_authorize_action": False,
+        "approval_receipt_sha256": "",
         "intent_id": intent_id,
         "receipt_id": receipt_id,
         "proposal_commit": proposal_commit,
@@ -992,6 +1353,9 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
         "sha256",
         "actor",
         "user_authorized",
+        "approval_trust",
+        "can_authorize_action",
+        "approval_receipt_sha256",
         "intent_id",
         "receipt_id",
         "proposal_commit",
@@ -1071,6 +1435,16 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
         ):
             conn.rollback()
             raise ValueError("committed target changed before observation apply")
+        try:
+            committed_blob_oid = _git_blob_oid(observation["proposal_commit"], repo_path)
+            committed_blob = _run_git("cat-file", "blob", committed_blob_oid)
+        except ValueError as exc:
+            conn.rollback()
+            raise ValueError("committed target blob changed before observation apply") from exc
+        if committed_blob.returncode != 0:
+            conn.rollback()
+            raise ValueError("committed target blob changed before observation apply")
+        committed_blob_sha256 = hashlib.sha256(committed_blob.stdout).hexdigest()
 
         existing = conn.execute(
             "SELECT " + ", ".join(audit_columns) + " FROM memory_committed_observations "
@@ -1088,7 +1462,7 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
                 raise ValueError("existing committed observation does not match this audit chain")
             stored_head = str(existing["observed_git_head"] or "").lower()
             stored_head_checks = (
-                re.fullmatch(r"[0-9a-f]{40}", stored_head) is not None
+                git_oid_matches(stored_head)
                 and _run_git(
                     "merge-base",
                     "--is-ancestor",
@@ -1121,10 +1495,16 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
                 conn.rollback()
                 raise ValueError("existing committed observation has an invalid observed Git head")
             current = conn.execute(
-                "SELECT sha256 FROM memory_file_observations WHERE path=?",
+                "SELECT sha256, git_commit, git_blob_oid, git_blob_sha256 "
+                "FROM memory_file_observations WHERE path=?",
                 (observation["path"],),
             ).fetchone()
-            if current is not None and str(current[0]) == observation["sha256"]:
+            if current is not None and tuple(str(value) for value in current) == (
+                observation["sha256"],
+                observation["proposal_commit"],
+                committed_blob_oid,
+                committed_blob_sha256,
+            ):
                 conn.rollback()
                 return 0
         else:
@@ -1139,13 +1519,17 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
         conn.execute(
             """
             INSERT INTO memory_file_observations (
-              path, rel_path, sha256, actor, session_hash, observed_at
-            ) VALUES (?, ?, ?, ?, '', ?)
+              path, rel_path, sha256, actor, session_hash,
+              git_commit, git_blob_oid, git_blob_sha256, observed_at
+            ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
               rel_path=excluded.rel_path,
               sha256=excluded.sha256,
               actor=excluded.actor,
               session_hash='',
+              git_commit=excluded.git_commit,
+              git_blob_oid=excluded.git_blob_oid,
+              git_blob_sha256=excluded.git_blob_sha256,
               observed_at=excluded.observed_at
             """,
             (
@@ -1153,6 +1537,9 @@ def _store_committed_observation(observation: dict[str, Any]) -> int:
                 observation["rel_path"],
                 observation["sha256"],
                 observation["actor"],
+                observation["proposal_commit"],
+                committed_blob_oid,
+                committed_blob_sha256,
                 now,
             ),
         )
@@ -1168,6 +1555,7 @@ def apply_committed_observation(
     intent_id: str,
     evidence_ref: str,
     user_authorized: bool,
+    approval_verifier: ApprovalVerifier | None = None,
 ) -> int:
     with deletion_observation_lock():
         refreshed = validate_committed_observation(
@@ -1179,7 +1567,8 @@ def apply_committed_observation(
         )
         if refreshed != observation:
             raise ValueError("committed observation evidence changed between preview and apply")
-        return _store_committed_observation(refreshed)
+        trusted = _trusted_observation(refreshed, approval_verifier)
+        return _store_committed_observation(trusted)
 
 
 def safe_committed_observation_payload(observation: dict[str, Any]) -> dict[str, Any]:
@@ -1190,6 +1579,8 @@ def safe_committed_observation_payload(observation: dict[str, Any]) -> dict[str,
             "sha256",
             "actor",
             "user_authorized",
+            "approval_trust",
+            "can_authorize_action",
             "intent_id",
             "receipt_id",
             "proposal_commit",

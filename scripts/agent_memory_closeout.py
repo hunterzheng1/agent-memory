@@ -26,8 +26,10 @@ from agent_memory_claim import (
     all_active_claim_rows,
     complete_claim_paths,
     deletion_commit_matches_audit,
+    git_oid_matches,
     parse_deleted_observation,
     record_file_observations,
+    stored_observation_has_trusted_approval,
 )
 from agent_memory_safety import KNOWLEDGE_KINDS, SOURCE_CLASSES, assess_source, record_assessment
 from agent_memory_state import secure_append_text, secure_sqlite_connect
@@ -324,8 +326,17 @@ def last_observed_git_head() -> str:
             continue
         for key in ("git_observed_through", "git_head_after", "commit"):
             value = str(item.get(key, ""))
-            if value and value != "skipped" and re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
-                return value
+            lowered = value.lower()
+            if value and value != "skipped":
+                try:
+                    if git_oid_matches(
+                        lowered,
+                        git_root=REPO_ROOT,
+                        allow_abbreviation=True,
+                    ):
+                        return lowered
+                except ValueError:
+                    continue
     return ""
 
 
@@ -957,7 +968,11 @@ def _hash_object_bytes(data: bytes, repo_path: str) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired):
         return False, ""
     object_id = completed.stdout.decode("ascii", errors="ignore").strip().lower()
-    return completed.returncode == 0 and bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id)), object_id
+    try:
+        valid_oid = git_oid_matches(object_id, git_root=REPO_ROOT)
+    except ValueError:
+        valid_oid = False
+    return completed.returncode == 0 and valid_oid, object_id
 
 
 def bind_checked_file_hashes(files: list[Path]) -> tuple[dict[Path, str], dict[str, str]]:
@@ -1163,7 +1178,151 @@ def commit_files(
             return {"ok": False, "stage": "head", "detail": head_result}
         expected_head = str(head_result["stdout"]).strip()
     message = args.message or f"memory closeout[{args.actor}]: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    return _build_isolated_commit(snapshots, expected_head=expected_head, message=message)
+    result = _build_isolated_commit(snapshots, expected_head=expected_head, message=message)
+    if result.get("ok"):
+        result["observation_commit"] = str(result.get("commit") or expected_head)
+        result["snapshot_sha256"] = {
+            snapshot.repo_path: snapshot.raw_sha256 for snapshot in snapshots
+        }
+        result["snapshot_blob_oids"] = {
+            snapshot.repo_path: snapshot.blob_oid for snapshot in snapshots
+        }
+        result["files"] = [snapshot.repo_path for snapshot in snapshots]
+    return result
+
+
+def committed_blob_oid(commit: str, repo_path: str) -> str:
+    result = run_command(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", f"{commit}:{repo_path}"],
+        timeout=30,
+    )
+    oid = str(result.get("stdout", "")).strip().lower()
+    try:
+        valid_oid = git_oid_matches(oid, git_root=REPO_ROOT)
+    except ValueError:
+        valid_oid = False
+    if not result.get("ok") or not valid_oid:
+        raise ValueError(f"COMMITTED_OBSERVATION_BLOB_UNRESOLVED: {repo_path}")
+    return oid
+
+
+def file_observation_matches_git(
+    entry: GitEntry,
+    record: dict[str, str],
+) -> bool:
+    """Revalidate an observation against immutable Git path history."""
+
+    commit = str(record.get("git_commit", "")).strip().lower()
+    blob_oid = str(record.get("git_blob_oid", "")).strip().lower()
+    blob_sha256 = str(record.get("git_blob_sha256", "")).strip().lower()
+    try:
+        if (
+            not git_oid_matches(commit, git_root=REPO_ROOT)
+            or not git_oid_matches(blob_oid, git_root=REPO_ROOT)
+            or re.fullmatch(r"[0-9a-f]{64}", blob_sha256) is None
+        ):
+            return False
+    except ValueError:
+        return False
+
+    head_result = run_command(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--verify", "HEAD^{commit}"],
+        timeout=30,
+    )
+    head = str(head_result.get("stdout", "")).strip().lower()
+    try:
+        head_is_valid = git_oid_matches(head, git_root=REPO_ROOT)
+    except ValueError:
+        head_is_valid = False
+    if not head_result.get("ok") or not head_is_valid:
+        return False
+    ancestry = run_command(
+        ["git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", commit, head],
+        timeout=30,
+    )
+    if ancestry.get("returncode") != 0:
+        return False
+
+    try:
+        tree = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-tree", "-z", commit, "--", entry.repo_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    tree_entries = [item for item in tree.stdout.split(b"\0") if item]
+    if tree.returncode != 0 or len(tree_entries) != 1:
+        return False
+    metadata, separator, raw_path = tree_entries[0].partition(b"\t")
+    fields = metadata.split()
+    try:
+        mode = fields[0].decode("ascii", errors="strict")
+        object_type = fields[1].decode("ascii", errors="strict")
+        actual_blob_oid = fields[2].decode("ascii", errors="strict").lower()
+        decoded_path = raw_path.decode("utf-8", errors="strict")
+    except (IndexError, UnicodeDecodeError):
+        return False
+    if (
+        separator != b"\t"
+        or decoded_path != entry.repo_path
+        or mode not in {"100644", "100755"}
+        or object_type != "blob"
+        or actual_blob_oid != blob_oid
+    ):
+        return False
+
+    try:
+        blob = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "cat-file", "blob", blob_oid],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != blob_sha256:
+        return False
+
+    observed_latest = run_command(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "log",
+            "-1",
+            "--format=%H",
+            commit,
+            "--",
+            entry.repo_path,
+        ],
+        timeout=30,
+    )
+    current_latest = run_command(
+        [
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "log",
+            "-1",
+            "--format=%H",
+            head,
+            "--",
+            entry.repo_path,
+        ],
+        timeout=30,
+    )
+    observed_path_commit = str(observed_latest.get("stdout", "")).strip().lower()
+    current_path_commit = str(current_latest.get("stdout", "")).strip().lower()
+    return bool(
+        observed_latest.get("ok")
+        and current_latest.get("ok")
+        and observed_path_commit
+        and observed_path_commit == current_path_commit
+    )
 
 
 def append_log(payload: dict[str, Any]) -> None:
@@ -1204,11 +1363,25 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
             read_only=True,
             pragmas=("PRAGMA busy_timeout=5000",),
         ) as conn:
-            rows = conn.execute("SELECT path, sha256 FROM memory_file_observations").fetchall()
+            file_observation_columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(memory_file_observations)")
+            }
+            binding_select = [
+                name if name in file_observation_columns else f"'' AS {name}"
+                for name in ("git_commit", "git_blob_oid", "git_blob_sha256")
+            ]
+            rows = conn.execute(
+                "SELECT path, sha256, actor, session_hash, "
+                + ", ".join(binding_select)
+                + " FROM memory_file_observations"
+            ).fetchall()
             try:
                 deletion_rows = conn.execute(
                     """
-                    SELECT path, sentinel, actor, user_authorized,
+                    SELECT observation_id, path, sentinel, actor, user_authorized,
+                           approval_trust, can_authorize_action,
+                           approval_receipt_sha256,
                            deletion_commit, parent_commit, prior_sha256,
                            trash_sha256, trash_path_sha256,
                            evidence_ref_sha256, evidence_ref_length
@@ -1217,16 +1390,67 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
                 ).fetchall()
             except sqlite3.Error:
                 deletion_rows = []
+            try:
+                committed_rows = conn.execute(
+                    """
+                    SELECT observation_id, path, sha256, actor, user_authorized,
+                           approval_trust, can_authorize_action,
+                           approval_receipt_sha256, intent_id, receipt_id,
+                           proposal_commit, observed_git_head, audit_chain_sha256,
+                           evidence_ref_sha256, evidence_ref_length
+                    FROM memory_committed_observations
+                    """
+                ).fetchall()
+            except sqlite3.Error:
+                committed_rows = []
     except (OSError, sqlite3.Error):
         return entries
-    observed = {str(Path(str(path)).resolve()): str(digest) for path, digest in rows}
+    observed = {
+        str(Path(str(row[0])).resolve()): {
+            "sha256": str(row[1]),
+            "actor": str(row[2]),
+            "session_hash": str(row[3]),
+            "git_commit": str(row[4]),
+            "git_blob_oid": str(row[5]),
+            "git_blob_sha256": str(row[6]),
+        }
+        for row in rows
+    }
+    trusted_committed = {
+        (str(Path(str(row[1])).resolve()), str(row[2]))
+        for row in committed_rows
+        if stored_observation_has_trusted_approval(
+            "committed",
+            {
+                "observation_id": row[0],
+                "path": row[1],
+                "sha256": row[2],
+                "actor": row[3],
+                "user_authorized": row[4],
+                "approval_trust": row[5],
+                "can_authorize_action": row[6],
+                "approval_receipt_sha256": row[7],
+                "intent_id": row[8],
+                "receipt_id": row[9],
+                "proposal_commit": row[10],
+                "observed_git_head": row[11],
+                "audit_chain_sha256": row[12],
+                "evidence_ref_sha256": row[13],
+                "evidence_ref_length": row[14],
+            },
+        )
+    }
     deletion_audits: dict[tuple[str, str], tuple[str, str, str]] = {}
     for row in deletion_rows:
         (
+            observation_id,
             path,
             sentinel,
             actor,
             user_authorized,
+            approval_trust,
+            can_authorize_action,
+            approval_receipt_sha256,
             deletion_commit,
             parent_commit,
             prior_sha256,
@@ -1245,9 +1469,29 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
             parsed is None
             or str(actor) != "human"
             or not authorized
+            or not stored_observation_has_trusted_approval(
+                "deletion",
+                {
+                    "observation_id": observation_id,
+                    "path": path,
+                    "sentinel": sentinel,
+                    "actor": actor,
+                    "user_authorized": user_authorized,
+                    "approval_trust": approval_trust,
+                    "can_authorize_action": can_authorize_action,
+                    "approval_receipt_sha256": approval_receipt_sha256,
+                    "deletion_commit": deletion_commit,
+                    "parent_commit": parent_commit,
+                    "prior_sha256": prior_sha256,
+                    "trash_sha256": trash_sha256,
+                    "trash_path_sha256": trash_path_sha256,
+                    "evidence_ref_sha256": evidence_ref_sha256,
+                    "evidence_ref_length": evidence_ref_length,
+                },
+            )
             or parsed != (str(deletion_commit), str(prior_sha256))
             or str(trash_sha256) != str(prior_sha256)
-            or re.fullmatch(r"[0-9a-f]{40}", str(parent_commit)) is None
+            or not git_oid_matches(str(parent_commit), git_root=REPO_ROOT)
             or re.fullmatch(r"[0-9a-f]{64}", str(trash_path_sha256)) is None
             or re.fullmatch(r"[0-9a-f]{64}", str(evidence_ref_sha256)) is None
             or not 0 < evidence_length <= 4096
@@ -1264,7 +1508,7 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
         try:
             digest = hashlib.sha256(entry.path.read_bytes()).hexdigest()
         except OSError:
-            sentinel = observed.get(resolved_path, "")
+            sentinel = str(observed.get(resolved_path, {}).get("sha256", ""))
             parsed = parse_deleted_observation(sentinel)
             audit = deletion_audits.get((resolved_path, sentinel))
             if (
@@ -1300,7 +1544,14 @@ def unobserved_history_entries(entries: list[GitEntry]) -> list[GitEntry]:
                     continue
             pending.append(entry)
             continue
-        if observed.get(resolved_path) != digest:
+        record = observed.get(resolved_path)
+        if record is None or record.get("sha256") != digest:
+            pending.append(entry)
+            continue
+        if record.get("actor") == "human" and (resolved_path, digest) not in trusted_committed:
+            pending.append(entry)
+            continue
+        if not file_observation_matches_git(entry, record):
             pending.append(entry)
     return pending
 
@@ -1426,6 +1677,7 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     }
     intent_validations: list[dict[str, Any]] = []
     intent_error = ""
+    claim_path_by_intent: dict[str, Path] = {}
     try:
         intent_gate = write_intent.enforce_protected_changes(
             [entry.path for entry in process_entries],
@@ -1658,7 +1910,67 @@ def run_closeout(args: argparse.Namespace) -> dict[str, Any]:
     observation_step: dict[str, Any] = {"ok": True, "skipped": True, "detail": "not_completed"}
     if status == "ok" and not args.dry_run and commit_step.get("ok"):
         try:
-            observed = record_file_observations(args.session_id, args.actor, process_files)
+            early_validation_by_path = {
+                claim_path_by_intent[str(validation.get("intent_id", ""))].resolve(): validation
+                for validation in intent_validations
+                if validation.get("ok")
+                and validation.get("early_commit")
+                and str(validation.get("intent_id", "")) in claim_path_by_intent
+            }
+            snapshot_blob_oids = commit_step.get("snapshot_blob_oids", {})
+            if not isinstance(snapshot_blob_oids, dict):
+                snapshot_blob_oids = {}
+            ordinary_commit = str(
+                commit_step.get("observation_commit") or git_head_before
+            ).strip()
+            committed_bindings: dict[str, dict[str, str]] = {}
+            for path in process_files:
+                resolved_path = path.resolve()
+                repo_path = resolved_path.relative_to(REPO_ROOT).as_posix()
+                validation = early_validation_by_path.get(resolved_path)
+                git_commit = str(
+                    validation.get("proposal_commit", "") if validation else ordinary_commit
+                ).strip()
+                raw_sha256 = str(checked_commit_hashes.get(resolved_path, "")).strip()
+                blob_oid = str(snapshot_blob_oids.get(repo_path, "")).strip().lower()
+                if validation or not blob_oid:
+                    blob_oid = committed_blob_oid(git_commit, repo_path)
+                committed_bindings[str(resolved_path)] = {
+                    "raw_sha256": raw_sha256,
+                    "git_commit": git_commit,
+                    "git_blob_oid": blob_oid,
+                }
+            observed = record_file_observations(
+                args.session_id,
+                args.actor,
+                process_files,
+                committed_bindings=committed_bindings,
+            )
+            # The observation transaction records the immutable commit
+            # snapshot. Recheck the raw worktree, scoped status, and HEAD
+            # before releasing claims or advancing the history baseline so a
+            # change immediately after that transaction remains actionable.
+            post_observation_hashes, _ = bind_checked_file_hashes(process_files)
+            if post_observation_hashes != checked_commit_hashes:
+                raise ValueError("CONTENT_CHANGED_AFTER_OBSERVATION")
+            final_git_entries, final_git_warnings = git_status_entries()
+            if final_git_warnings:
+                raise ValueError("POST_OBSERVATION_GIT_STATUS_UNVERIFIED")
+            process_path_set = {path.resolve() for path in process_files}
+            if any(entry.path.resolve() in process_path_set for entry in final_git_entries):
+                raise ValueError("CONTENT_CHANGED_AFTER_OBSERVATION")
+            final_observation_head, final_head_warnings = current_git_head()
+            expected_observation_head = str(
+                commit_step.get("observation_commit")
+                or commit_step.get("commit")
+                or git_head_before
+            ).strip()
+            if (
+                final_head_warnings
+                or not expected_observation_head
+                or final_observation_head != expected_observation_head
+            ):
+                raise ValueError("HEAD_CHANGED_AFTER_OBSERVATION")
             observation_step = {"ok": True, "skipped": False, "detail": f"recorded={observed}"}
         except (OSError, sqlite3.Error, ValueError) as exc:
             observation_step = {"ok": False, "skipped": False, "detail": str(exc)}

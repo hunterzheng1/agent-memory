@@ -132,6 +132,56 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
         self.assertEqual(warnings, [])
         self.assertEqual([entry.repo_path for entry in entries], ["AgentMemory/项目/note.md"])
 
+    def test_history_observation_is_bound_to_latest_path_commit_and_blob(self) -> None:
+        self.module.STATE_DB = self.root / "state.sqlite"
+        repo_path = "AgentMemory/项目/note.md"
+        stable_content = b"# Stable observation\n"
+        self.note.write_bytes(stable_content)
+        git(self.root, "add", repo_path)
+        git(self.root, "commit", "-qm", "observed snapshot")
+        unrelated = self.root / "unrelated.txt"
+        unrelated.write_text("later unrelated snapshot boundary\n", encoding="utf-8")
+        git(self.root, "add", "unrelated.txt")
+        git(self.root, "commit", "-qm", "later unrelated snapshot boundary")
+        observation_commit = git(self.root, "rev-parse", "HEAD")
+        observed_blob = git(self.root, "rev-parse", f"{observation_commit}:{repo_path}")
+        blob_bytes = subprocess.run(
+            ["git", "-C", str(self.root), "cat-file", "blob", observed_blob],
+            capture_output=True,
+            check=True,
+        ).stdout
+        with sqlite3.connect(self.module.STATE_DB) as conn:
+            conn.execute(
+                "CREATE TABLE memory_file_observations ("
+                "path TEXT PRIMARY KEY, rel_path TEXT NOT NULL, sha256 TEXT NOT NULL, "
+                "actor TEXT NOT NULL, session_hash TEXT NOT NULL DEFAULT '', "
+                "git_commit TEXT NOT NULL, git_blob_oid TEXT NOT NULL, "
+                "git_blob_sha256 TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO memory_file_observations VALUES (?, ?, ?, 'codex', 'session', ?, ?, ?)",
+                (
+                    str(self.note),
+                    "项目/note.md",
+                    hashlib.sha256(stable_content).hexdigest(),
+                    observation_commit,
+                    observed_blob,
+                    hashlib.sha256(blob_bytes).hexdigest(),
+                ),
+            )
+        entry = self.module.GitEntry(status="M", repo_path=repo_path, path=self.note)
+
+        self.assertEqual(self.module.unobserved_history_entries([entry]), [])
+
+        self.note.write_text("# Different snapshot\n", encoding="utf-8")
+        git(self.root, "add", repo_path)
+        git(self.root, "commit", "-qm", "later different snapshot")
+        self.note.write_bytes(stable_content)
+        git(self.root, "add", repo_path)
+        git(self.root, "commit", "-qm", "later same bytes")
+
+        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+
     def _record_deleted_observation(
         self,
         path: Path,
@@ -147,13 +197,17 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS memory_file_observations "
-                "(path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
+                "(path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, actor TEXT NOT NULL, "
+                "session_hash TEXT NOT NULL DEFAULT '')"
             )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_deletion_observations (
                   observation_id TEXT PRIMARY KEY, path TEXT NOT NULL, rel_path TEXT NOT NULL,
                   sentinel TEXT NOT NULL, actor TEXT NOT NULL, user_authorized INTEGER NOT NULL,
+                  approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+                  can_authorize_action INTEGER NOT NULL DEFAULT 0,
+                  approval_receipt_sha256 TEXT NOT NULL DEFAULT '',
                   deletion_commit TEXT NOT NULL, parent_commit TEXT NOT NULL,
                   prior_sha256 TEXT NOT NULL, trash_sha256 TEXT NOT NULL,
                   trash_path_sha256 TEXT NOT NULL, evidence_ref_sha256 TEXT NOT NULL,
@@ -162,21 +216,24 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
                 """
             )
             conn.execute(
-                "INSERT OR REPLACE INTO memory_file_observations(path, sha256) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO memory_file_observations"
+                "(path, sha256, actor, session_hash) VALUES (?, ?, 'human', '')",
                 (str(path), sentinel),
             )
             conn.execute(
                 "INSERT INTO memory_deletion_observations "
                 "(observation_id, path, rel_path, sentinel, actor, user_authorized, "
+                "approval_trust, can_authorize_action, approval_receipt_sha256, "
                 "deletion_commit, parent_commit, prior_sha256, trash_sha256, "
                 "trash_path_sha256, evidence_ref_sha256, evidence_ref_length, observed_at) "
-                "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 12, ?)",
+                "VALUES (?, ?, ?, ?, ?, 1, 'trusted_verifier', 1, ?, ?, ?, ?, ?, ?, ?, 12, ?)",
                 (
                     hashlib.sha256((str(path) + actor).encode("utf-8")).hexdigest(),
                     str(path),
                     path.relative_to(self.vault).as_posix(),
                     sentinel,
                     actor,
+                    "ab" * 32,
                     deletion_commit,
                     parent_commit,
                     prior_sha256,
@@ -211,10 +268,15 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
             repo_path="AgentMemory/项目/deleted.md",
             path=deleted,
         )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [])
 
-        git(self.root, "commit", "--allow-empty", "-qm", "unrelated later commit")
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [])
+            git(self.root, "commit", "--allow-empty", "-qm", "unrelated later commit")
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [])
 
         deleted.write_bytes(content)
         git(self.root, "add", "AgentMemory/项目/deleted.md")
@@ -222,6 +284,26 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
         deleted.unlink()
         git(self.root, "add", "-u", "AgentMemory/项目/deleted.md")
         git(self.root, "commit", "-qm", "later deletion")
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+
+    def test_history_rejects_self_attested_deletion_even_if_fields_look_valid(self) -> None:
+        deleted, content, deletion_commit = self._committed_delete("self-attested.md")
+        self.module.STATE_DB = self.root / "state.sqlite"
+        self._record_deleted_observation(
+            deleted,
+            deletion_commit,
+            hashlib.sha256(content).hexdigest(),
+        )
+        entry = self.module.GitEntry(
+            status="D",
+            repo_path="AgentMemory/项目/self-attested.md",
+            path=deleted,
+        )
         self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
     def test_history_rejects_invalid_deletion_audit_fields(self) -> None:
@@ -238,28 +320,48 @@ class CloseoutHistoryCandidateTests(unittest.TestCase):
             repo_path="AgentMemory/项目/invalid.md",
             path=deleted,
         )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
         with contextlib.closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "UPDATE memory_deletion_observations SET actor='human', trash_sha256=?",
                 ("c" * 64,),
             )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
         with contextlib.closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "UPDATE memory_deletion_observations "
                 "SET trash_sha256=prior_sha256, evidence_ref_sha256=''"
             )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
         with contextlib.closing(sqlite3.connect(self.module.STATE_DB)) as conn, conn:
             conn.execute(
                 "UPDATE memory_deletion_observations SET evidence_ref_sha256=?, parent_commit=?",
                 ("e" * 64, "a" * 40),
             )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
 
 class CloseoutReconcileStatusTests(unittest.TestCase):
@@ -402,7 +504,7 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertEqual(warnings, [])
 
-    def test_history_requires_a_matching_closeout_observation(self) -> None:
+    def test_history_rejects_legacy_observation_without_commit_binding(self) -> None:
         note = self.vault / "项目" / "observed.md"
         note.write_text("# Observed\n", encoding="utf-8")
         entry = self.module.GitEntry(
@@ -413,7 +515,8 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         self.module.STATE_DB = self.vault.parent / "state.sqlite"
         with sqlite3.connect(self.module.STATE_DB) as conn:
             conn.execute(
-                "CREATE TABLE memory_file_observations (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
+                "CREATE TABLE memory_file_observations (path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, "
+                "actor TEXT NOT NULL, session_hash TEXT NOT NULL DEFAULT '')"
             )
 
         self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
@@ -421,13 +524,94 @@ class CloseoutReconcileStatusTests(unittest.TestCase):
         digest = hashlib.sha256(note.read_bytes()).hexdigest()
         with sqlite3.connect(self.module.STATE_DB) as conn:
             conn.execute(
-                "INSERT INTO memory_file_observations(path, sha256) VALUES (?, ?)",
+                "INSERT INTO memory_file_observations(path, sha256, actor, session_hash) "
+                "VALUES (?, ?, 'codex', '1')",
                 (str(note), digest),
             )
-        self.assertEqual(self.module.unobserved_history_entries([entry]), [])
+        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
 
         note.write_text("# Observed\n\nChanged.\n", encoding="utf-8")
         self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+
+    def test_committed_recovery_requires_independent_stored_receipt_verifier(self) -> None:
+        git_root = self.vault.parent
+        git(git_root, "init", "-q")
+        git(git_root, "config", "user.name", "Recovery Test")
+        git(git_root, "config", "user.email", "recovery@example.invalid")
+        note = self.vault / "项目" / "committed-recovery.md"
+        note.write_text("# Committed recovery\n", encoding="utf-8")
+        repo_path = "AgentMemory/项目/committed-recovery.md"
+        git(git_root, "add", repo_path)
+        git(git_root, "commit", "-qm", "committed recovery")
+        proposal_commit = git(git_root, "rev-parse", "HEAD")
+        blob_oid = git(git_root, "rev-parse", f"{proposal_commit}:{repo_path}")
+        blob_bytes = subprocess.run(
+            ["git", "-C", str(git_root), "cat-file", "blob", blob_oid],
+            capture_output=True,
+            check=True,
+        ).stdout
+        digest = hashlib.sha256(note.read_bytes()).hexdigest()
+        entry = self.module.GitEntry(
+            status="M",
+            repo_path=repo_path,
+            path=note,
+        )
+        self.module.REPO_ROOT = git_root
+        self.module.STATE_DB = git_root / "state.sqlite"
+        with sqlite3.connect(self.module.STATE_DB) as conn:
+            conn.execute(
+                "CREATE TABLE memory_file_observations ("
+                "path TEXT PRIMARY KEY, sha256 TEXT NOT NULL, actor TEXT NOT NULL, "
+                "session_hash TEXT NOT NULL DEFAULT '', git_commit TEXT NOT NULL, "
+                "git_blob_oid TEXT NOT NULL, git_blob_sha256 TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO memory_file_observations VALUES (?, ?, 'human', '', ?, ?, ?)",
+                (
+                    str(note),
+                    digest,
+                    proposal_commit,
+                    blob_oid,
+                    hashlib.sha256(blob_bytes).hexdigest(),
+                ),
+            )
+            conn.execute(
+                """
+                CREATE TABLE memory_committed_observations (
+                  observation_id TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                  actor TEXT NOT NULL, user_authorized INTEGER NOT NULL,
+                  approval_trust TEXT NOT NULL, can_authorize_action INTEGER NOT NULL,
+                  approval_receipt_sha256 TEXT NOT NULL, intent_id TEXT NOT NULL,
+                  receipt_id TEXT NOT NULL, proposal_commit TEXT NOT NULL,
+                  observed_git_head TEXT NOT NULL, audit_chain_sha256 TEXT NOT NULL,
+                  evidence_ref_sha256 TEXT NOT NULL, evidence_ref_length INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO memory_committed_observations VALUES "
+                "(?, ?, ?, 'human', 1, 'trusted_verifier', 1, ?, ?, ?, ?, ?, ?, ?, 12)",
+                (
+                    "a" * 64,
+                    str(note),
+                    digest,
+                    "b" * 64,
+                    "c" * 32,
+                    "d" * 32,
+                    proposal_commit,
+                    proposal_commit,
+                    "1" * 64,
+                    "2" * 64,
+                ),
+            )
+
+        self.assertEqual(self.module.unobserved_history_entries([entry]), [entry])
+        with mock.patch.object(
+            self.module,
+            "stored_observation_has_trusted_approval",
+            return_value=True,
+        ):
+            self.assertEqual(self.module.unobserved_history_entries([entry]), [])
 
 
 class CloseoutCommitSnapshotTests(unittest.TestCase):

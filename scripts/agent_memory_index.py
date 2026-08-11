@@ -464,6 +464,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           sha256 TEXT NOT NULL,
           actor TEXT NOT NULL,
           session_hash TEXT NOT NULL DEFAULT '',
+          git_commit TEXT NOT NULL DEFAULT '',
+          git_blob_oid TEXT NOT NULL DEFAULT '',
+          git_blob_sha256 TEXT NOT NULL DEFAULT '',
           observed_at TEXT NOT NULL
         );
 
@@ -474,6 +477,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           sentinel TEXT NOT NULL,
           actor TEXT NOT NULL,
           user_authorized INTEGER NOT NULL,
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
+          approval_receipt_sha256 TEXT NOT NULL DEFAULT '',
           deletion_commit TEXT NOT NULL,
           parent_commit TEXT NOT NULL,
           prior_sha256 TEXT NOT NULL,
@@ -492,6 +498,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           sha256 TEXT NOT NULL,
           actor TEXT NOT NULL,
           user_authorized INTEGER NOT NULL,
+          approval_trust TEXT NOT NULL DEFAULT 'self_attested',
+          can_authorize_action INTEGER NOT NULL DEFAULT 0,
+          approval_receipt_sha256 TEXT NOT NULL DEFAULT '',
           intent_id TEXT NOT NULL,
           receipt_id TEXT NOT NULL,
           proposal_commit TEXT NOT NULL,
@@ -521,6 +530,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     ensure_column(conn, "memory_search_log", "sources", "TEXT")
     ensure_column(conn, "memory_search_log", "duration_ms", "INTEGER")
     ensure_column(conn, "memory_session_claims", "intent_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "memory_file_observations", "git_commit", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "memory_file_observations", "git_blob_oid", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "memory_file_observations", "git_blob_sha256", "TEXT NOT NULL DEFAULT ''")
+    for table in ("memory_deletion_observations", "memory_committed_observations"):
+        ensure_column(conn, table, "approval_trust", "TEXT NOT NULL DEFAULT 'self_attested'")
+        ensure_column(conn, table, "can_authorize_action", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, table, "approval_receipt_sha256", "TEXT NOT NULL DEFAULT ''")
     agent_memory_intent.ensure_schema(conn)
     # Older databases do not have these columns until the migration above runs.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_docs_agent_scope ON memory_docs(agent_scope)")
@@ -533,7 +549,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_session_claims_active_intent "
         "ON memory_session_claims(intent_id) WHERE intent_id<>'' AND status='active'"
     )
-    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "8"))
+    conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", ("memory_index_schema_version", "9"))
     conn.commit()
 
 

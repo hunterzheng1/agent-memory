@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import os
@@ -107,6 +108,179 @@ class ActorSessionIsolationTest(unittest.TestCase):
 
 
 class SessionClaimConcurrencyTest(unittest.TestCase):
+    def test_post_commit_race_keeps_claim_and_dirty_stop_attention(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp)
+            git_root = tmp / "git"
+            vault = git_root / "AgentMemory"
+            runtime = tmp / "runtime"
+            git_root.mkdir(parents=True)
+            shutil.copytree(TEMPLATE, vault)
+            subprocess.run(["git", "init", "-q", str(git_root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(git_root), "config", "user.name", "Race Test"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(git_root), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(["git", "-C", str(git_root), "add", "AgentMemory"], check=True)
+            subprocess.run(
+                ["git", "-C", str(git_root), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            baseline = subprocess.run(
+                ["git", "-C", str(git_root), "rev-parse", "HEAD"],
+                text=True,
+                capture_output=True,
+                check=True,
+            ).stdout.strip()
+            config_dir = runtime / "config"
+            config_dir.mkdir(parents=True)
+            state_db = runtime / "state.sqlite"
+            closeout_log = runtime / "logs" / "closeout.jsonl"
+            config_path = config_dir / "agent-memory.toml"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        f'memory_root = "{vault.as_posix()}"',
+                        f'git_root = "{git_root.as_posix()}"',
+                        f'config_root = "{runtime.as_posix()}"',
+                        f'state_db = "{state_db.as_posix()}"',
+                        f'closeout_log = "{closeout_log.as_posix()}"',
+                        f'python = "{Path(sys.executable).as_posix()}"',
+                        "",
+                        "[semantic_retrieval]",
+                        "enabled = false",
+                        f'python = "{Path(sys.executable).as_posix()}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": str(config_path),
+                    "AGENT_MEMORY_ROOT": str(vault),
+                }
+            )
+            for script, extra in (
+                ("agent_memory_evolution.py", ["--init", "--scan"]),
+                ("agent_memory_index.py", ["--init", "--scan"]),
+            ):
+                initialized = run(
+                    [sys.executable, str(SCRIPTS / script), *extra],
+                    cwd=REPO_ROOT,
+                    env=env,
+                )
+                self.assertEqual(
+                    initialized.returncode,
+                    0,
+                    initialized.stderr + initialized.stdout,
+                )
+
+            note = vault / "项目" / "_模板-项目.md"
+            approved = note.read_text(encoding="utf-8") + "\nApproved snapshot.\n"
+            raced = approved + "\nRaced after commit.\n"
+            note.write_text(approved, encoding="utf-8")
+            claimed = run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "agent_memory_claim.py"),
+                    "--actor",
+                    "codex",
+                    "--session-id",
+                    "race-session",
+                    "--json",
+                    "claim",
+                    "--file",
+                    str(note),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+            )
+            self.assertEqual(claimed.returncode, 0, claimed.stderr + claimed.stdout)
+
+            harness = f"""
+import pathlib
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+import agent_memory_closeout as closeout
+original = closeout.record_file_observations
+def raced_record(*args, **kwargs):
+    recorded = original(*args, **kwargs)
+    pathlib.Path({str(note)!r}).write_text({raced!r}, encoding='utf-8')
+    return recorded
+closeout.record_file_observations = raced_record
+sys.argv = [
+    'agent_memory_closeout.py', '--actor', 'codex', '--session-id', 'race-session',
+    '--claimed-only', '--commit', '--skip-zvec', '--no-zvec', '--skip-audit',
+    '--trigger', 'test', '--lock-timeout', '10', '--json',
+]
+raise SystemExit(closeout.main())
+"""
+            completed = run(
+                [sys.executable, "-c", harness],
+                cwd=REPO_ROOT,
+                env=env,
+                timeout=120,
+            )
+            payload = json.loads(completed.stdout)
+            self.assertEqual(completed.returncode, 2, completed.stderr + completed.stdout)
+            self.assertEqual(payload["status"], "error")
+            self.assertIn(
+                "CONTENT_CHANGED_AFTER_OBSERVATION",
+                payload["steps"]["observations"]["detail"],
+            )
+            committed = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(git_root),
+                    "show",
+                    "HEAD:AgentMemory/项目/_模板-项目.md",
+                ],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+            ).stdout
+            self.assertEqual(committed.replace("\r\n", "\n"), approved.replace("\r\n", "\n"))
+            self.assertEqual(note.read_text(encoding="utf-8"), raced)
+            self.assertNotEqual(payload["git_observed_through"], payload["git_head_after"])
+            self.assertIn(payload["git_observed_through"], {"", baseline})
+            with sqlite3.connect(state_db) as conn:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM memory_session_claims WHERE status='active'"
+                ).fetchone()[0]
+                observed = conn.execute(
+                    "SELECT sha256 FROM memory_file_observations WHERE path=?",
+                    (str(note),),
+                ).fetchone()
+            self.assertEqual(active, 1)
+            self.assertTrue(
+                observed is None
+                or observed[0] != hashlib.sha256(raced.encode("utf-8")).hexdigest()
+            )
+
+            pending_probe = run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json,sys;"
+                        f"sys.path.insert(0,{str(SCRIPTS)!r});"
+                        "import agent_memory_stop_hook as hook;"
+                        "print(json.dumps([str(path) for path in hook.pending_paths()]))"
+                    ),
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+            )
+            self.assertEqual(pending_probe.returncode, 0, pending_probe.stderr + pending_probe.stdout)
+            self.assertIn(str(note.resolve()), json.loads(pending_probe.stdout))
+
     def test_two_sessions_commit_only_their_claimed_files(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
             tmp = Path(raw_tmp)

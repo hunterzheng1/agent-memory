@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -46,6 +47,97 @@ class DurabilityGuardTests(unittest.TestCase):
         conn.close()
         self.assertIn("memory_deletion_observations", tables)
         self.assertIn("memory_committed_observations", tables)
+
+    def test_claim_and_index_recovery_schemas_stay_in_parity(self) -> None:
+        claim_conn = sqlite3.connect(":memory:")
+        index_conn = sqlite3.connect(":memory:")
+        claim.ensure_schema(claim_conn)
+        index.init_db(index_conn)
+        for table in (
+            "memory_file_observations",
+            "memory_deletion_observations",
+            "memory_committed_observations",
+        ):
+            with self.subTest(table=table):
+                claim_columns = [tuple(row[1:6]) for row in claim_conn.execute(f"PRAGMA table_info({table})")]
+                index_columns = [tuple(row[1:6]) for row in index_conn.execute(f"PRAGMA table_info({table})")]
+                self.assertEqual(claim_columns, index_columns)
+        claim_conn.close()
+        index_conn.close()
+
+    def test_legacy_recovery_rows_migrate_to_untrusted_defaults(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE memory_deletion_observations (
+              observation_id TEXT PRIMARY KEY, path TEXT NOT NULL, rel_path TEXT NOT NULL,
+              sentinel TEXT NOT NULL, actor TEXT NOT NULL, user_authorized INTEGER NOT NULL,
+              deletion_commit TEXT NOT NULL, parent_commit TEXT NOT NULL,
+              prior_sha256 TEXT NOT NULL, trash_sha256 TEXT NOT NULL,
+              trash_path_sha256 TEXT NOT NULL, evidence_ref_sha256 TEXT NOT NULL,
+              evidence_ref_length INTEGER NOT NULL, observed_at TEXT NOT NULL
+            );
+            CREATE TABLE memory_committed_observations (
+              observation_id TEXT PRIMARY KEY, path TEXT NOT NULL, rel_path TEXT NOT NULL,
+              sha256 TEXT NOT NULL, actor TEXT NOT NULL, user_authorized INTEGER NOT NULL,
+              intent_id TEXT NOT NULL, receipt_id TEXT NOT NULL, proposal_commit TEXT NOT NULL,
+              observed_git_head TEXT NOT NULL, audit_chain_sha256 TEXT NOT NULL,
+              evidence_ref_sha256 TEXT NOT NULL, evidence_ref_length INTEGER NOT NULL,
+              observed_at TEXT NOT NULL
+            );
+            INSERT INTO memory_deletion_observations VALUES (
+              'legacy-delete', 'p', 'r', 's', 'human', 1, 'c', 'p', 'h', 'h', 't', 'e', 1, 'now'
+            );
+            INSERT INTO memory_committed_observations VALUES (
+              'legacy-commit', 'p', 'r', 'h', 'human', 1, 'i', 'r', 'c', 'c', 'a', 'e', 1, 'now'
+            );
+            """
+        )
+        claim.ensure_schema(conn)
+        for table in ("memory_deletion_observations", "memory_committed_observations"):
+            with self.subTest(table=table):
+                row = conn.execute(
+                    f"SELECT approval_trust, can_authorize_action, approval_receipt_sha256 "
+                    f"FROM {table}"
+                ).fetchone()
+                self.assertEqual(row, ("self_attested", 0, ""))
+        conn.close()
+
+    def test_committed_observation_cas_rejects_post_commit_file_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp).resolve()
+            vault = root / "AgentMemory"
+            note = vault / "项目" / "removed-after-commit.md"
+            note.parent.mkdir(parents=True)
+            content = b"# Approved snapshot\n"
+            note.write_bytes(content)
+            git(root, "init", "-q")
+            git(root, "config", "user.name", "CAS Test")
+            git(root, "config", "user.email", "test@example.invalid")
+            git(root, "add", "AgentMemory")
+            git(root, "commit", "-qm", "approved commit")
+            commit = git(root, "rev-parse", "HEAD")
+            blob = git(root, "rev-parse", f"{commit}:AgentMemory/项目/removed-after-commit.md")
+            note.unlink()
+            with (
+                mock.patch.object(claim, "VAULT_ROOT", vault),
+                mock.patch.object(claim, "GIT_ROOT", root),
+                mock.patch.object(claim, "STATE_DB", root / "state.sqlite"),
+            ):
+                with self.assertRaisesRegex(ValueError, "CONTENT_CHANGED_AFTER_COMMIT"):
+                    claim.record_file_observations(
+                        "cas-session",
+                        "codex",
+                        [note],
+                        committed_bindings={
+                            str(note.resolve()): {
+                                "raw_sha256": hashlib.sha256(content).hexdigest(),
+                                "git_commit": commit,
+                                "git_blob_oid": blob,
+                            }
+                        },
+                    )
+            self.assertFalse((root / "state.sqlite").exists())
 
     def test_doctor_reports_unobserved_closeout_history(self) -> None:
         pending = closeout.GitEntry(

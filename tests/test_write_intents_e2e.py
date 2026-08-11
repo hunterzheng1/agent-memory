@@ -396,7 +396,10 @@ class WriteIntentEndToEndTests(unittest.TestCase):
             )
         preview = self.box.ctl("human", "human-maintenance", "observe-committed", *observe_args)
         self.assertEqual(preview.returncode, 0, preview.stderr + preview.stdout)
-        self.assertTrue(self.box.json_payload(preview)["preview"])
+        preview_payload = self.box.json_payload(preview)
+        self.assertTrue(preview_payload["preview"])
+        self.assertEqual(preview_payload["observation"]["approval_trust"], "self_attested")
+        self.assertFalse(preview_payload["observation"]["can_authorize_action"])
         with closing(sqlite3.connect(self.box.state_db)) as conn:
             count_before = conn.execute(
                 "SELECT COUNT(*) FROM memory_committed_observations"
@@ -474,15 +477,47 @@ raise SystemExit(3)
 
         applied_args = (*observe_args[:-1], "--apply", "--json")
         applied = self.box.ctl("human", "human-maintenance", "observe-committed", *applied_args)
-        self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
-        self.assertEqual(self.box.json_payload(applied)["applied"], 1)
+        self.assertEqual(applied.returncode, 2, applied.stderr + applied.stdout)
+        self.assertEqual(
+            self.box.json_payload(applied)["error"],
+            "TRUSTED_APPROVAL_VERIFIER_REQUIRED",
+        )
+        trusted_apply_script = f"""
+import sys
+sys.path.insert(0, {str(SCRIPTS)!r})
+import agent_memory_claim as claim
+observation = claim.validate_committed_observation(
+    actor='human', target_file={str(target)!r}, intent_id={intent_id!r},
+    evidence_ref='verified-original-user-authorization', user_authorized=True,
+)
+applied = claim.apply_committed_observation(
+    observation,
+    actor='human', target_file={str(target)!r}, intent_id={intent_id!r},
+    evidence_ref='verified-original-user-authorization', user_authorized=True,
+    approval_verifier=lambda _subject: {{
+        'approval_trust': 'trusted_verifier',
+        'can_authorize_action': True,
+        'receipt_sha256': 'ab' * 32,
+    }},
+)
+print(applied)
+"""
+        trusted_apply = run(
+            [sys.executable, "-c", trusted_apply_script],
+            cwd=REPO_ROOT,
+            env=self.box.env("human", "human-maintenance"),
+        )
+        self.assertEqual(trusted_apply.returncode, 0, trusted_apply.stderr + trusted_apply.stdout)
+        self.assertEqual(trusted_apply.stdout.strip(), "1")
         with closing(sqlite3.connect(self.box.state_db)) as conn:
             audit = conn.execute(
-                "SELECT actor, user_authorized, intent_id, proposal_commit, evidence_ref_sha256 "
+                "SELECT actor, user_authorized, intent_id, proposal_commit, evidence_ref_sha256, "
+                "approval_trust, can_authorize_action, approval_receipt_sha256 "
                 "FROM memory_committed_observations"
             ).fetchone()
             observed = conn.execute(
-                "SELECT sha256, actor, session_hash FROM memory_file_observations WHERE path=?",
+                "SELECT sha256, actor, session_hash, git_commit, git_blob_oid, git_blob_sha256 "
+                "FROM memory_file_observations WHERE path=?",
                 (str(target),),
             ).fetchone()
         self.assertEqual(audit[0:3], ("human", 1, intent_id))
@@ -501,12 +536,29 @@ raise SystemExit(3)
             audit[4],
             hashlib.sha256(b"verified-original-user-authorization").hexdigest(),
         )
-        self.assertEqual(observed[1:], ("human", ""))
+        self.assertEqual(audit[5:], ("trusted_verifier", 1, "ab" * 32))
+        self.assertEqual(observed[1:4], ("human", "", audit[3]))
+        expected_blob_oid = git(
+            self.box.git_root,
+            "rev-parse",
+            f"{audit[3]}:AgentMemory/用户记忆/偏好与边界.md",
+        )
+        self.assertEqual(observed[4], expected_blob_oid)
+        blob_bytes = subprocess.run(
+            ["git", "-C", str(self.box.git_root), "cat-file", "blob", expected_blob_oid],
+            capture_output=True,
+            check=True,
+        ).stdout
+        self.assertEqual(observed[5], hashlib.sha256(blob_bytes).hexdigest())
 
         git(self.box.git_root, "commit", "--allow-empty", "-qm", "later unrelated commit")
-        repeated = self.box.ctl("human", "human-maintenance", "observe-committed", *applied_args)
+        repeated = run(
+            [sys.executable, "-c", trusted_apply_script],
+            cwd=REPO_ROOT,
+            env=self.box.env("human", "human-maintenance"),
+        )
         self.assertEqual(repeated.returncode, 0, repeated.stderr + repeated.stdout)
-        self.assertEqual(self.box.json_payload(repeated)["applied"], 0)
+        self.assertEqual(repeated.stdout.strip(), "0")
 
         with closing(sqlite3.connect(self.box.state_db)) as conn, conn:
             conn.execute(
