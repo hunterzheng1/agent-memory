@@ -5,10 +5,15 @@ project_id: agent-memory-vault-index
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
+created_by: {{AGENT_ID}}
+last_updated_by: {{AGENT_ID}}
 session_id: ""
 status: active
 sensitivity: normal
 verified_at: 2026-06-20
+review_after_days: 180
+valid_until: ""
 keywords:
   - index
   - routing

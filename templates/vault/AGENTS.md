@@ -1,6 +1,6 @@
 # Shared Agent Memory Vault Instructions
 
-这是 Codex、Claude Code 与 CodeBuddy 可共用的本地长期记忆库。Markdown 是唯一正式事实源；各 Agent 不各自维护第二套正式事实。
+这是 Codex、Claude Code、CodeBuddy 与 Cursor 可共用的本地长期记忆库。Markdown 是唯一正式事实源；各 Agent 不各自维护第二套正式事实。
 
 读取顺序：
 
@@ -18,17 +18,40 @@
 python3 scripts/memoryctl --actor codex search "查询词" --limit 5
 python3 scripts/memoryctl --actor claude search "查询词" --limit 5
 python3 scripts/memoryctl --actor codebuddy search "查询词" --limit 5
+python3 scripts/memoryctl --actor cursor search "查询词" --limit 5
 ```
 
 它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
+
+项目任务应传入 `--current-project <project-id>`。其他项目的工作流、决策和事实默认被硬隔离；显式 `--cross-project` 只返回类比线索，不能授权动作。`valid_until` 已过期的结果必须重新核验。`zvec_raw_distance` 决定距离闸门，词面修正后的排序分数不能改变写入或合并决策。
 
 ## 写入规则
 
 正式写入前先做对账，避免重复记忆越写越多：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude|codebuddy> prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor <codex|claude|codebuddy|cursor> prewrite \
+  "准备写入的记忆摘要" \
+  --source-class <user_direct|manual_edit|local_verified|external_untrusted|agent_inferred|unknown> \
+  --knowledge-kind <fact|preference|rule|inference|hypothesis> \
+  --asserted-by <bounded-identity> \
+  --evidence-ref <evidence-reference>
 ```
+
+`source_class` 和 `knowledge_kind` 是写入前的来源与内容分类。安全评估必须早于检索；外部不可信规则、来源不明事实和 Agent 推断的权威偏好不能直接写入。安全日志只保存哈希、长度和分类。
+
+列入 `[write_intents].protected_paths` 的文件可以在编辑前创建内容绑定 intent。提案文件必须位于 vault 外：
+
+```bash
+python3 scripts/memoryctl --actor <codex|claude|codebuddy|cursor> prewrite \
+  "准备修改受保护文件" --create-intent \
+  --target-file "/absolute/path/to/protected-memory.md" \
+  --proposal-file "/outside/vault/proposal.md" \
+  --source-class user_direct --knowledge-kind rule \
+  --asserted-by user --evidence-ref "当前对话中的明确指令"
+```
+
+返回 intent ID 后，在 `claim` 中传入 `--intent-id`。`off` 和 `advisory` 下的记录属于审计证据，不是独立授权；没有可信验证器时不要切到 `enforce`。
 
 对账动作只允许这 6 种：
 
@@ -42,20 +65,21 @@ python3 scripts/memoryctl --actor <codex|claude|codebuddy> prewrite "准备写�
 每次新建或修改正式记忆后，立即把文件认领到当前 Agent 会话：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude|codebuddy> claim --file "/absolute/path/to/memory.md"
+python3 scripts/memoryctl --actor <codex|claude|codebuddy|cursor> claim --file "/absolute/path/to/memory.md"
 ```
 
 - Codex 自动使用 `CODEX_THREAD_ID`。
 - Claude Code **必须**通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`。
 - CodeBuddy 原生透传 `CODEBUDDY_SESSION_ID`，**默认不需要** SessionStart 桥接。
+- Cursor 需要显式传入 `--session-id`，或设置 `AGENT_MEMORY_SESSION_ID`；当前不提供 Cursor Stop Hook 协议。
 
 Stop Hook 只处理当前会话认领的文件，其他会话的脏文件会明确排除；成功 closeout 会另存文件内容 hash，只有匹配这份完成指纹的历史内容才视为已处理。
 
 重要任务结束前执行 memory closeout：
 
 ```bash
-python3 scripts/memoryctl --actor <codex|claude|codebuddy> closeout --dry-run
-python3 scripts/memoryctl --actor <codex|claude|codebuddy> closeout
+python3 scripts/memoryctl --actor <codex|claude|codebuddy|cursor> closeout --dry-run
+python3 scripts/memoryctl --actor <codex|claude|codebuddy|cursor> closeout
 ```
 
 在 Agent 会话内，`memoryctl closeout` 会按当前会话的认领账本执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本会话认领的文件。只有人工维护时才使用 `--global` 做全库收尾。
@@ -90,13 +114,14 @@ app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
 agent_scope: shared
-created_by: human | codex | claude | codebuddy
-last_updated_by: human | codex | claude | codebuddy
+created_by: human | codex | claude | codebuddy | cursor
+last_updated_by: human | codex | claude | codebuddy | cursor
 session_id: ""
 status: active
 sensitivity: normal
 verified_at: 2026-06-20
 review_after_days: 90
+valid_until: ""
 keywords:
   - example
 ---
@@ -108,5 +133,6 @@ keywords:
 - 不要把私密原始聊天全文写入公开仓库。
 - 不要把 SQLite 数据库提交到 Git。
 - 搜索日志只保存查询哈希、长度、来源和耗时，不保存新的查询原文。
+- `[write_intents]` 默认 `enabled=false`、`enforcement="off"`。`advisory` 只提示；没有独立可信审批验证器时，`enforce` 必须返回 `TRUSTED_APPROVAL_VERIFIER_REQUIRED`。自报的 `approved_by` 或 `--confirm-user-authorized` 不能授权动作。
 - 对外分享前必须脱敏。
 - Claude Code 原生 auto-memory 不应直接指向正式 vault；可停用，或只把它当作非正式草稿层。

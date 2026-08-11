@@ -1,11 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-<<<<<<<< HEAD:templates/vault/工作流/记忆语义检索设计.md
-project_id: agent-memory-semantic-retrieval
-========
 project_id: agent-memory-vault-semantic-retrieval
->>>>>>>> upstream/main:templates/vault/工作流/Agent记忆语义检索设计.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -44,12 +40,8 @@ keywords:
 ```bash
 python3 scripts/agent_memory_index.py --init --scan --report
 python3 scripts/agent_memory_zvec_index.py --init
-<<<<<<<< HEAD:templates/vault/工作流/记忆语义检索设计.md
-python3 scripts/agent_memory_zvec_index.py --scan
-========
 python3 scripts/agent_memory_zvec_index.py --scan --prune
 python3 scripts/agent_memory_zvec_index.py --report
->>>>>>>> upstream/main:templates/vault/工作流/Agent记忆语义检索设计.md
 python3 scripts/agent_memory_zvec_index.py --search "只记得大概意思的问题" --limit 5
 python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
 ```
@@ -59,6 +51,8 @@ python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
 - Zvec 是本地嵌入式向量数据库，不需要单独后台服务。
 - Embedding 模型会占用本机磁盘和运行内存；具体取决于模型大小。
 - 模型缓存、向量库、SQLite、`.env` 和任何 token 都不要提交到公开仓库。
+- `zvec_raw_distance` 决定结果能否越过距离闸门；词面修正只用于排序，不得改变写入或合并决策。
+- 项目边界和 `valid_until` 在 SQLite 与 Zvec 合并后再次检查。跨项目或过期结果只能作为需要核验的参考。
 
 ## 下次优先看
 

@@ -1,14 +1,14 @@
-# Agent Memory Vault: Shared Claude Code + Codex + CodeBuddy
+# Agent Memory Vault：Claude Code、Codex、CodeBuddy 与 Cursor 共享记忆
 
-这是一个可由 Claude Code、Codex 与 CodeBuddy Code CLI 共用的长期记忆库模板。它把普通 Markdown 文件当作唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
+这是一个可由 Claude Code、Codex、CodeBuddy Code CLI 与 Cursor 共用的长期记忆库模板。它把普通 Markdown 文件作为唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
-所有运行入口都使用平台中立命名：配置使用 `AGENT_MEMORY_*`，脚本使用 `agent_memory_*`，统一命令为 `memoryctl`。仓库不提供旧名称兼容脚本或环境变量回退。
+所有运行入口都使用平台中立命名：配置首选 `AGENT_MEMORY_*`，脚本使用 `agent_memory_*`，统一命令为 `memoryctl`。已有安装仍可通过 `CODEX_MEMORY_*` 回退别名迁移，但新配置不要继续扩展旧前缀。
 
 ## 它解决什么问题
 
-- 让 Claude Code、Codex 与 CodeBuddy 每次开始重要任务时，读取同一份相关长期记忆。
+- 让 Claude Code、Codex、CodeBuddy 与 Cursor 每次开始重要任务时，读取同一份相关长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -39,6 +39,13 @@ scripts/
   agent_memory_index.py  # 全库 SQLite 索引和搜索
   agent_memory_search.py # 统一搜索入口：SQLite + 可选 Zvec + 手动 rg
   agent_memory_claim.py  # 会话文件认领账本，防止多宿主串提交
+  agent_memory_intent.py # 受保护写入的内容绑定意图与完成回执
+  agent_memory_safety.py # 来源分类和写入前安全评估
+  agent_memory_state.py  # SQLite 安全连接与权限模型报告
+  agent_memory_decision_outcomes.py
+                          # 决策—结果记录覆盖率报告
+  agent_memory_policy_benchmark.py
+                          # 离线对账与来源安全策略基准
   agent_memory_closeout.py
                           # 任务结束收尾：检查、对账、刷新索引、审计、可选提交
   agent_memory_audit.py  # 定期体检：过期、重复、open-loop、裁决记录
@@ -51,7 +58,7 @@ scripts/
   agent_memory_stop_hook.py
                           # 可选 Stop 自动 closeout + 到期 audit（Claude/Codex/CodeBuddy）
   install_runtime.py     # 把当前 Git 版本安装为可校验的本机 Runtime
-  memoryctl               # Codex/Claude/CodeBuddy 共用的平台中立命令入口
+  memoryctl               # 所有宿主共用的平台中立命令入口
   agent_memory_zvec_index.py
   agent_memory_retrieval_benchmark.py
   agent_memory_evolution.py
@@ -60,9 +67,11 @@ scripts/
 
 ## 快速开始
 
+Windows 用户优先阅读 [Windows 原生安装与运行](docs/windows.md)。兼容性和验证边界见 [Windows 兼容性审计摘要](docs/windows-compatibility-audit.md)。
+
 ```bash
-git clone https://github.com/mcncarl/agent-memory-vault.git
-cd agent-memory-vault
+git clone https://github.com/hunterzheng1/agent-memory.git
+cd agent-memory
 cp .env.example .env
 ```
 
@@ -89,25 +98,29 @@ cp config/agent-memory.example.toml "$HOME/.config/agent-memory/config/agent-mem
   --config-root "$HOME/.config/agent-memory" --verify --json
 ```
 
-## Claude Code、Codex 与 CodeBuddy 共用
+## Claude Code、Codex、CodeBuddy 与 Cursor 共用
 
 保持一个 Markdown vault、一个 Git 基线、一个 SQLite、一个 Zvec 和一个 audit 调度器。各宿主只维护薄适配层：
 
 - Codex 的 `AGENTS.md` 指向 vault 规则。
 - Claude Code 的 `CLAUDE.md` 使用 `@/absolute/path/to/AGENTS.md` 导入同一规则。
 - CodeBuddy 的 `CODEBUDDY.md` 指向同一 vault 规则；Bash 原生提供 `CODEBUDDY_SESSION_ID`。
+- Cursor 使用项目规则或 [Cursor User Rule](docs/cursor-user-rule.md)，并通过 `--actor cursor` 进入同一检索 scope。Cursor 当前没有 Stop Hook 协议，写入时需显式设置 `AGENT_MEMORY_SESSION_ID` 或传入 `--session-id`。
 - Claude Code 原生 auto-memory 不要指向正式 vault；推荐关闭，或只把它当作非正式草稿层。
-- 通过 `memoryctl --actor codex|claude|codebuddy` 使用同一搜索和 closeout。
+- 通过 `memoryctl --actor codex|claude|codebuddy|cursor` 使用同一搜索和 closeout。
 
 ```bash
 python3 scripts/memoryctl --actor claude search "项目状态" --limit 5
 python3 scripts/memoryctl --actor codebuddy search "项目状态" --limit 5
-python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor cursor search "项目状态" --limit 5
+python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要" \
+  --source-class user_direct --knowledge-kind fact \
+  --asserted-by user --evidence-ref "当前对话中的明确指令"
 python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/changed-memory.md"
 python3 scripts/memoryctl --actor claude closeout
 ```
 
-写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session id 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容 hash，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude` 或 `codebuddy`。
+写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session ID 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。成功 closeout 还会记录每个文件的内容哈希，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude`、`codebuddy` 或 `cursor`。
 
 异常退出可能留下旧认领。Stop Hook 不会继续信任超过 24 小时的认领，Doctor 会把它列为警告。清理时先预览，再显式应用；这只把 SQLite 账本状态改为 `expired`，不会删除或改写 Markdown：
 
@@ -115,6 +128,46 @@ python3 scripts/memoryctl --actor claude closeout
 python3 scripts/memoryctl --actor human claims-expire --older-than-hours 24 --json
 python3 scripts/memoryctl --actor human claims-expire --older-than-hours 24 --apply --json
 ```
+
+## 安全写入与审计恢复
+
+`prewrite` 先执行来源安全评估，再按项目边界检索和对账。必须提供 `source_class`、`knowledge_kind`、`asserted_by` 与可选 `evidence_ref`。外部不可信规则、来源不明事实和 Agent 推断的权威偏好不会直接写入。安全日志只保存哈希、长度和分类。
+
+写意图采用分阶段启用，示例配置保持：
+
+```toml
+[write_intents]
+enabled = false
+enforcement = "off"
+```
+
+建议先为少量高影响文件开启 `advisory`。当前没有独立可信审批验证器；若直接设置 `enforcement = "enforce"`，check 和写入闸门会返回 `TRUSTED_APPROVAL_VERIFIER_REQUIRED`。本地 CLI 自报的 `approved_by`、`approval_ref` 或 `--confirm-user-authorized` 标记为 `self_attested`，不能授权受保护写入、删除或恢复。
+
+已明确授权且可恢复的删除，以及具备完整意图—回执—Git 证据链的提前提交，可以先预览：
+
+```bash
+python3 scripts/memoryctl --actor human observe-deletion \
+  --file "/absolute/path/to/deleted.md" \
+  --trash-path "/recoverable/trash/copy.md" \
+  --deletion-commit <git-object-id> \
+  --evidence-ref "authorization reference"
+
+python3 scripts/memoryctl --actor human observe-committed \
+  --file "/absolute/path/to/memory.md" \
+  --intent-id <expired-intent-id> \
+  --evidence-ref "recovery reference"
+```
+
+公共 CLI 不提供可信授权注入，因此 `--apply` 默认稳定拒绝。只有进程内接入独立可信验证器并返回内容绑定回执时，才允许写入观察记录。恢复验证会检查 Git ancestry、40/64 位对象 ID、tree mode、blob、clean filter、当前工作树 CAS 和最新路径变更；符号链接、gitlink、rename/copy 和竞态均 fail closed。
+
+策略与决策报告：
+
+```bash
+python3 scripts/memoryctl --actor human decision-outcomes --strict --json
+python3 scripts/memoryctl --actor human policy-benchmark --kind all --json
+```
+
+公共 benchmark 只包含假样本。显式传入的私有 fixture 默认仅返回聚合指标；除非人工排查，不要使用 `--show-private-details`。
 
 搜索示例：
 

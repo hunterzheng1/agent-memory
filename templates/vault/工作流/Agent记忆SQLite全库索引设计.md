@@ -1,11 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-<<<<<<<< HEAD:templates/vault/工作流/记忆SQLite全库索引设计.md
-project_id: agent-memory-sqlite-index
-========
 project_id: agent-memory-vault-sqlite-index
->>>>>>>> upstream/main:templates/vault/工作流/Agent记忆SQLite全库索引设计.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -34,14 +30,17 @@ SQLite 索引用于在任务开始时快速找到最相关的 Markdown。它不�
 - `memory_files`：Agent case 文件状态。
 - `agent_case_state`：按 case_key 汇总的复用状态。
 - `reminders`：需要提醒用户确认的事项。
+- `memory_write_intents` 与 `memory_write_receipts`：受保护写入的内容绑定意图和完成回执。
+- `memory_deletion_observations` 与 `memory_committed_observations`：经过验证的删除或提前提交恢复审计。
 
 ## 搜索策略
 
 1. 先用 SQLite FTS 做全文搜索。
 2. 再用 LIKE 兜底，改善中文短词召回。
-3. 最后用字段过滤缩小范围。
+3. 最后用字段过滤缩小范围，并把 `project_id` 作为硬边界。
 4. 中文查询补充二元/三元片段，避免没有空格时只能整句匹配。
 5. `verified_at_source` 区分真实复核与 mtime 回退；`review_after_days` 决定何时进入 audit。
+6. 搜索日志只保存脱敏摘要、路径摘要和计数，不保存查询原文或命中文件绝对路径。
 
 ## 和语义检索的关系
 

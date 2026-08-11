@@ -1,11 +1,7 @@
 ---
 memory_type: workflow
 track: workflow
-<<<<<<<< HEAD:templates/vault/工作流/记忆收尾决策规则.md
-project_id: agent-memory-closeout
-========
 project_id: agent-memory-vault-closeout
->>>>>>>> upstream/main:templates/vault/工作流/Agent记忆收尾决策规则.md
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
@@ -29,8 +25,27 @@ keywords:
 写入前先运行：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要" \
+  --source-class user_direct \
+  --knowledge-kind fact \
+  --asserted-by user \
+  --evidence-ref "当前对话中的明确指令"
 ```
+
+其中，`source_class` 表示来源类别，`knowledge_kind` 表示内容类型。安全评估先于检索和对账；外部不可信规则、来源不明事实和 Agent 推断的权威偏好不能直接进入正式记忆。
+
+受保护文件需要内容绑定记录时，在 vault 外准备完整提案，再为同一目标创建 intent：
+
+```bash
+python3 scripts/memoryctl --actor codex prewrite "准备修改受保护文件" \
+  --create-intent \
+  --target-file "/absolute/path/to/protected-memory.md" \
+  --proposal-file "/outside/vault/proposal.md" \
+  --source-class user_direct --knowledge-kind rule \
+  --asserted-by user --evidence-ref "当前对话中的明确指令"
+```
+
+编辑后使用 `claim --intent-id <intent-id> --file <path>`。`advisory` 只报告和保存审计状态，不能把 self-attested 元数据提升为可信授权。
 
 根据结果选择：
 
@@ -78,16 +93,17 @@ python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要
 
 ## 收尾动作
 
-写完记忆后优先运行统一 closeout：
+写完记忆后，先把修改文件认领到当前会话，再运行统一 closeout：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --dry-run
-python3 scripts/agent_memory_closeout.py --commit
+python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/memory.md"
+python3 scripts/memoryctl --actor codex closeout --dry-run
+python3 scripts/memoryctl --actor codex closeout
 ```
 
 它会自动完成：
 
-- Git 自动发现变更文件。
+- 只处理当前会话认领的变更文件。
 - 检查结构、frontmatter、泄密和变更文件膨胀。
 - 对新文件做写入后查重。
 - 刷新 SQLite 索引。
@@ -98,6 +114,8 @@ python3 scripts/agent_memory_closeout.py --commit
 - 只提交本轮处理过的记忆文件。
 
 如果输出 `MERGE_REQUIRED`、`ASK_USER`、删除文件状态或疑似历史脏变更，不要强行提交。
+
+`[write_intents]` 默认关闭。启用 `advisory` 后只报告受保护路径的意图问题；`enforce` 在没有独立可信审批验证器时稳定返回 `TRUSTED_APPROVAL_VERIFIER_REQUIRED`，不能把本地 CLI 的自报批准当作用户授权。
 
 ## Audit 体检
 

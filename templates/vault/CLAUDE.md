@@ -4,7 +4,7 @@
 
 本 vault 是项目级长期记忆层，与 Claude 全局记忆（`~/.claude/`）互补不替代：全局记忆管跨项目偏好与技能，本 vault 管本项目的稳定事实与状态。
 
-> Codex 用户看 `AGENTS.md`，Cursor 用户看项目 `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule，规则等价。
+> Codex 用户看 `AGENTS.md`，CodeBuddy 用户看 `CODEBUDDY.md`，Cursor 用户看项目 `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule。各入口使用同一事实源和同一写入协议。
 
 读取顺序：
 
@@ -19,7 +19,7 @@
 优先使用统一搜索脚本，而不是手工猜该读哪个文件：
 
 ```bash
-python3 scripts/agent_memory_search.py "查询词" --limit 5
+python3 scripts/memoryctl --actor claude search "查询词" --limit 5
 ```
 
 它会先查 SQLite/FTS；启用语义索引时，也可以并行查 Zvec。Zvec 命中只能当作候选线索，最终回答前必须回读 Markdown 原文。
@@ -29,8 +29,16 @@ python3 scripts/agent_memory_search.py "查询词" --limit 5
 正式写入前先做对账，避免重复记忆越写越多：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要"
+python3 scripts/memoryctl --actor claude prewrite "准备写入的记忆摘要" \
+  --source-class <user_direct|manual_edit|local_verified|external_untrusted|agent_inferred|unknown> \
+  --knowledge-kind <fact|preference|rule|inference|hypothesis> \
+  --asserted-by <bounded-identity> \
+  --evidence-ref <evidence-reference>
 ```
+
+`source_class` 与 `knowledge_kind` 分别表示来源类别和内容类型。安全评估先于检索和对账；来源不明或外部不可信的内容不能直接成为权威事实或规则。
+
+修改 `[write_intents].protected_paths` 中的文件前，按 `AGENTS.md` 的完整提案流程创建 intent，并在 `claim` 中绑定 intent ID。`advisory` 记录问题但不提供独立授权。
 
 对账动作只允许这 6 种：
 
@@ -41,15 +49,22 @@ python3 scripts/agent_memory_closeout.py --prewrite "准备写入的记忆摘要
 - `MERGE_REQUIRED`：疑似重复或冲突，需要人工合并。
 - `ASK_USER`：涉及敏感、删除、费用、账号、凭证或不确定判断时先问用户。
 
+每次新建或修改正式记忆后，立即认领到当前 Claude 会话：
+
+```bash
+python3 scripts/memoryctl --actor claude claim --file "/absolute/path/to/memory.md"
+```
+
+Claude Code 必须通过 `SessionStart` 运行 `agent_memory_session_hook.py --actor claude`，把官方 Hook payload 的真实 `session_id` 写入 `CLAUDE_ENV_FILE`。缺少会话 ID 时，Stop 不能把同一 actor 的脏文件静默归给其他会话。
+
 重要任务结束前执行 memory closeout：
 
 ```bash
-python3 scripts/agent_memory_closeout.py --commit
+python3 scripts/memoryctl --actor claude closeout --dry-run
+python3 scripts/memoryctl --actor claude closeout
 ```
 
-只检查不提交时才使用 `--dry-run`。当 `AGENT_MEMORY_AUTO_COMMIT=1` 时，非 dry-run closeout 可以默认提交本轮处理过的记忆文件。
-
-closeout 会自动发现记忆库变更文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发、closeout 日志写入，并只提交本轮处理过的记忆文件。
+closeout 只处理当前会话认领的文件，执行结构检查、写入后对账、SQLite 刷新、可选 Zvec 刷新、Agent evolution 刷新、audit 捎带触发和 scoped commit。人工维护全库时才使用 `--global`。
 
 如果 closeout 输出 `MERGE_REQUIRED`、`ASK_USER`、删除文件状态、疑似历史脏变更，先停下让用户确认。
 
@@ -79,10 +94,15 @@ project_id: example-app
 app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
+agent_scope: shared
+created_by: human | codex | claude | codebuddy | cursor
+last_updated_by: human | codex | claude | codebuddy | cursor
 session_id: ""
 status: active
 sensitivity: normal
 verified_at: 2026-06-20
+review_after_days: 90
+valid_until: ""
 keywords:
   - example
 ---
@@ -93,4 +113,5 @@ keywords:
 - 不要把 API key、token、cookie、密码写入 Markdown。
 - 不要把私密原始聊天全文写入公开仓库。
 - 不要把 SQLite 数据库提交到 Git。
+- `[write_intents]` 默认关闭。启用 `advisory` 只产生提示；没有独立可信审批验证器时，`enforce` 返回 `TRUSTED_APPROVAL_VERIFIER_REQUIRED`。本地自报审批不能授权受保护写入。
 - 对外分享前必须脱敏。

@@ -18,20 +18,22 @@ When a task involves an existing project, previous conclusions, local paths, use
 1. Read <vault root>/AGENTS.md.
 2. Read <vault root>/INDEX.md.
 3. Search with:
-   python "<agent-memory repo>/scripts/agent_memory_search.py" "keywords" --limit 5
+   python "<agent-memory repo>/scripts/memoryctl" --actor cursor search "keywords" --limit 5
 4. Read only the most relevant 1-3 Markdown files before answering.
 
 Do not read the entire vault by default.
 
-Cursor may write durable memory when the user asks to remember something or when an important task produces stable facts, decisions, workflows, or reusable agent experience. Before writing, reconcile with:
+Cursor may write durable memory when the user asks to remember something or when an important task produces stable facts, decisions, workflows, or reusable agent experience. Set a stable AGENT_MEMORY_SESSION_ID for the current chat; Cursor does not have an Agent Memory Stop Hook protocol. Before writing, reconcile with source metadata:
 
-python "<agent-memory repo>/scripts/agent_memory_closeout.py" --prewrite "summary to write"
+python "<agent-memory repo>/scripts/memoryctl" --actor cursor prewrite "summary to write" --source-class user_direct --knowledge-kind fact --asserted-by user --evidence-ref "current user instruction"
 
-When writing memory, use agent_id: cursor. After writing, run:
+When writing memory, use agent_id: cursor and agent_scope: shared unless the fact is Cursor-specific. Immediately claim every changed file, then run scoped closeout:
 
-python "<agent-memory repo>/scripts/agent_memory_closeout.py" --commit
+python "<agent-memory repo>/scripts/memoryctl" --actor cursor claim --file "<absolute path to changed memory.md>"
+python "<agent-memory repo>/scripts/memoryctl" --actor cursor closeout --dry-run
+python "<agent-memory repo>/scripts/memoryctl" --actor cursor closeout
 
-If AGENT_MEMORY_AUTO_COMMIT=1 is enabled, a non-dry-run closeout may commit processed memory files by default. --dry-run never commits. Stop and ask the user on MERGE_REQUIRED, ASK_USER, deleted files, or warnings.
+Only human maintenance may use --global. --dry-run never commits. Stop and ask the user on MERGE_REQUIRED, ASK_USER, protected-write warnings, deleted files, or warnings.
 
 Never write API keys, tokens, cookies, passwords, private raw chat transcripts, SQLite databases, vector stores, or model caches into Markdown or a public repository.
 ```

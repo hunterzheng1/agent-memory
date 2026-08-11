@@ -1,19 +1,21 @@
-# Automation
+# 自动化
 
-Agent Memory Vault can run without background automation. The recommended automated setup is layered:
+Agent Memory Vault 不依赖后台自动化。推荐按需启用以下层级：
 
-1. `closeout` piggyback: every important task-end closeout checks whether audit is due.
-2. Optional Stop hook: shared Claude/Codex setups run full closeout only for files claimed by the current session.
-3. Optional macOS `launchd` fallback: runs the due content audit plus a read-only infrastructure Doctor weekly even if no Agent session happens.
+1. `closeout` 捎带检查：每次重要任务收尾时判断 audit 是否到期。
+2. 可选 Stop Hook：只对当前会话认领的文件执行完整 closeout。
+3. 可选 macOS `launchd`：即使一周内没有 Agent 会话，也运行到期的内容 audit 和只读 Doctor。
 
-Automation should only produce reminders, reports, logs, and local audit decisions. It should not directly rewrite Markdown facts.
+自动化只生成提醒、报告、日志和本地 audit 裁决，不直接改写 Markdown 事实。
+
+Windows 的 PowerShell wrapper、Codex Hook 安装器和 Task Scheduler 操作见 [Windows 原生安装与运行](windows.md)。安装脚本保留无关 Hook，并在路径重定向、并发编辑或配置变化时停止。
 
 ## Closeout Piggyback
 
 This is the primary path because it runs when an Agent is already present to read and explain the result.
 
 ```bash
-python3 scripts/agent_memory_closeout.py --commit
+python3 scripts/memoryctl --actor codex closeout
 ```
 
 By default, closeout calls:
