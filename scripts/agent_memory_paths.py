@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 
 
-def resolve_path(raw: str) -> Path:
-    """Resolve config paths consistently across POSIX and Windows shells."""
+def resolve_path(raw: str, *, lexical: bool = False) -> Path:
+    """Expand config paths consistently, optionally preserving lexical components."""
     expanded = raw
     if "$HOME" in raw or "${HOME}" in raw:
         home = str(Path.home())
@@ -20,4 +20,7 @@ def resolve_path(raw: str) -> Path:
         lambda match: os.environ.get(match.group(1), match.group(0)),
         expanded,
     )
-    return Path(expanded).expanduser().resolve()
+    expanded_path = Path(expanded).expanduser()
+    if lexical:
+        return Path(os.path.abspath(expanded_path))
+    return expanded_path.resolve()

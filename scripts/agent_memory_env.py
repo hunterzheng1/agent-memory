@@ -57,18 +57,18 @@ CONFIG_KEYS: dict[str, tuple[str, ...]] = {
 
 
 
-def resolve_config_path(raw: str) -> Path:
+def resolve_config_path(raw: str, *, lexical: bool = False) -> Path:
     """Resolve config paths with Windows-safe $HOME / ~ / %VAR% expansion."""
     from agent_memory_paths import resolve_path
 
-    return resolve_path(raw)
+    return resolve_path(raw, lexical=lexical)
 
 
 def config_path() -> Path:
     explicit = os.environ.get("AGENT_MEMORY_CONFIG_FILE", "").strip()
     if explicit:
-        return resolve_config_path(explicit)
-    return RUNTIME_ROOT / "config" / "agent-memory.toml"
+        return resolve_config_path(explicit, lexical=True)
+    return _lexical_absolute_path(RUNTIME_ROOT / "config" / "agent-memory.toml")
 
 
 class ConfigPathSecurityError(OSError):
@@ -160,28 +160,37 @@ def _same_stable_config_file(
     )
 
 
-def _parse_config_bytes(payload_bytes: bytes) -> dict[str, Any]:
+def _parse_config_bytes(path: Path, payload_bytes: bytes) -> dict[str, Any]:
     try:
         payload_text = payload_bytes.decode("utf-8")
         if tomllib is not None:
             payload = tomllib.loads(payload_text)
         else:
             payload = parse_toml_fallback(payload_text)
-    except (UnicodeDecodeError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ConfigPathSecurityError(
+            path,
+            "invalid_config",
+            exc.__class__.__name__,
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ConfigPathSecurityError(path, "invalid_config", "root_not_table")
+    return payload
 
 
 def load_config_stable(
     raw_path: str | os.PathLike[str],
     *,
     before_open: Callable[[], None] | None = None,
+    require_exists: bool = False,
 ) -> dict[str, Any]:
     """Read one lexical TOML file without parsing bytes from a redirected path."""
 
     path = _lexical_absolute_path(raw_path)
     before_metadata = _stable_config_lstat(path)
     if before_metadata is None:
+        if require_exists:
+            raise ConfigPathSecurityError(path, "missing_explicit_config")
         return {}
     if before_open is not None:
         before_open()
@@ -236,7 +245,7 @@ def load_config_stable(
         if descriptor is not None:
             os.close(descriptor)
 
-    return _parse_config_bytes(bytes(payload_bytes))
+    return _parse_config_bytes(path, bytes(payload_bytes))
 
 
 
@@ -487,24 +496,12 @@ def parse_toml_fallback(text: str) -> dict[str, Any]:
     return payload
 
 
-@lru_cache(maxsize=1)
 def load_config() -> dict[str, Any]:
-    path = config_path()
-    if not path.is_file():
-        return {}
-    try:
-        if tomllib is not None:
-            with path.open("rb") as handle:
-                payload = tomllib.load(handle)
-        else:
-            payload = parse_toml_fallback(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    explicit = bool(os.environ.get("AGENT_MEMORY_CONFIG_FILE", "").strip())
+    return load_config_stable(config_path(), require_exists=explicit)
 
 
 def reset_config_cache() -> None:
-    load_config.cache_clear()
     load_dotenv.cache_clear()
 
 

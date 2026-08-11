@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -9,8 +10,10 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
+import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from agent_memory_state import (
     PRIVATE_DIRECTORY_MODE,
@@ -68,6 +71,17 @@ SUPPORT_FILES = (
 )
 FILE_ATTRIBUTE_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 INTEGRITY_MODEL = "sha256_drift_detection_not_authentication"
+
+
+class RuntimeRollbackError(StateSecurityError):
+    """A failed publish has recoverable backups that must not be deleted."""
+
+    def __init__(self, recovery_path: Path, errors: list[str]) -> None:
+        self.recovery_path = recovery_path
+        super().__init__(
+            "runtime install failed and rollback was incomplete; "
+            f"recovery_path={recovery_path}; errors=" + "; ".join(errors)
+        )
 
 
 def utc_now() -> str:
@@ -360,15 +374,43 @@ def runtime_permission_report(config_root: Path) -> dict[str, Any]:
     }
 
 
-def _template_name_is_safe(name: object) -> bool:
-    if not isinstance(name, str) or "\\" in name:
+WINDOWS_RESERVED_SEGMENTS = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+WINDOWS_FORBIDDEN_NAME_CHARACTERS = frozenset('<>:"|?*\\')
+
+
+def _manifest_segment_is_safe(segment: str) -> bool:
+    if segment in {"", ".", ".."} or segment.endswith((".", " ")):
+        return False
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in WINDOWS_FORBIDDEN_NAME_CHARACTERS
+        for character in segment
+    ):
+        return False
+    device_stem = segment.split(".", 1)[0].upper()
+    return device_stem not in WINDOWS_RESERVED_SEGMENTS
+
+
+def _manifest_name_is_safe(name: object) -> bool:
+    if not isinstance(name, str) or name.startswith("/"):
         return False
     parts = name.split("/")
-    return (
-        len(parts) >= 3
-        and parts[:2] == ["templates", "vault"]
-        and all(part not in {"", ".", ".."} for part in parts)
-    )
+    return bool(parts) and all(_manifest_segment_is_safe(part) for part in parts)
+
+
+def _template_name_is_safe(name: object) -> bool:
+    if not _manifest_name_is_safe(name):
+        return False
+    assert isinstance(name, str)
+    parts = name.split("/")
+    return len(parts) >= 3 and parts[:2] == ["templates", "vault"]
 
 
 def _record_issue(issues: list[dict[str, Any]], issue: dict[str, Any] | None) -> None:
@@ -457,6 +499,11 @@ def verify(config_root: Path) -> dict[str, Any]:
 
     expected_raw = manifest.get("files")
     expected = expected_raw if isinstance(expected_raw, dict) else {}
+    core_unsafe_names = sorted(
+        str(name)
+        for name in expected
+        if not _manifest_name_is_safe(name) or "/" in str(name)
+    )
     core_closure_missing = sorted(set(CORE_FILES) - set(expected))
     core_closure_unexpected = sorted(set(expected) - set(CORE_FILES))
     missing: list[str] = []
@@ -478,6 +525,9 @@ def verify(config_root: Path) -> dict[str, Any]:
 
     support_expected_raw = manifest.get("support_files")
     support_expected = support_expected_raw if isinstance(support_expected_raw, dict) else {}
+    support_unsafe_names = sorted(
+        str(name) for name in support_expected if not _manifest_name_is_safe(name)
+    )
     support_closure_missing = sorted(set(SUPPORT_FILES) - set(support_expected))
     support_closure_unexpected = sorted(set(support_expected) - set(SUPPORT_FILES))
     support_missing: list[str] = []
@@ -570,8 +620,10 @@ def verify(config_root: Path) -> dict[str, Any]:
     closure = {
         "core_missing": core_closure_missing,
         "core_unexpected": core_closure_unexpected,
+        "core_unsafe_names": core_unsafe_names,
         "support_missing": support_closure_missing,
         "support_unexpected": support_closure_unexpected,
+        "support_unsafe_names": support_unsafe_names,
         "required_template_missing": required_template_missing,
         "template_unsafe_names": template_unsafe_names,
         "template_hash_missing": template_hash_missing,
@@ -599,6 +651,8 @@ def verify(config_root: Path) -> dict[str, Any]:
             and not template_mismatched
             and not unsafe_paths
             and not template_unsafe_names
+            and not core_unsafe_names
+            and not support_unsafe_names
             and not core_closure_missing
             and not core_closure_unexpected
             and not support_closure_missing
@@ -656,90 +710,316 @@ def assert_managed_target(
     )
 
 
+def _raise_first_unsafe_path(config_root: Path) -> None:
+    unsafe_paths = _unsafe_runtime_paths(config_root)
+    if not unsafe_paths:
+        return
+    first = unsafe_paths[0]
+    if first["reason"] == "reparse_point":
+        raise StateSecurityError(
+            "managed runtime path must not be a symlink or reparse point: "
+            f"{first['path']}"
+        )
+    raise StateSecurityError(
+        f"managed runtime path is unsafe ({first['reason']}): {first['path']}"
+    )
+
+
+def _nearest_existing_directory(path: Path) -> Path:
+    cursor = absolute_path(path)
+    while True:
+        try:
+            metadata = os.lstat(cursor)
+        except FileNotFoundError:
+            parent = cursor.parent
+            if parent == cursor:
+                raise StateSecurityError(
+                    f"runtime install has no existing parent directory: {path}"
+                )
+            cursor = parent
+            continue
+        if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise StateSecurityError(
+                f"runtime install parent is unsafe: {cursor}"
+            )
+        return cursor
+
+
+@contextlib.contextmanager
+def _runtime_install_mutex(config_root: Path) -> Iterator[None]:
+    """Serialize publishers without placing a lock artifact in the runtime."""
+
+    lock_parent = _nearest_existing_directory(config_root.parent)
+    lock_key = hashlib.sha256(
+        os.path.normcase(os.path.normpath(os.fspath(config_root))).encode("utf-8")
+    ).hexdigest()[:20]
+    lock_path = lock_parent / f".agent-memory-runtime-install-{lock_key}.lock"
+    try:
+        lock_path.mkdir()
+    except FileExistsError as exc:
+        raise StateSecurityError(
+            f"runtime install is already in progress: {config_root}"
+        ) from exc
+    try:
+        yield
+    finally:
+        try:
+            lock_path.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _runtime_sources(manifest: dict[str, Any]) -> list[tuple[str, Path, int | None]]:
+    sources: list[tuple[str, Path, int | None]] = []
+    for name in CORE_FILES:
+        source = SOURCE_ROOT / name
+        mode = source.stat().st_mode & 0o777 if POSIX_MODE_ENFORCED else None
+        sources.append((f"scripts/{name}", source, mode))
+    sources.extend((name, REPO_ROOT / name, None) for name in SUPPORT_FILES)
+    sources.extend(
+        (name, REPO_ROOT / name, None) for name in manifest["template_inventory"]
+    )
+    return sources
+
+
+def _change_report(
+    config_root: Path,
+    manifest: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    expected: list[tuple[str, str]] = []
+    expected.extend((name, manifest["files"][name]) for name in CORE_FILES)
+    expected.extend((name, manifest["support_files"][name]) for name in SUPPORT_FILES)
+    expected.extend(manifest["template_files"].items())
+    changed: list[str] = []
+    unchanged: list[str] = []
+    for report_name, digest in expected:
+        relative = f"scripts/{report_name}" if report_name in CORE_FILES else report_name
+        target = config_root / relative
+        assert_managed_target(config_root, target)
+        try:
+            metadata = os.lstat(target)
+        except FileNotFoundError:
+            changed.append(report_name)
+            continue
+        if stat.S_ISREG(metadata.st_mode) and sha256(target) == digest:
+            unchanged.append(report_name)
+        else:
+            changed.append(report_name)
+    return changed, unchanged
+
+
+def _create_managed_directory(
+    config_root: Path,
+    directory: Path,
+    created: list[Path],
+) -> None:
+    missing: list[Path] = []
+    cursor = directory
+    while cursor != config_root:
+        try:
+            metadata = os.lstat(cursor)
+        except FileNotFoundError:
+            missing.append(cursor)
+            cursor = cursor.parent
+            continue
+        if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise StateSecurityError(f"managed runtime directory is unsafe: {cursor}")
+        break
+    assert_managed_target(
+        config_root,
+        cursor,
+        expected_kind="directory",
+        allow_missing=False,
+    )
+    for candidate in reversed(missing):
+        assert_managed_target(config_root, candidate, expected_kind="directory")
+        candidate.mkdir()
+        created.append(candidate)
+        assert_managed_target(
+            config_root,
+            candidate,
+            expected_kind="directory",
+            allow_missing=False,
+        )
+
+
+def _stage_runtime(
+    config_root: Path,
+    manifest: dict[str, Any],
+) -> Path:
+    stage_root = Path(tempfile.mkdtemp(prefix=".runtime-stage-", dir=config_root))
+    try:
+        for relative, source, mode in _runtime_sources(manifest):
+            target = stage_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            if mode is not None:
+                target.chmod(mode)
+        manifest_path = stage_root / "config" / "runtime-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        harden_runtime_permissions(stage_root)
+        staged_verification = verify(stage_root)
+        if not staged_verification.get("ok"):
+            raise StateSecurityError(
+                "staged runtime closure failed verification: "
+                + json.dumps(staged_verification, ensure_ascii=False, sort_keys=True)
+            )
+        return stage_root
+    except BaseException:
+        shutil.rmtree(stage_root, ignore_errors=True)
+        raise
+
+
+def _remove_empty_directories(paths: list[Path]) -> None:
+    for directory in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _publish_staged_runtime(
+    config_root: Path,
+    stage_root: Path,
+    manifest: dict[str, Any],
+) -> None:
+    backup_root = stage_root / ".rollback"
+    backup_root.mkdir()
+    created_directories: list[Path] = []
+    actions: list[dict[str, Any]] = []
+
+    def publish(relative: str, mode: int | None = None) -> None:
+        source = stage_root / relative
+        target = config_root / relative
+        assert_managed_target(config_root, target)
+        _create_managed_directory(config_root, target.parent, created_directories)
+        assert_managed_target(config_root, target)
+        backup = backup_root / relative
+        existed = False
+        try:
+            metadata = os.lstat(target)
+        except FileNotFoundError:
+            pass
+        else:
+            if _is_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+                raise StateSecurityError(f"managed runtime file is unsafe: {target}")
+            existed = True
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target, backup)
+        action = {"target": target, "backup": backup, "existed": existed, "published": False}
+        actions.append(action)
+        assert_managed_target(config_root, target)
+        os.replace(source, target)
+        action["published"] = True
+        if mode is not None:
+            target.chmod(mode)
+
+    try:
+        manifest_relative = "config/runtime-manifest.json"
+        for relative, _source, mode in _runtime_sources(manifest):
+            publish(relative, mode)
+
+        desired_templates = set(manifest["template_inventory"])
+        disk_templates, template_issues = scan_template_inventory(config_root)
+        if template_issues:
+            first = template_issues[0]
+            raise StateSecurityError(
+                f"managed template tree is unsafe ({first['reason']}): {first['path']}"
+            )
+        for relative in sorted(set(disk_templates) - desired_templates):
+            target = config_root / relative
+            assert_managed_target(config_root, target, allow_missing=False)
+            backup = backup_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            action = {
+                "target": target,
+                "backup": backup,
+                "existed": True,
+                "published": False,
+                "removed": False,
+            }
+            actions.append(action)
+            os.replace(target, backup)
+            action["removed"] = True
+
+        # The manifest is the commit marker and is always published last.
+        publish(manifest_relative)
+        harden_runtime_permissions(config_root)
+        installed_verification = verify(config_root)
+        if not installed_verification.get("ok"):
+            raise StateSecurityError(
+                "published runtime closure failed verification: "
+                + json.dumps(installed_verification, ensure_ascii=False, sort_keys=True)
+            )
+    except BaseException as install_error:
+        rollback_errors: list[str] = []
+        for action in reversed(actions):
+            target = action["target"]
+            backup = action["backup"]
+            try:
+                if action.get("existed") and backup.exists():
+                    os.replace(backup, target)
+                elif action.get("published"):
+                    target.unlink(missing_ok=True)
+            except OSError as exc:
+                rollback_errors.append(f"{target}: {exc}")
+        _remove_empty_directories(created_directories)
+        if rollback_errors:
+            raise RuntimeRollbackError(backup_root, rollback_errors) from install_error
+        raise
+
+
 def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
     config_root = absolute_path(config_root)
-    script_root = config_root / "scripts"
-    config_dir = config_root / "config"
-    manifest_path = config_dir / "runtime-manifest.json"
-    unsafe_paths = _unsafe_runtime_paths(config_root)
-    if unsafe_paths:
-        first = unsafe_paths[0]
-        if first["reason"] == "reparse_point":
-            raise StateSecurityError(
-                "managed runtime path must not be a symlink or reparse point: "
-                f"{first['path']}"
-            )
-        raise StateSecurityError(
-            f"managed runtime path is unsafe ({first['reason']}): {first['path']}"
-        )
+    _raise_first_unsafe_path(config_root)
     manifest = expected_manifest(config_root)
     for name in manifest["template_inventory"]:
         assert_managed_target(config_root, config_root / name)
-    changed: list[str] = []
-    unchanged: list[str] = []
+    changed, unchanged = _change_report(config_root, manifest)
     if not dry_run:
-        ensure_private_directory(config_root, harden_existing=True)
-    for name in CORE_FILES:
-        source = SOURCE_ROOT / name
-        target = script_root / name
-        assert_managed_target(config_root, target)
-        if target.is_file() and sha256(target) == manifest["files"][name]:
-            unchanged.append(name)
-            if not dry_run and POSIX_MODE_ENFORCED:
-                target.chmod(source.stat().st_mode & 0o777)
-            continue
-        changed.append(name)
-        if not dry_run:
-            assert_managed_target(
-                config_root,
-                target.parent,
-                expected_kind="directory",
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            assert_managed_target(config_root, target)
-            shutil.copy2(source, target)
-            if POSIX_MODE_ENFORCED:
-                target.chmod(source.stat().st_mode & 0o777)
-    for name in SUPPORT_FILES:
-        source = REPO_ROOT / name
-        target = config_root / name
-        assert_managed_target(config_root, target)
-        if target.is_file() and sha256(target) == manifest["support_files"][name]:
-            unchanged.append(name)
-            continue
-        changed.append(name)
-        if not dry_run:
-            assert_managed_target(
-                config_root,
-                target.parent,
-                expected_kind="directory",
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            assert_managed_target(config_root, target)
-            shutil.copy2(source, target)
-    for name, digest in manifest["template_files"].items():
-        source = REPO_ROOT / name
-        target = config_root / name
-        assert_managed_target(config_root, target)
-        if target.is_file() and sha256(target) == digest:
-            unchanged.append(name)
-            continue
-        changed.append(name)
-        if not dry_run:
-            assert_managed_target(
-                config_root,
-                target.parent,
-                expected_kind="directory",
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            assert_managed_target(config_root, target)
-            shutil.copy2(source, target)
-    if not dry_run:
-        assert_managed_target(config_root, config_dir, expected_kind="directory")
-        ensure_private_directory(config_dir, harden_existing=True)
-        assert_managed_target(config_root, manifest_path)
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        harden_runtime_permissions(config_root)
+        root_created = False
+        with _runtime_install_mutex(config_root):
+            _raise_first_unsafe_path(config_root)
+            try:
+                try:
+                    metadata = os.lstat(config_root)
+                except FileNotFoundError:
+                    config_root.mkdir(parents=True)
+                    root_created = True
+                else:
+                    if _is_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+                        raise StateSecurityError(
+                            f"managed runtime root is unsafe: {config_root}"
+                        )
+                assert_managed_target(
+                    config_root,
+                    config_root,
+                    expected_kind="directory",
+                    allow_missing=False,
+                )
+                ensure_private_directory(config_root, harden_existing=True)
+                stage_root = _stage_runtime(config_root, manifest)
+                preserve_stage = False
+                try:
+                    _raise_first_unsafe_path(config_root)
+                    _publish_staged_runtime(config_root, stage_root, manifest)
+                except RuntimeRollbackError:
+                    preserve_stage = True
+                    raise
+                finally:
+                    if not preserve_stage:
+                        shutil.rmtree(stage_root, ignore_errors=True)
+            except BaseException:
+                if root_created:
+                    try:
+                        config_root.rmdir()
+                    except OSError:
+                        pass
+                raise
     permissions = (
         runtime_permission_report(config_root)
         if not dry_run

@@ -20,6 +20,24 @@ from agent_memory_env import env_value, parse_toml_fallback, reset_config_cache
 
 
 class AgentMemoryEnvironmentTests(unittest.TestCase):
+    def test_explicit_config_path_expands_variables_without_resolving(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": "%TEST_CONFIG_HOME%/agent-memory.toml",
+                    "TEST_CONFIG_HOME": str(root),
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    agent_memory_env.config_path(),
+                    root / "agent-memory.toml",
+                )
+
     def test_toml_fallback_matches_tomllib_value_corpus(self) -> None:
         corpus = r'''
 title = "value # retained" # outside comment

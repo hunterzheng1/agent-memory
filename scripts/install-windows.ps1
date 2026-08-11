@@ -124,13 +124,49 @@ function Get-InstallerPathState([string]$Path) {
     if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "installer_preflight=error reason=reparse_point path=$Path"
     }
-    return [string]::Join('|', @(
+    $state = @(
         'present',
         $item.GetType().FullName,
         [string]$item.PSIsContainer,
         [string][int]$attributes,
         [string]$item.CreationTimeUtc.Ticks
-    ))
+    )
+    if ($item -is [System.IO.FileInfo]) {
+        $hashStream = $null
+        $hasher = $null
+        try {
+            $hashStream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+            $hasher = [System.Security.Cryptography.SHA256]::Create()
+            $hashBytes = $hasher.ComputeHash($hashStream)
+            $contentHash = ([System.BitConverter]::ToString($hashBytes)).Replace('-', '').ToLowerInvariant()
+            $afterHash = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        } catch {
+            $errorKind = $_.Exception.GetType().Name
+            throw "installer_preflight=error reason=metadata_error detail=$errorKind path=$Path"
+        } finally {
+            if ($null -ne $hasher) { $hasher.Dispose() }
+            if ($null -ne $hashStream) { $hashStream.Dispose() }
+        }
+        $afterAttributes = [System.IO.FileAttributes]$afterHash.Attributes
+        if (
+            ($afterAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            -not ($afterHash -is [System.IO.FileInfo]) -or
+            $afterHash.CreationTimeUtc.Ticks -ne $item.CreationTimeUtc.Ticks
+        ) {
+            throw "installer_preflight=error reason=path_changed path=$Path"
+        }
+        $state += @(
+            [string]$afterHash.Length,
+            [string]$afterHash.LastWriteTimeUtc.Ticks,
+            $contentHash
+        )
+    }
+    return [string]::Join('|', $state)
 }
 
 function Get-InstallerPathSnapshot([string[]]$Paths) {
@@ -445,7 +481,11 @@ import sys
 sys.path.insert(0, sys.argv[1])
 import agent_memory_env
 
-config = agent_memory_env.load_config()
+try:
+    config = agent_memory_env.load_config()
+except agent_memory_env.ConfigPathSecurityError as exc:
+    print('config_validation=error reason=' + exc.reason, file=sys.stderr)
+    raise SystemExit(2)
 required = ('memory_root', 'git_root', 'state_db')
 missing = [key for key in required if not str(config.get(key, '')).strip()]
 if missing:

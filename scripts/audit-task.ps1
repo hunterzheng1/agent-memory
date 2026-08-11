@@ -19,6 +19,27 @@ $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
+$taskPath = '\AgentMemory\'
+
+function Assert-SafeTaskName([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        throw 'TaskName must not be empty.'
+    }
+    if ($Name.Length -gt 128) {
+        throw 'TaskName must not exceed 128 characters.'
+    }
+    if ($Name.IndexOfAny([char[]]@('*', '?', '[', ']', '/', '\')) -ge 0) {
+        throw 'TaskName must not contain wildcards or path separators.'
+    }
+    foreach ($character in $Name.ToCharArray()) {
+        $code = [int][char]$character
+        if ($code -lt 32 -or $code -eq 127) {
+            throw 'TaskName must not contain control characters.'
+        }
+    }
+}
+
+Assert-SafeTaskName $TaskName
 
 if (-not $RuntimeRoot) {
     $RuntimeRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -27,31 +48,61 @@ $RuntimeRoot = [System.IO.Path]::GetFullPath($RuntimeRoot)
 $scriptRoot = Join-Path $RuntimeRoot 'scripts'
 $auditScript = Join-Path $scriptRoot 'agent_memory_audit_autorun.py'
 $pythonPrefix = ''
-if (-not $Python) {
-    $candidate = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-        $Python = $candidate
-    } else {
-        $command = Get-Command python.exe -ErrorAction SilentlyContinue
-        if (-not $command) {
-            $command = Get-Command py.exe -ErrorAction SilentlyContinue
-            if ($command) { $pythonPrefix = '-3 ' }
+$taskArguments = $null
+
+function Resolve-InstallPython {
+    if (-not $script:Python) {
+        $candidate = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $script:Python = $candidate
+        } else {
+            $command = Get-Command python.exe -ErrorAction SilentlyContinue
+            if (-not $command) {
+                $command = Get-Command py.exe -ErrorAction SilentlyContinue
+                if ($command) { $script:pythonPrefix = '-3 ' }
+            }
+            if (-not $command) { throw 'Python 3 was not found.' }
+            $script:Python = $command.Source
         }
-        if (-not $command) { throw 'Python 3 was not found.' }
-        $Python = $command.Source
     }
+    $script:Python = [System.IO.Path]::GetFullPath($script:Python)
+    if ($script:Python.IndexOf('"') -ge 0 -or $auditScript.IndexOf('"') -ge 0) {
+        throw 'Scheduled task executable paths may not contain a double quote.'
+    }
+    $script:taskArguments = $script:pythonPrefix + ('-X utf8 "{0}" --reason task-scheduler --json' -f $auditScript)
 }
-$Python = [System.IO.Path]::GetFullPath($Python)
-if ($Python.IndexOf('"') -ge 0 -or $auditScript.IndexOf('"') -ge 0) {
-    throw 'Scheduled task executable paths may not contain a double quote.'
+
+function Get-ExactAuditTask {
+    $candidates = @(
+        Get-ScheduledTask `
+            -TaskPath $taskPath `
+            -TaskName $TaskName `
+            -ErrorAction SilentlyContinue
+    )
+    $exact = @(
+        $candidates | Where-Object {
+            $null -ne $_ -and
+            ([string]$_.TaskName).Equals($TaskName, [System.StringComparison]::OrdinalIgnoreCase) -and
+            ([string]$_.TaskPath).Equals($taskPath, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    )
+    if ($exact.Count -gt 1) {
+        throw "Multiple exact scheduled tasks were returned for path=$taskPath name=$TaskName"
+    }
+    if ($exact.Count -eq 1) { return $exact[0] }
+    return $null
 }
-$taskArguments = $pythonPrefix + ('-X utf8 "{0}" --reason task-scheduler --json' -f $auditScript)
+
+if ($Action -eq 'install') {
+    Resolve-InstallPython
+}
 
 if ($PlanOnly) {
     [pscustomobject]@{
         action = $Action
+        task_path = $taskPath
         task_name = $TaskName
-        python = $Python
+        python = $(if ($Action -eq 'install') { $Python } else { $null })
         arguments = $taskArguments
         working_directory = $RuntimeRoot
         day_of_week = $DayOfWeek
@@ -77,6 +128,7 @@ switch ($Action) {
             -StartWhenAvailable `
             -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
         Register-ScheduledTask `
+            -TaskPath $taskPath `
             -TaskName $TaskName `
             -Action $taskAction `
             -Trigger $trigger `
@@ -87,24 +139,24 @@ switch ($Action) {
         Write-Output "[OK] installed task=$TaskName"
     }
     'status' {
-        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        $task = Get-ExactAuditTask
         if (-not $task) {
-            Write-Output "[WARN] task_missing name=$TaskName"
+            Write-Output "[WARN] task_missing path=$taskPath name=$TaskName"
             exit 1
         }
-        $info = Get-ScheduledTaskInfo -TaskName $TaskName
-        Write-Output "[OK] task=$TaskName state=$($task.State) last_result=$($info.LastTaskResult) next_run=$($info.NextRunTime)"
+        $info = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName $TaskName
+        Write-Output "[OK] task_path=$taskPath task=$TaskName state=$($task.State) last_result=$($info.LastTaskResult) next_run=$($info.NextRunTime)"
     }
     'run' {
-        if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        if (-not (Get-ExactAuditTask)) {
             throw "Scheduled task not found: $TaskName"
         }
-        Start-ScheduledTask -TaskName $TaskName
+        Start-ScheduledTask -TaskPath $taskPath -TaskName $TaskName
         Write-Output "[OK] started task=$TaskName"
     }
     'uninstall' {
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        if (Get-ExactAuditTask) {
+            Unregister-ScheduledTask -TaskPath $taskPath -TaskName $TaskName -Confirm:$false
             Write-Output "[OK] uninstalled task=$TaskName"
         } else {
             Write-Output "[OK] task_already_absent name=$TaskName"

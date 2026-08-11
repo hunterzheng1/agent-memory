@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,30 @@ from tests.subprocess_env import isolated_subprocess_env
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_ROOT = REPO_ROOT / "scripts"
+
+
+def make_directory_reparse(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if created.returncode != 0:
+            raise OSError(created.stdout + created.stderr)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def remove_directory_reparse(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
 
 
 def run(command: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -26,6 +51,180 @@ def run(command: list[str], env: dict[str, str] | None = None) -> subprocess.Com
 
 
 class BootstrapIntegrationTests(unittest.TestCase):
+    def test_bootstrap_after_cas_replacement_restores_actual_object(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            vault = root / "vault"
+            vault.mkdir()
+            agents = vault / "AGENTS.md"
+            agents.write_text("original vault object\n", encoding="utf-8")
+            outside = root / "outside-agents.md"
+            outside.write_text("external sentinel\n", encoding="utf-8")
+            capability = root / "symlink-capability"
+            try:
+                capability.symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            else:
+                capability.unlink()
+            probe = (
+                "import pathlib,sys;"
+                f"sys.path.insert(0,{str(SCRIPT_ROOT)!r});"
+                "import bootstrap;"
+                "vault=pathlib.Path(sys.argv[1]);outside=pathlib.Path(sys.argv[2]);"
+                "fired=[False];"
+                "exec(\"def race(target):\\n"
+                "    if target.name == 'AGENTS.md' and not fired[0]:\\n"
+                "        fired[0] = True\\n"
+                "        target.unlink()\\n"
+                "        target.symlink_to(outside)\");"
+                "bootstrap.copy_template(vault,{},True,after_cas_before_replace=race)"
+            )
+
+            result = subprocess.run(
+                [sys.executable, "-c", probe, str(vault), str(outside)],
+                cwd=REPO_ROOT,
+                env=isolated_subprocess_env(),
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("actual vault object was unsafe", result.stderr)
+            self.assertTrue(agents.is_symlink())
+            self.assertEqual(outside.read_text(encoding="utf-8"), "external sentinel\n")
+
+    def test_bootstrap_rejects_vault_root_junction_without_external_write(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            outside = root / "outside-vault"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            vault = root / "vault-link"
+            try:
+                make_directory_reparse(vault, outside)
+            except OSError as exc:
+                self.skipTest(f"directory reparse points unavailable: {exc}")
+            try:
+                bootstrap = run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_ROOT / "bootstrap.py"),
+                        "--memory-root",
+                        str(vault),
+                        "--no-init-git",
+                    ]
+                )
+
+                self.assertNotEqual(
+                    bootstrap.returncode,
+                    0,
+                    bootstrap.stdout + bootstrap.stderr,
+                )
+                self.assertIn("BootstrapPathSecurityError", bootstrap.stderr)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+                self.assertEqual(
+                    sorted(path.name for path in outside.iterdir()),
+                    ["sentinel.txt"],
+                )
+            finally:
+                remove_directory_reparse(vault)
+
+    def test_bootstrap_rejects_agents_file_symlink_even_with_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            vault = root / "vault"
+            vault.mkdir()
+            outside = root / "outside-agents.md"
+            outside.write_text("external sentinel\n", encoding="utf-8")
+            try:
+                (vault / "AGENTS.md").symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+
+            bootstrap = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_ROOT / "bootstrap.py"),
+                    "--memory-root",
+                    str(vault),
+                    "--overwrite",
+                    "--no-init-git",
+                ]
+            )
+
+            self.assertNotEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("BootstrapPathSecurityError", bootstrap.stderr)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "external sentinel\n")
+
+    def test_bootstrap_rejects_broken_template_file_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            vault = root / "vault"
+            vault.mkdir()
+            outside = root / "must-not-be-created.md"
+            try:
+                (vault / "AGENTS.md").symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+
+            bootstrap = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_ROOT / "bootstrap.py"),
+                    "--memory-root",
+                    str(vault),
+                    "--no-init-git",
+                ]
+            )
+
+            self.assertNotEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("BootstrapPathSecurityError", bootstrap.stderr)
+            self.assertFalse(outside.exists())
+
+    def test_bootstrap_rejects_template_parent_junction_without_external_write(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            vault = root / "vault"
+            vault.mkdir()
+            outside = root / "outside-agent"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            link = vault / "agent"
+            try:
+                make_directory_reparse(link, outside)
+            except OSError as exc:
+                self.skipTest(f"directory reparse points unavailable: {exc}")
+            try:
+                bootstrap = run(
+                    [
+                        sys.executable,
+                        str(SCRIPT_ROOT / "bootstrap.py"),
+                        "--memory-root",
+                        str(vault),
+                        "--overwrite",
+                        "--no-init-git",
+                    ]
+                )
+
+                self.assertNotEqual(
+                    bootstrap.returncode,
+                    0,
+                    bootstrap.stdout + bootstrap.stderr,
+                )
+                self.assertIn("BootstrapPathSecurityError", bootstrap.stderr)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+                self.assertEqual(
+                    sorted(path.name for path in outside.iterdir()),
+                    ["sentinel.txt"],
+                )
+            finally:
+                remove_directory_reparse(link)
+
     def test_new_namespace_bootstraps_indexes_and_checks(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             root = Path(raw_root).resolve()

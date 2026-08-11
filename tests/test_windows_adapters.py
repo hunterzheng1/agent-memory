@@ -241,6 +241,374 @@ class WindowsPowerShellAdapterTests(unittest.TestCase):
             self.assertIn("-Protocol codex", managed[0])
             self.assertIn("-Event stop-hook", managed[0])
 
+    def test_codex_hook_updates_mode_and_converges_duplicate_managed_entries(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            hooks_path = root / "profile" / "hooks.json"
+            hooks_path.parent.mkdir()
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "custom": {"preserve": True},
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": "unrelated-stop",
+                                            "timeout": 7,
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            base_arguments = (
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_path),
+            )
+
+            normal = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                *base_arguments,
+            )
+            self.assertEqual(normal.returncode, 0, normal.stdout + normal.stderr)
+            auto = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                *base_arguments,
+                "-AutoCloseout",
+            )
+            self.assertEqual(auto.returncode, 0, auto.stdout + auto.stderr)
+            auto_payload = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            managed_groups = [
+                group
+                for group in auto_payload["hooks"]["Stop"]
+                if any(
+                    "stop-hook.ps1" in hook.get("command", "").lower()
+                    for hook in group["hooks"]
+                )
+            ]
+            self.assertEqual(len(managed_groups), 1)
+            managed_hook = next(
+                hook
+                for hook in managed_groups[0]["hooks"]
+                if "stop-hook.ps1" in hook["command"].lower()
+            )
+            self.assertIn("-AutoCloseout", managed_hook["command"])
+            self.assertEqual(managed_hook["timeout"], 320)
+
+            auto_payload["hooks"]["Stop"].append(json.loads(json.dumps(managed_groups[0])))
+            hooks_path.write_text(json.dumps(auto_payload), encoding="utf-8")
+            back_to_normal = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                *base_arguments,
+            )
+            self.assertEqual(
+                back_to_normal.returncode,
+                0,
+                back_to_normal.stdout + back_to_normal.stderr,
+            )
+            final_payload = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            managed_hooks = [
+                hook
+                for group in final_payload["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if "stop-hook.ps1" in hook.get("command", "").lower()
+            ]
+            self.assertEqual(len(managed_hooks), 1)
+            self.assertNotIn("-AutoCloseout", managed_hooks[0]["command"])
+            self.assertEqual(managed_hooks[0]["timeout"], 20)
+            self.assertEqual(final_payload["custom"], {"preserve": True})
+            unrelated = [
+                hook
+                for group in final_payload["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if hook.get("command") == "unrelated-stop"
+            ]
+            self.assertEqual(len(unrelated), 1)
+
+    def test_codex_hook_recognizes_single_quoted_managed_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime path"
+            scripts = self.install_runtime(runtime)
+            hooks_path = root / "profile" / "hooks.json"
+            hooks_path.parent.mkdir()
+            wrapper = scripts / "stop-hook.ps1"
+            single_quoted = (
+                "powershell.exe -NoProfile -File "
+                f"'{wrapper}' -Actor codex -Protocol codex -Event stop-hook"
+            )
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {
+                                    "hooks": [
+                                        {
+                                            "type": "command",
+                                            "command": single_quoted,
+                                            "timeout": 20,
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_path),
+                "-AutoCloseout",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            managed = [
+                hook
+                for group in payload["hooks"]["Stop"]
+                for hook in group["hooks"]
+                if "stop-hook.ps1" in hook.get("command", "").lower()
+            ]
+            self.assertEqual(len(managed), 1)
+            self.assertIn("-AutoCloseout", managed[0]["command"])
+            self.assertEqual(managed[0]["timeout"], 320)
+
+    def test_codex_hook_rejects_invalid_nested_schema_without_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            hooks_path = root / "profile" / "hooks.json"
+            hooks_path.parent.mkdir()
+            before = b'{"hooks":{"Stop":[{"hooks":"not-an-array"}]}}\n'
+            hooks_path.write_bytes(before)
+
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_path),
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("schema", result.stderr.lower())
+            self.assertEqual(hooks_path.read_bytes(), before)
+
+    def test_codex_hook_detects_concurrent_edit_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            hooks_path = root / "profile" / "hooks.json"
+            hooks_path.parent.mkdir()
+            hooks_path.write_text('{"custom":"initial"}\n', encoding="utf-8")
+            barrier = root / "agent-memory-hook-test-race"
+            barrier.mkdir()
+            environment = isolated_subprocess_env(
+                {"_AGENT_MEMORY_TEST_HOOK_BARRIER": str(barrier)}
+            )
+            command = [
+                WINDOWS_POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(scripts / "install-codex-hook.ps1"),
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_path),
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ready = barrier / "ready"
+            deadline = time.monotonic() + 10
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready.exists():
+                stdout, stderr = process.communicate(timeout=10)
+                self.fail(f"hook test barrier was not reached: {stdout}{stderr}")
+            concurrent = b'{"custom":"concurrent-editor"}\n'
+            hooks_path.write_bytes(concurrent)
+            (barrier / "continue").write_text("continue\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=20)
+
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+            self.assertIn("concurrent", stderr.lower())
+            self.assertEqual(hooks_path.read_bytes(), concurrent)
+
+    def test_codex_hook_restores_actual_object_changed_after_cas(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            hooks_path = root / "profile" / "hooks.json"
+            hooks_path.parent.mkdir()
+            hooks_path.write_text('{"custom":"initial"}\n', encoding="utf-8")
+            barrier = root / "agent-memory-hook-test-after-cas"
+            barrier.mkdir()
+            environment = isolated_subprocess_env(
+                {"_AGENT_MEMORY_TEST_HOOK_AFTER_CAS_BARRIER": str(barrier)}
+            )
+            command = [
+                WINDOWS_POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(scripts / "install-codex-hook.ps1"),
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_path),
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ready = barrier / "ready"
+            deadline = time.monotonic() + 10
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready.exists():
+                stdout, stderr = process.communicate(timeout=10)
+                self.fail(f"after-CAS hook barrier was not reached: {stdout}{stderr}")
+            concurrent = b'{"custom":"after-cas-editor"}\n'
+            hooks_path.write_bytes(concurrent)
+            (barrier / "continue").write_text("continue\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=20)
+
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+            self.assertIn("actual hooks object changed", stderr.lower())
+            self.assertEqual(hooks_path.read_bytes(), concurrent)
+
+    def test_codex_hook_default_path_uses_temporary_userprofile(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            profile = root / "temporary profile"
+            profile.mkdir()
+
+            result = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                "-RuntimeRoot",
+                str(runtime),
+                env=isolated_subprocess_env(
+                    {"USERPROFILE": str(profile), "HOME": str(profile)}
+                ),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            hooks_path = profile / ".codex" / "hooks.json"
+            self.assertTrue(hooks_path.is_file())
+            payload = json.loads(hooks_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(len(payload["hooks"]["Stop"]), 1)
+
+    def test_codex_hook_rejects_parent_junction_and_file_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+
+            outside_directory = root / "outside-directory"
+            outside_directory.mkdir()
+            sentinel = outside_directory / "sentinel.txt"
+            sentinel.write_text("unchanged\n", encoding="utf-8")
+            hooks_parent = root / "profile-link"
+            try:
+                make_windows_junction(hooks_parent, outside_directory)
+            except OSError as exc:
+                self.skipTest(f"junctions unavailable: {exc}")
+            try:
+                parent_result = run_ps(
+                    WINDOWS_POWERSHELL,
+                    scripts / "install-codex-hook.ps1",
+                    "-RuntimeRoot",
+                    str(runtime),
+                    "-HooksPath",
+                    str(hooks_parent / "hooks.json"),
+                )
+                self.assertNotEqual(
+                    parent_result.returncode,
+                    0,
+                    parent_result.stdout + parent_result.stderr,
+                )
+                self.assertIn("reparse", parent_result.stderr.lower())
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
+                self.assertFalse((outside_directory / "hooks.json").exists())
+            finally:
+                os.rmdir(hooks_parent)
+
+            safe_parent = root / "safe-profile"
+            safe_parent.mkdir()
+            external_file = root / "outside-hooks.json"
+            external_file.write_text('{"sentinel":"unchanged"}\n', encoding="utf-8")
+            hooks_file = safe_parent / "hooks.json"
+            try:
+                hooks_file.symlink_to(external_file)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+            file_result = run_ps(
+                WINDOWS_POWERSHELL,
+                scripts / "install-codex-hook.ps1",
+                "-RuntimeRoot",
+                str(runtime),
+                "-HooksPath",
+                str(hooks_file),
+            )
+            self.assertNotEqual(
+                file_result.returncode,
+                0,
+                file_result.stdout + file_result.stderr,
+            )
+            self.assertIn("reparse", file_result.stderr.lower())
+            self.assertEqual(
+                external_file.read_text(encoding="utf-8"),
+                '{"sentinel":"unchanged"}\n',
+            )
+
     def test_audit_task_plan_only_has_no_scheduled_task_side_effect(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             runtime = Path(raw_root).resolve() / "runtime with spaces"
@@ -280,6 +648,141 @@ class WindowsPowerShellAdapterTests(unittest.TestCase):
             uninstall_plan = json.loads(uninstall.stdout)
             self.assertEqual(uninstall_plan["action"], "uninstall")
             self.assertFalse(uninstall_plan["side_effects"])
+
+    def test_audit_task_rejects_unsafe_task_names(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            runtime = Path(raw_root).resolve() / "runtime"
+            scripts = self.install_runtime(runtime)
+            invalid_names = (
+                "unsafe*wildcard",
+                "unsafe?wildcard",
+                "unsafe[range]",
+                "unsafe/path",
+                "unsafe\\path",
+                "unsafe\ncontrol",
+                "x" * 129,
+            )
+            for task_name in invalid_names:
+                with self.subTest(task_name=repr(task_name)):
+                    result = run_ps(
+                        WINDOWS_POWERSHELL,
+                        scripts / "audit-task.ps1",
+                        "status",
+                        "-TaskName",
+                        task_name,
+                        "-PlanOnly",
+                        env=isolated_subprocess_env({"PATH": ""}),
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+                    self.assertIn("TaskName", result.stderr)
+
+    def test_audit_noninstall_plan_does_not_resolve_python_and_has_fixed_path(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            runtime = Path(raw_root).resolve() / "runtime"
+            scripts = self.install_runtime(runtime)
+            for action in ("status", "run", "uninstall"):
+                with self.subTest(action=action):
+                    result = run_ps(
+                        WINDOWS_POWERSHELL,
+                        scripts / "audit-task.ps1",
+                        action,
+                        "-TaskName",
+                        "AgentMemoryVaultAudit-Test",
+                        "-PlanOnly",
+                        env=isolated_subprocess_env({"PATH": ""}),
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(payload["task_path"], "\\AgentMemory\\")
+                    self.assertIn(payload["python"], (None, ""))
+
+    def test_audit_noninstall_actions_work_without_python_using_exact_mock_task(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            probe = root / "audit-task-mock.ps1"
+            audit_script_literal = str(scripts / "audit-task.ps1").replace("'", "''")
+            probe.write_text(
+                "\n".join(
+                    [
+                        "$ErrorActionPreference = 'Stop'",
+                        "function Get-ScheduledTask {",
+                        "  [CmdletBinding()] param([string]$TaskPath, [string]$TaskName)",
+                        "  if ($TaskPath -ne '\\AgentMemory\\') { throw 'wrong task path' }",
+                        "  [pscustomobject]@{ TaskPath=$TaskPath; TaskName=$TaskName; State='Ready' }",
+                        "}",
+                        "function Get-ScheduledTaskInfo {",
+                        "  [CmdletBinding()] param([string]$TaskPath, [string]$TaskName)",
+                        "  if ($TaskPath -ne '\\AgentMemory\\') { throw 'wrong info path' }",
+                        "  [pscustomobject]@{ LastTaskResult=0; NextRunTime='soon' }",
+                        "}",
+                        "function Start-ScheduledTask {",
+                        "  [CmdletBinding()] param([string]$TaskPath, [string]$TaskName)",
+                        "  if ($TaskPath -ne '\\AgentMemory\\') { throw 'wrong start path' }",
+                        "}",
+                        "function Unregister-ScheduledTask {",
+                        "  [CmdletBinding()] param([string]$TaskPath, [string]$TaskName, [switch]$Confirm)",
+                        "  if ($TaskPath -ne '\\AgentMemory\\') { throw 'wrong unregister path' }",
+                        "}",
+                        f"& '{audit_script_literal}' $env:TEST_AUDIT_ACTION -TaskName 'AgentMemoryVaultAudit-Test'",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            for action in ("status", "run", "uninstall"):
+                with self.subTest(action=action):
+                    result = run_ps(
+                        WINDOWS_POWERSHELL,
+                        probe,
+                        env=isolated_subprocess_env(
+                            {"PATH": "", "TEST_AUDIT_ACTION": action}
+                        ),
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        result.stdout + result.stderr,
+                    )
+
+    def test_audit_task_rejects_ambiguous_exact_lookup(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            scripts = self.install_runtime(runtime)
+            probe = root / "audit-task-ambiguous.ps1"
+            audit_script_literal = str(scripts / "audit-task.ps1").replace("'", "''")
+            python_literal = str(sys.executable).replace("'", "''")
+            probe.write_text(
+                "\n".join(
+                    [
+                        "$ErrorActionPreference = 'Stop'",
+                        "function Get-ScheduledTask {",
+                        "  [CmdletBinding()] param([string]$TaskPath, [string]$TaskName)",
+                        "  1..2 | ForEach-Object {",
+                        "    [pscustomobject]@{ TaskPath=$TaskPath; TaskName=$TaskName; State='Ready' }",
+                        "  }",
+                        "}",
+                        f"& '{audit_script_literal}' status -TaskName 'AgentMemoryVaultAudit-Test' -Python '{python_literal}'",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = run_ps(WINDOWS_POWERSHELL, probe)
+
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("multiple", result.stderr.lower())
 
     def test_windows_installer_fresh_install_and_upgrade_preserve_config(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
@@ -808,6 +1311,67 @@ class WindowsPowerShellAdapterTests(unittest.TestCase):
                 self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged\n")
             finally:
                 os.rmdir(config_dir)
+
+    def test_windows_installer_rechecks_config_content_hash_before_venv(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "runtime"
+            config = runtime / "config" / "agent-memory.toml"
+            config.parent.mkdir(parents=True)
+            before = "memory_root = 'vault-before'\n"
+            after = "memory_root = 'vault-after-'\n"
+            self.assertEqual(len(before), len(after))
+            config.write_text(before, encoding="utf-8")
+            vault = root / "must-not-exist-vault"
+            barrier = root / "agent-memory-installer-test-config-hash"
+            barrier.mkdir()
+            env = isolated_subprocess_env(
+                {"AGENT_MEMORY_INSTALLER_TEST_BARRIER": str(barrier)}
+            )
+            command = [
+                WINDOWS_POWERSHELL,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(SCRIPT_ROOT / "install-windows.ps1"),
+                "-MemoryRoot",
+                str(vault),
+                "-ConfigRoot",
+                str(runtime),
+            ]
+            process = subprocess.Popen(
+                command,
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            ready = barrier / "ready"
+            deadline = time.monotonic() + 15
+            while not ready.is_file() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not ready.is_file():
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=30)
+                self.fail("installer config hash barrier was not reached\n" + stdout + stderr)
+
+            config.write_text(after, encoding="utf-8")
+            (barrier / "continue").write_text("continue\n", encoding="utf-8")
+            stdout, stderr = process.communicate(timeout=60)
+
+            self.assertNotEqual(process.returncode, 0, stdout + stderr)
+            self.assertIn("installer_preflight=error", stderr)
+            self.assertIn("path_changed", stderr)
+            self.assertFalse((runtime / ".venv").exists())
+            self.assertFalse((runtime / "scripts").exists())
+            self.assertFalse(vault.exists())
+            self.assertEqual(config.read_text(encoding="utf-8"), after)
 
 
 if __name__ == "__main__":
