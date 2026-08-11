@@ -33,6 +33,7 @@ model-cache/
 /.codebuddy/
 /.harness/
 /.codegraph/
+/.worktrees/
 /.cursor/skills/
 /.cursor/rules/harness-general.mdc
 /CLAUDE.md
