@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from agent_memory_env import resolve_config_path
 
@@ -31,9 +33,13 @@ def render_text(text: str, mapping: dict[str, str]) -> str:
     return text
 
 
-def copy_template(target_root: Path, mapping: dict[str, str], overwrite: bool) -> tuple[int, int]:
-    created = 0
-    skipped = 0
+def copy_template(
+    target_root: Path,
+    mapping: dict[str, str],
+    overwrite: bool,
+) -> tuple[list[Path], list[Path]]:
+    written: list[Path] = []
+    skipped: list[Path] = []
     for source in sorted(TEMPLATE_ROOT.rglob("*")):
         relative = source.relative_to(TEMPLATE_ROOT)
         target = target_root / relative
@@ -42,15 +48,15 @@ def copy_template(target_root: Path, mapping: dict[str, str], overwrite: bool) -
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() and not overwrite:
-            skipped += 1
+            skipped.append(relative)
             continue
         if source.suffix.lower() in {".md", ".txt"}:
             text = source.read_text(encoding="utf-8")
             target.write_text(render_text(text, mapping), encoding="utf-8")
         else:
             shutil.copy2(source, target)
-        created += 1
-    return created, skipped
+        written.append(relative)
+    return written, skipped
 
 
 def write_env(args: argparse.Namespace, memory_root: Path) -> None:
@@ -78,6 +84,100 @@ def write_env(args: argparse.Namespace, memory_root: Path) -> None:
     )
     env_path.write_text(content, encoding="utf-8")
     print(f"OK wrote_env {env_path}")
+
+
+def run_git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(
+            ["git", "-C", str(root), *args],
+            127,
+            "",
+            str(exc),
+        )
+
+
+def existing_git_root(path: Path) -> Path | None:
+    result = run_git(path, "rev-parse", "--show-toplevel")
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return resolve_config_path(result.stdout.strip())
+
+
+def initialize_git_baseline(
+    memory_root: Path,
+    git_root: Path,
+    *,
+    target_was_nonempty: bool,
+    written_paths: list[Path],
+) -> dict[str, str]:
+    """Create a baseline only when this invocation owns a new empty vault.
+
+    Existing repositories, parent repositories, and pre-populated vaults are
+    deliberately left untouched. In particular, skipped template files are
+    never staged by this function.
+    """
+
+    if shutil.which("git") is None:
+        return {"status": "error", "detail": "git_not_found"}
+    if git_root != memory_root:
+        return {"status": "skipped", "detail": "external_git_root"}
+
+    discovered_root = existing_git_root(memory_root)
+    if discovered_root is not None and discovered_root != memory_root:
+        return {"status": "skipped", "detail": "external_git_root"}
+    if discovered_root == memory_root:
+        head = run_git(memory_root, "rev-parse", "--verify", "HEAD")
+        if head.returncode == 0:
+            return {"status": "existing", "detail": head.stdout.strip()}
+        return {"status": "skipped", "detail": "existing_repository_without_head"}
+    if target_was_nonempty:
+        return {"status": "skipped", "detail": "preexisting_vault"}
+    if not written_paths:
+        return {"status": "skipped", "detail": "no_template_files_written"}
+
+    initialized = run_git(memory_root, "init", "-q")
+    if initialized.returncode != 0:
+        return {
+            "status": "error",
+            "detail": initialized.stderr.strip() or "git_init_failed",
+        }
+    relative_paths = [path.as_posix() for path in written_paths]
+    staged = run_git(memory_root, "add", "--", *relative_paths)
+    if staged.returncode != 0:
+        return {
+            "status": "error",
+            "detail": staged.stderr.strip() or "git_add_failed",
+        }
+    commit = run_git(
+        memory_root,
+        "-c",
+        "user.name=Agent Memory Vault",
+        "-c",
+        "user.email=agent-memory@localhost",
+        "commit",
+        "-qm",
+        "Initialize Agent Memory Vault",
+    )
+    if commit.returncode != 0:
+        return {
+            "status": "error",
+            "detail": commit.stderr.strip() or "git_commit_failed",
+        }
+    head = run_git(memory_root, "rev-parse", "HEAD")
+    return {
+        "status": "created",
+        "detail": head.stdout.strip() if head.returncode == 0 else "baseline_committed",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +208,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--write-env", action="store_true", help="Write a local .env file in this repo.")
     parser.add_argument("--overwrite-env", action="store_true", help="Overwrite an existing local .env file.")
+    git_group = parser.add_mutually_exclusive_group()
+    git_group.add_argument(
+        "--init-git",
+        dest="init_git",
+        action="store_true",
+        help="Create an initial Git baseline for a new empty vault (default).",
+    )
+    git_group.add_argument(
+        "--no-init-git",
+        dest="init_git",
+        action="store_false",
+        help="Do not initialize Git.",
+    )
+    parser.set_defaults(init_git=True)
     return parser.parse_args()
 
 
@@ -117,26 +231,44 @@ def main() -> int:
         raise SystemExit(f"Template root not found: {TEMPLATE_ROOT}")
 
     memory_root = expand_path(args.memory_root)
+    target_was_nonempty = memory_root.exists() and any(memory_root.iterdir())
     memory_root.mkdir(parents=True, exist_ok=True)
-    created, skipped = copy_template(memory_root, replacements(args), args.overwrite)
+    written, skipped = copy_template(memory_root, replacements(args), args.overwrite)
     print(f"memory_root={memory_root}")
-    print(f"created_or_updated_files={created}")
-    print(f"skipped_existing_files={skipped}")
+    print(f"created_or_updated_files={len(written)}")
+    print(f"skipped_existing_files={len(skipped)}")
 
     if args.write_env:
         write_env(args, memory_root)
 
+    git_root = expand_path(args.git_root) if args.git_root else memory_root
+    git_baseline = (
+        initialize_git_baseline(
+            memory_root,
+            git_root,
+            target_was_nonempty=target_was_nonempty,
+            written_paths=written,
+        )
+        if args.init_git
+        else {"status": "skipped", "detail": "disabled"}
+    )
+    print(f"git_baseline={git_baseline['status']} {git_baseline['detail']}")
+    if git_baseline["status"] == "error":
+        return 2
+
     print("next_commands:")
-    print("  source .env")
-    print("  git -C \"$AGENT_MEMORY_GIT_ROOT\" init  # optional, if the vault is not already in a git repo")
-    print("  python3 scripts/agent_memory_evolution.py --init --scan --report")
-    print("  python3 scripts/agent_memory_index.py --init --scan --report")
-    print("  python3 scripts/agent_memory_closeout.py --dry-run")
-    print("  python3 scripts/agent_memory_check.py")
-    print("  python3 scripts/agent_memory_doctor.py")
+    if os.name == "nt":
+        print("  # Runtime TOML/.env is loaded by Python; no PowerShell import is required")
+    else:
+        print("  source .env")
+    print(f"  {sys.executable} scripts/agent_memory_evolution.py --init --scan --report")
+    print(f"  {sys.executable} scripts/agent_memory_index.py --init --scan --report")
+    print(f"  {sys.executable} scripts/agent_memory_closeout.py --dry-run")
+    print(f"  {sys.executable} scripts/agent_memory_check.py")
+    print(f"  {sys.executable} scripts/agent_memory_doctor.py")
     print("optional_semantic_retrieval:")
-    print("  python3 -m pip install -r requirements-vector.lock")
-    print("  python3 scripts/agent_memory_zvec_index.py --init --scan --prune")
+    print(f"  {sys.executable} -m pip install -r requirements-vector.lock")
+    print(f"  {sys.executable} scripts/agent_memory_zvec_index.py --init --scan --prune")
     return 0
 
 

@@ -81,5 +81,5 @@ jobs:
         shell: powershell
         run: >-
           python -m unittest
-          tests.test_runtime_install.RuntimeInstallTests.test_install_is_idempotent_and_preserves_local_adapter
+          tests.test_windows_adapters.WindowsPowerShellAdapterTests.test_installed_runtime_adapter_smoke_ps51
           -v

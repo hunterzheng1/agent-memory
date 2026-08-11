@@ -87,8 +87,12 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_state.py",
     SCRIPT_ROOT / "agent_memory_stop_hook.py",
     SCRIPT_ROOT / "agent_memory_env.py",
+    SCRIPT_ROOT / "audit-task.ps1",
+    SCRIPT_ROOT / "install-codex-hook.ps1",
     SCRIPT_ROOT / "install_runtime.py",
+    SCRIPT_ROOT / "install-windows.ps1",
     SCRIPT_ROOT / "memoryctl",
+    SCRIPT_ROOT / "stop-hook.ps1",
 ]
 
 REQUIRED_STATE_TABLES = {

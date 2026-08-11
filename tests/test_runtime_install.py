@@ -18,6 +18,34 @@ INSTALLER = REPO_ROOT / "scripts" / "install_runtime.py"
 
 
 class RuntimeInstallTests(unittest.TestCase):
+    def test_install_rejects_managed_file_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            scripts = root / "scripts"
+            scripts.mkdir()
+            outside = root / "outside.py"
+            outside.write_text("DO_NOT_CHANGE = True\n", encoding="utf-8")
+            managed = scripts / "agent_memory_check.py"
+            try:
+                managed.symlink_to(outside)
+            except OSError as exc:
+                self.skipTest(f"file symlinks unavailable: {exc}")
+
+            result = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["error"], "StateSecurityError")
+            self.assertIn("must not be a symlink", payload["detail"])
+            self.assertEqual(outside.read_text(encoding="utf-8"), "DO_NOT_CHANGE = True\n")
+
     def test_install_is_idempotent_and_preserves_local_adapter(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
             root = Path(raw_root).resolve()
@@ -37,10 +65,23 @@ class RuntimeInstallTests(unittest.TestCase):
             self.assertIn("memoryctl", payload["changed"])
             self.assertIn("agent_memory_lock.py", payload["changed"])
             self.assertIn("agent_memory_paths.py", payload["changed"])
+            for adapter in (
+                "install-windows.ps1",
+                "stop-hook.ps1",
+                "install-codex-hook.ps1",
+                "audit-task.ps1",
+            ):
+                self.assertIn(adapter, payload["changed"])
+                self.assertTrue((scripts / adapter).is_file())
             self.assertIn("requirements-vector.lock", payload["changed"])
             self.assertTrue((scripts / "agent_memory_lock.py").is_file())
             self.assertTrue((scripts / "agent_memory_paths.py").is_file())
             self.assertTrue((root / "requirements-vector.lock").is_file())
+            self.assertTrue((root / "templates" / "vault" / "AGENTS.md").is_file())
+            self.assertEqual(
+                (root / "templates" / "vault" / ".gitignore").read_text(encoding="utf-8"),
+                ".obsidian/\n",
+            )
             local_adapter.write_text("LOCAL = True\n", encoding="utf-8")
 
             runtime_env = isolated_subprocess_env(
@@ -79,6 +120,64 @@ class RuntimeInstallTests(unittest.TestCase):
             )
             self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
             self.assertTrue(json.loads(verify.stdout)["ok"])
+
+            (root / "templates" / "vault" / ".gitignore").write_text(
+                "tampered\n", encoding="utf-8"
+            )
+            drift = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--verify", "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(drift.returncode, 2, drift.stdout + drift.stderr)
+            self.assertIn("templates/vault/.gitignore", json.loads(drift.stdout)["template_mismatched"])
+
+            repaired = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(repaired.returncode, 0, repaired.stdout + repaired.stderr)
+
+            manifest_path = root / "config" / "runtime-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"].pop("stop-hook.ps1")
+            manifest["template_files"]["../outside-template"] = "0" * 64
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            incomplete = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--verify", "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(incomplete.returncode, 2, incomplete.stdout + incomplete.stderr)
+            incomplete_payload = json.loads(incomplete.stdout)
+            self.assertIn("stop-hook.ps1", incomplete_payload["closure"]["core_missing"])
+            self.assertIn(
+                "../outside-template",
+                incomplete_payload["closure"]["template_unsafe_names"],
+            )
+
+            manifest_repair = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(manifest_repair.returncode, 0, manifest_repair.stdout + manifest_repair.stderr)
 
             second = subprocess.run(
                 [sys.executable, str(INSTALLER), "--config-root", str(root), "--json"],
@@ -128,6 +227,62 @@ class RuntimeInstallTests(unittest.TestCase):
                 self.assertEqual(payload["permissions"]["permission_model"], "windows_acl_unverified")
                 self.assertIn("windows_acl_unverified", payload["permissions"]["warnings"])
             connection.close()
+
+    def test_installed_runtime_can_bootstrap_outside_repository(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            root = Path(raw_root).resolve()
+            runtime = root / "运行 runtime with spaces"
+            outside = root / "outside cwd"
+            vault = root / "记忆 vault with spaces"
+            outside.mkdir()
+
+            installed = subprocess.run(
+                [sys.executable, str(INSTALLER), "--config-root", str(runtime), "--json"],
+                cwd=REPO_ROOT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+            bootstrap = subprocess.run(
+                [
+                    sys.executable,
+                    str(runtime / "scripts" / "bootstrap.py"),
+                    "--memory-root",
+                    str(vault),
+                    "--init-git",
+                ],
+                cwd=outside,
+                env=isolated_subprocess_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("git_baseline=created", bootstrap.stdout)
+            self.assertTrue((vault / "AGENTS.md").is_file())
+            self.assertTrue((vault / ".git" / "HEAD").is_file())
+
+            verify = subprocess.run(
+                [sys.executable, str(runtime / "scripts" / "install_runtime.py"), "--config-root", str(runtime), "--verify", "--json"],
+                cwd=outside,
+                env=isolated_subprocess_env(),
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+            self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+            self.assertTrue(json.loads(verify.stdout)["ok"])
 
 
 if __name__ == "__main__":

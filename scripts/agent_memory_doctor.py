@@ -607,9 +607,13 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         "agent_memory_state.py",
         "agent_memory_stop_hook.py",
         "agent_memory_env.py",
+        "audit-task.ps1",
         "bootstrap.py",
+        "install-codex-hook.ps1",
         "install_runtime.py",
+        "install-windows.ps1",
         "memoryctl",
+        "stop-hook.ps1",
     ]
     missing = [name for name in required if not (SCRIPT_ROOT / name).is_file()]
     add(checks, "runtime_files", "fail" if missing else "pass", "Runtime files complete." if not missing else "Runtime files missing.", {"missing": missing})
@@ -640,27 +644,94 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         manifest_mismatch: list[str] = []
         support_missing: list[str] = []
         support_mismatch: list[str] = []
+        template_missing: list[str] = []
+        template_mismatch: list[str] = []
+        manifest_symlinked: list[str] = []
+        template_unsafe_names: list[str] = []
+        core_closure_missing = sorted(
+            set(required) - set(expected if isinstance(expected, dict) else {})
+        )
+        core_closure_unexpected = sorted(
+            set(expected if isinstance(expected, dict) else {}) - set(required)
+        )
         if isinstance(expected, dict):
             for name, digest in expected.items():
-                path = SCRIPT_ROOT / str(name)
-                if not path.is_file():
-                    manifest_missing.append(str(name))
+                normalized = str(name)
+                if normalized not in required:
+                    continue
+                path = SCRIPT_ROOT / normalized
+                if path.is_symlink():
+                    manifest_symlinked.append(normalized)
+                elif not path.is_file():
+                    manifest_missing.append(normalized)
                 elif file_sha256(path) != str(digest):
-                    manifest_mismatch.append(str(name))
+                    manifest_mismatch.append(normalized)
         support_expected = manifest.get("support_files", {}) if isinstance(manifest, dict) else {}
+        required_support = {
+            "requirements-vector.lock",
+            "benchmarks/public-sample.json",
+            "benchmarks/public-policy-reconcile.json",
+            "benchmarks/public-policy-safety.json",
+        }
+        support_closure_missing = sorted(
+            required_support - set(support_expected if isinstance(support_expected, dict) else {})
+        )
+        support_closure_unexpected = sorted(
+            set(support_expected if isinstance(support_expected, dict) else {}) - required_support
+        )
         if isinstance(support_expected, dict):
             for name, digest in support_expected.items():
-                path = CONFIG_ROOT / str(name)
-                if not path.is_file():
-                    support_missing.append(str(name))
+                normalized = str(name)
+                if normalized not in required_support:
+                    continue
+                path = CONFIG_ROOT / normalized
+                if path.is_symlink():
+                    manifest_symlinked.append(normalized)
+                elif not path.is_file():
+                    support_missing.append(normalized)
                 elif file_sha256(path) != str(digest):
-                    support_mismatch.append(str(name))
+                    support_mismatch.append(normalized)
+        template_expected = manifest.get("template_files", {}) if isinstance(manifest, dict) else {}
+        required_template_missing = (
+            []
+            if isinstance(template_expected, dict)
+            and "templates/vault/.gitignore" in template_expected
+            else ["templates/vault/.gitignore"]
+        )
+        if isinstance(template_expected, dict):
+            for name, digest in template_expected.items():
+                normalized = str(name)
+                parts = normalized.split("/")
+                if (
+                    "\\" in normalized
+                    or parts[:2] != ["templates", "vault"]
+                    or any(part in {"", ".", ".."} for part in parts)
+                ):
+                    template_unsafe_names.append(normalized)
+                    continue
+                path = CONFIG_ROOT / normalized
+                if path.is_symlink():
+                    manifest_symlinked.append(normalized)
+                elif not path.is_file():
+                    template_missing.append(normalized)
+                elif file_sha256(path) != str(digest):
+                    template_mismatch.append(normalized)
         manifest_ok = (
             isinstance(expected, dict)
+            and not RUNTIME_MANIFEST.is_symlink()
             and not manifest_missing
             and not manifest_mismatch
             and not support_missing
             and not support_mismatch
+            and not template_missing
+            and not template_mismatch
+            and not core_closure_missing
+            and not core_closure_unexpected
+            and not support_closure_missing
+            and not support_closure_unexpected
+            and not required_template_missing
+            and not manifest_symlinked
+            and not template_unsafe_names
         )
         add(
             checks,
@@ -670,10 +741,22 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
             {
                 "source_commit": manifest.get("source_commit", "") if manifest else "",
                 "source_dirty": bool(manifest.get("source_dirty")) if manifest else False,
+                "manifest_symlink": RUNTIME_MANIFEST.is_symlink(),
                 "missing": manifest_missing,
                 "mismatched": manifest_mismatch,
                 "support_missing": support_missing,
                 "support_mismatched": support_mismatch,
+                "template_missing": template_missing,
+                "template_mismatched": template_mismatch,
+                "symlinked": manifest_symlinked,
+                "closure": {
+                    "core_missing": core_closure_missing,
+                    "core_unexpected": core_closure_unexpected,
+                    "support_missing": support_closure_missing,
+                    "support_unexpected": support_closure_unexpected,
+                    "required_template_missing": required_template_missing,
+                    "template_unsafe_names": template_unsafe_names,
+                },
             },
         )
     if not STATE_DB.exists() and not STATE_DB.is_symlink():

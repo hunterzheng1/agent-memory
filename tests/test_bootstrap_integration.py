@@ -42,6 +42,15 @@ class BootstrapIntegrationTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(bootstrap.returncode, 0, bootstrap.stderr)
+            self.assertIn("git_baseline=created", bootstrap.stdout)
+            self.assertTrue((vault / ".git" / "HEAD").is_file())
+            head = run(["git", "-C", str(vault), "rev-parse", "--verify", "HEAD"])
+            self.assertEqual(head.returncode, 0, head.stdout + head.stderr)
+            (vault / ".obsidian").mkdir()
+            (vault / ".obsidian" / "workspace.json").write_text("{}\n", encoding="utf-8")
+            status = run(["git", "-C", str(vault), "status", "--porcelain"])
+            self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+            self.assertEqual(status.stdout, "")
 
             env = isolated_subprocess_env(
                 {
@@ -69,6 +78,100 @@ class BootstrapIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
             self.assertIn("agent_memory_check=ok", check.stdout)
+
+    def test_no_init_git_leaves_new_vault_unmanaged(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            vault = Path(raw_root).resolve() / "vault"
+            bootstrap = run(
+                [
+                    sys.executable,
+                    str(SCRIPT_ROOT / "bootstrap.py"),
+                    "--memory-root",
+                    str(vault),
+                    "--no-init-git",
+                ]
+            )
+
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("git_baseline=skipped disabled", bootstrap.stdout)
+            self.assertFalse((vault / ".git").exists())
+
+    def test_existing_vault_is_not_silently_initialized_or_committed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            vault = Path(raw_root).resolve() / "existing vault"
+            vault.mkdir()
+            user_file = vault / "private-user-note.md"
+            user_file.write_text("keep me\n", encoding="utf-8")
+
+            bootstrap = run(
+                [sys.executable, str(SCRIPT_ROOT / "bootstrap.py"), "--memory-root", str(vault)]
+            )
+
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("git_baseline=skipped preexisting_vault", bootstrap.stdout)
+            self.assertFalse((vault / ".git").exists())
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_existing_headless_repo_is_left_unstaged(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            vault = Path(raw_root).resolve() / "headless"
+            vault.mkdir()
+            initialized = run(["git", "-C", str(vault), "init", "-q"])
+            self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+            user_file = vault / "before-bootstrap.md"
+            user_file.write_text("untracked\n", encoding="utf-8")
+
+            bootstrap = run(
+                [sys.executable, str(SCRIPT_ROOT / "bootstrap.py"), "--memory-root", str(vault)]
+            )
+
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("git_baseline=skipped existing_repository_without_head", bootstrap.stdout)
+            head = run(["git", "-C", str(vault), "rev-parse", "--verify", "HEAD"])
+            self.assertNotEqual(head.returncode, 0)
+            staged = run(["git", "-C", str(vault), "diff", "--cached", "--name-only"])
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self.assertEqual(staged.stdout, "")
+
+    def test_parent_repository_is_not_staged_or_shadowed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            parent = Path(raw_root).resolve() / "parent"
+            parent.mkdir()
+            initialized = run(["git", "-C", str(parent), "init", "-q"])
+            self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+            unrelated = parent / "unrelated.txt"
+            unrelated.write_text("outside vault\n", encoding="utf-8")
+            vault = parent / "nested" / "vault"
+
+            bootstrap = run(
+                [sys.executable, str(SCRIPT_ROOT / "bootstrap.py"), "--memory-root", str(vault)]
+            )
+
+            self.assertEqual(bootstrap.returncode, 0, bootstrap.stdout + bootstrap.stderr)
+            self.assertIn("git_baseline=skipped external_git_root", bootstrap.stdout)
+            self.assertFalse((vault / ".git").exists())
+            staged = run(["git", "-C", str(parent), "diff", "--cached", "--name-only"])
+            self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+            self.assertEqual(staged.stdout, "")
+
+    def test_existing_repository_with_head_is_not_recommitted(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            vault = Path(raw_root).resolve() / "vault"
+            first = run(
+                [sys.executable, str(SCRIPT_ROOT / "bootstrap.py"), "--memory-root", str(vault)]
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            first_head = run(["git", "-C", str(vault), "rev-parse", "HEAD"])
+            self.assertEqual(first_head.returncode, 0, first_head.stdout + first_head.stderr)
+
+            second = run(
+                [sys.executable, str(SCRIPT_ROOT / "bootstrap.py"), "--memory-root", str(vault)]
+            )
+
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("git_baseline=existing", second.stdout)
+            second_head = run(["git", "-C", str(vault), "rev-parse", "HEAD"])
+            self.assertEqual(second_head.stdout, first_head.stdout)
 
 
 if __name__ == "__main__":

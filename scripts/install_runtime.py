@@ -27,6 +27,7 @@ from agent_memory_state import (
 
 SOURCE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = SOURCE_ROOT.parent
+TEMPLATE_ROOT = REPO_ROOT / "templates" / "vault"
 CORE_FILES = (
     "agent_memory_audit.py",
     "agent_memory_audit_autorun.py",
@@ -50,9 +51,13 @@ CORE_FILES = (
     "agent_memory_state.py",
     "agent_memory_stop_hook.py",
     "agent_memory_zvec_index.py",
+    "audit-task.ps1",
     "bootstrap.py",
+    "install-codex-hook.ps1",
     "install_runtime.py",
+    "install-windows.ps1",
     "memoryctl",
+    "stop-hook.ps1",
 )
 SUPPORT_FILES = (
     "requirements-vector.lock",
@@ -74,6 +79,20 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def template_hashes() -> dict[str, str]:
+    if not TEMPLATE_ROOT.is_dir():
+        raise FileNotFoundError(f"template root is missing: {TEMPLATE_ROOT}")
+    hashes = {
+        path.relative_to(REPO_ROOT).as_posix(): sha256(path)
+        for path in sorted(TEMPLATE_ROOT.rglob("*"))
+        if path.is_file()
+    }
+    required_ignore = "templates/vault/.gitignore"
+    if required_ignore not in hashes:
+        raise FileNotFoundError(f"required vault template is missing: {required_ignore}")
+    return hashes
+
+
 def git_value(*args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(REPO_ROOT), *args],
@@ -88,6 +107,7 @@ def git_value(*args: str) -> str:
 def expected_manifest(config_root: Path) -> dict[str, Any]:
     hashes = {name: sha256(SOURCE_ROOT / name) for name in CORE_FILES}
     support_hashes = {name: sha256(REPO_ROOT / name) for name in SUPPORT_FILES}
+    installed_templates = template_hashes()
     return {
         "schema_version": 1,
         "installed_at": utc_now(),
@@ -97,6 +117,7 @@ def expected_manifest(config_root: Path) -> dict[str, Any]:
         "runtime_root": str(config_root),
         "files": hashes,
         "support_files": support_hashes,
+        "template_files": installed_templates,
     }
 
 
@@ -180,6 +201,8 @@ def runtime_permission_report(config_root: Path) -> dict[str, Any]:
 
 def verify(config_root: Path) -> dict[str, Any]:
     manifest_path = config_root / "config" / "runtime-manifest.json"
+    if manifest_path.is_symlink():
+        return {"ok": False, "manifest": str(manifest_path), "unsafe_manifest": "symlink"}
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -187,27 +210,90 @@ def verify(config_root: Path) -> dict[str, Any]:
     expected = manifest.get("files") if isinstance(manifest, dict) else None
     if not isinstance(expected, dict):
         return {"ok": False, "manifest": str(manifest_path), "invalid_manifest": True}
+    core_closure_missing = sorted(set(CORE_FILES) - set(expected))
+    core_closure_unexpected = sorted(set(expected) - set(CORE_FILES))
     missing: list[str] = []
     mismatched: list[str] = []
+    symlinked: list[str] = []
     for name, digest in expected.items():
-        path = config_root / "scripts" / str(name)
-        if not path.is_file():
-            missing.append(str(name))
+        normalized = str(name)
+        if normalized not in CORE_FILES:
+            continue
+        path = config_root / "scripts" / normalized
+        if path.is_symlink():
+            symlinked.append(normalized)
+        elif not path.is_file():
+            missing.append(normalized)
         elif sha256(path) != str(digest):
-            mismatched.append(str(name))
+            mismatched.append(normalized)
     support_missing: list[str] = []
     support_mismatched: list[str] = []
-    support_expected = manifest.get("support_files", {}) if isinstance(manifest, dict) else {}
+    support_expected = manifest.get("support_files") if isinstance(manifest, dict) else None
+    support_closure_missing = sorted(
+        set(SUPPORT_FILES) - set(support_expected if isinstance(support_expected, dict) else {})
+    )
+    support_closure_unexpected = sorted(
+        set(support_expected if isinstance(support_expected, dict) else {}) - set(SUPPORT_FILES)
+    )
     if isinstance(support_expected, dict):
         for name, digest in support_expected.items():
-            path = config_root / str(name)
-            if not path.is_file():
-                support_missing.append(str(name))
+            normalized = str(name)
+            if normalized not in SUPPORT_FILES:
+                continue
+            path = config_root / normalized
+            if path.is_symlink():
+                symlinked.append(normalized)
+            elif not path.is_file():
+                support_missing.append(normalized)
             elif sha256(path) != str(digest):
-                support_mismatched.append(str(name))
+                support_mismatched.append(normalized)
+    template_missing: list[str] = []
+    template_mismatched: list[str] = []
+    template_unsafe_names: list[str] = []
+    template_expected = manifest.get("template_files") if isinstance(manifest, dict) else None
+    required_template_missing = (
+        []
+        if isinstance(template_expected, dict) and "templates/vault/.gitignore" in template_expected
+        else ["templates/vault/.gitignore"]
+    )
+    if isinstance(template_expected, dict):
+        for name, digest in template_expected.items():
+            normalized = str(name)
+            parts = normalized.split("/")
+            if (
+                "\\" in normalized
+                or parts[:2] != ["templates", "vault"]
+                or any(part in {"", ".", ".."} for part in parts)
+            ):
+                template_unsafe_names.append(normalized)
+                continue
+            path = config_root / normalized
+            if path.is_symlink():
+                symlinked.append(normalized)
+            elif not path.is_file():
+                template_missing.append(normalized)
+            elif sha256(path) != str(digest):
+                template_mismatched.append(normalized)
     permissions = runtime_permission_report(config_root)
     return {
-        "ok": not missing and not mismatched and not support_missing and not support_mismatched and permissions["ok"],
+        "ok": (
+            not missing
+            and not mismatched
+            and not support_missing
+            and not support_mismatched
+            and not template_missing
+            and not template_mismatched
+            and not symlinked
+            and not template_unsafe_names
+            and not core_closure_missing
+            and not core_closure_unexpected
+            and isinstance(support_expected, dict)
+            and not support_closure_missing
+            and not support_closure_unexpected
+            and isinstance(template_expected, dict)
+            and not required_template_missing
+            and permissions["ok"]
+        ),
         "manifest": str(manifest_path),
         "source_commit": manifest.get("source_commit", ""),
         "source_dirty": bool(manifest.get("source_dirty")),
@@ -216,8 +302,41 @@ def verify(config_root: Path) -> dict[str, Any]:
         "mismatched": mismatched,
         "support_missing": support_missing,
         "support_mismatched": support_mismatched,
+        "template_missing": template_missing,
+        "template_mismatched": template_mismatched,
+        "symlinked": symlinked,
+        "closure": {
+            "core_missing": core_closure_missing,
+            "core_unexpected": core_closure_unexpected,
+            "support_missing": support_closure_missing,
+            "support_unexpected": support_closure_unexpected,
+            "required_template_missing": required_template_missing,
+            "template_unsafe_names": template_unsafe_names,
+        },
         "permissions": permissions,
     }
+
+
+def assert_managed_target(config_root: Path, target: Path) -> None:
+    """Reject managed paths that traverse a symlink or non-directory parent."""
+
+    try:
+        relative = target.relative_to(config_root)
+    except ValueError as exc:
+        raise StateSecurityError(f"managed runtime target escapes config root: {target}") from exc
+    cursor = config_root
+    if cursor.is_symlink():
+        raise StateSecurityError(f"managed runtime root must not be a symlink: {cursor}")
+    for part in relative.parts[:-1]:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise StateSecurityError(f"managed runtime parent must not be a symlink: {cursor}")
+        if cursor.exists() and not cursor.is_dir():
+            raise StateSecurityError(f"managed runtime parent is not a directory: {cursor}")
+    if target.is_symlink():
+        raise StateSecurityError(f"managed runtime file must not be a symlink: {target}")
+    if target.exists() and not target.is_file():
+        raise StateSecurityError(f"managed runtime target is not a regular file: {target}")
 
 
 def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
@@ -231,20 +350,34 @@ def install(config_root: Path, dry_run: bool) -> dict[str, Any]:
     for name in CORE_FILES:
         source = SOURCE_ROOT / name
         target = script_root / name
+        assert_managed_target(config_root, target)
         if target.is_file() and sha256(target) == manifest["files"][name]:
             unchanged.append(name)
-            if not dry_run:
+            if not dry_run and POSIX_MODE_ENFORCED:
                 target.chmod(source.stat().st_mode & 0o777)
             continue
         changed.append(name)
         if not dry_run:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-            target.chmod(source.stat().st_mode & 0o777)
+            if POSIX_MODE_ENFORCED:
+                target.chmod(source.stat().st_mode & 0o777)
     for name in SUPPORT_FILES:
         source = REPO_ROOT / name
         target = config_root / name
+        assert_managed_target(config_root, target)
         if target.is_file() and sha256(target) == manifest["support_files"][name]:
+            unchanged.append(name)
+            continue
+        changed.append(name)
+        if not dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    for name, digest in manifest["template_files"].items():
+        source = REPO_ROOT / name
+        target = config_root / name
+        assert_managed_target(config_root, target)
+        if target.is_file() and sha256(target) == digest:
             unchanged.append(name)
             continue
         changed.append(name)
