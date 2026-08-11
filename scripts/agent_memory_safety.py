@@ -32,7 +32,11 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}"),
     re.compile(r"(?i)(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{30,}"),
     re.compile(r"(?i)(?<![A-Za-z0-9])xox[baprs]-[0-9A-Za-z-]{10,}"),
-    re.compile(r"(?i)(?<![A-Za-z0-9])(?:glpat-|npm_)[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?i)(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"),
+    re.compile(
+        r"(?i)(?<![A-Za-z0-9])npm_[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"
+        r"(?!\s*=\s*(?:true|false|null)\b)"
+    ),
     re.compile(r"(?i)-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"),
     re.compile(r"(?i)\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"(?i)\b(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}\b"),

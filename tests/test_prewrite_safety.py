@@ -310,6 +310,22 @@ class SourceSafetyTests(unittest.TestCase):
                 result = assess_source(candidate, source_class="user_direct", knowledge_kind="fact")
                 self.assertEqual(result["decision"], "ALLOW")
 
+    def test_npm_boolean_profile_fields_are_not_secret_material(self) -> None:
+        candidate = "npm_" + "profile_field_enabled=true"
+
+        result = assess_source(candidate, source_class="user_direct", knowledge_kind="fact")
+
+        self.assertEqual(result["decision"], "ALLOW")
+
+    def test_npm_access_tokens_remain_blocked(self) -> None:
+        candidate = "token=" + "npm_" + ("a" * 36)
+
+        result = assess_source(candidate, source_class="user_direct", knowledge_kind="fact")
+
+        self.assertEqual(result["decision"], "BLOCK")
+        self.assertEqual(result["reason_code"], "SECRET_MATERIAL")
+        self.assertNotIn(candidate, str(result))
+
     def test_json_files_are_included_in_public_leak_scan(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             fixture = Path(raw_tmp) / "fixture.json"
