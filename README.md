@@ -55,8 +55,14 @@ scripts/
   agent_memory_session_hook.py
                           # Claude SessionStart 会话 ID 桥接，防止与外层 Codex 串号
                           # CodeBuddy 使用原生 CODEBUDDY_SESSION_ID（默认无需 SessionStart）
+  agent_memory_prompt_hook.py
+                          # Claude UserPromptSubmit 自动召回：按当前输入检索并注入相关记忆
+                          # fail-open（出错静默）、只读、按会话去重、有字数上限
   agent_memory_stop_hook.py
                           # 可选 Stop 自动 closeout + 到期 audit（Claude/Codex/CodeBuddy）
+  install-claude-hooks.ps1
+                          # 幂等合并 Claude 四个 hook（SessionStart/UserPromptSubmit/Stop/SessionEnd）
+                          # 保留无关 hook；被 provider 切换器清空后重跑即可修复
   install_runtime.py     # 把当前 Git 版本安装为可校验的本机 Runtime
   memoryctl               # 所有宿主共用的平台中立命令入口
   agent_memory_zvec_index.py

@@ -100,6 +100,64 @@ Claude SessionStart example:
 
 This uses Claude Code's official `CLAUDE_ENV_FILE` mechanism. Merge it with existing `SessionStart` groups instead of replacing unrelated hooks.
 
+### Automatic recall on Claude (the read half)
+
+`SessionStart` + `Stop` only close the *write* half. Without a read hook, recall
+depends on the model remembering to run a search — an instruction that is
+reliably skipped under load. `agent_memory_prompt_hook.py` runs on
+`UserPromptSubmit` and injects relevant vault entries as context.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_prompt_hook.py --actor claude",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Behaviour:
+
+- **Fail open, always.** Any error, timeout, malformed payload, or empty result exits 0 with no output. A memory problem must never block or delay a prompt.
+- **Read-only.** Passes `--no-log` so a recall on every prompt does not migrate schema or append search-log rows.
+- **Quiet by default.** Skips prompts under 8 characters and those starting with `/`, `!`, `#`; drops results below `--min-score`.
+- **Per-session dedupe.** Already-injected entries are not re-injected; each prompt surfaces up to `--limit` *new* memories, then the hook goes silent. Stamps expire after 24h so a reused session id cannot suppress recall permanently.
+- **Bounded.** `--max-chars` (default 1800) caps injected context so recall cannot crowd out the task.
+- **Trust metadata preserved.** `requires_live_verification`, `analogy_only`, expired `time_status`, and non-active `status` are rendered inline, and the injected block states that entries are point-in-time observations needing verification.
+
+Order matters: put the memory hook **before** any hook that drains stdin (for
+example a wrapper ending in `cat >/dev/null`), or it receives an empty payload.
+
+### One-command install / repair
+
+`install-claude-hooks.ps1` merges all four wires at once and is safe to re-run:
+
+```powershell
+pwsh -File scripts/install-claude-hooks.ps1            # install or repair
+pwsh -File scripts/install-claude-hooks.ps1 -DryRun    # show wiring, write nothing
+pwsh -File scripts/install-claude-hooks.ps1 -NoAutoCloseout   # reminder-only Stop
+```
+
+It preserves unrelated hooks and unrelated settings keys, backs up before
+writing, validates the result as JSON, and reports `unchanged` when nothing is
+needed. Re-run it after any provider switch or settings regeneration (see
+"Claude Settings Managers" below) — that is the failure this script exists for.
+
+> **Install all four or none.** A `Stop` hook without the `SessionStart` bridge
+> cannot attribute changes and fails *every* run with `MISSING_HOST_SESSION_ID`,
+> which looks like a working installation in the settings file while writing
+> nothing to the vault. Verify with `logs/stop-hook.jsonl`, not with the presence
+> of a hook entry.
+
 ## CodeBuddy Code (CLI)
 
 CodeBuddy Code (`codebuddy` / `cbc`) stores settings in `~/.codebuddy/settings.json` (or project `.codebuddy/settings.json`). Hooks receive stdin JSON with `session_id`, and Bash already exports `CODEBUDDY_SESSION_ID` / `CODEBUDDY_PROJECT_DIR`.
