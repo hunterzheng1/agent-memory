@@ -155,8 +155,32 @@ needed. Re-run it after any provider switch or settings regeneration (see
 > **Install all four or none.** A `Stop` hook without the `SessionStart` bridge
 > cannot attribute changes and fails *every* run with `MISSING_HOST_SESSION_ID`,
 > which looks like a working installation in the settings file while writing
-> nothing to the vault. Verify with `logs/stop-hook.jsonl`, not with the presence
+> nothing to the vault. Verify with the logs below, not with the presence
 > of a hook entry.
+
+### Verifying the hooks actually run
+
+Both hooks are silent when there is nothing to do, so "never wired up" and "ran
+and had nothing to say" look identical from the outside. Each therefore records
+every invocation:
+
+| Log | Written by | Key fields |
+|-----|-----------|-----------|
+| `logs/stop-hook.jsonl` | Stop / SessionEnd | `status:"invoked"` per run, plus `warning`/`error` records; `session_present`, `pending`, `claims` |
+| `logs/prompt-hook.jsonl` | UserPromptSubmit | `outcome` = `injected` / `no-results` / `below-threshold-or-seen` / `skipped`; `injected`, `promptChars` |
+
+Neither log stores prompt text or raw session ids — session ids are recorded as
+a 16-char SHA-256 prefix.
+
+What to check after wiring or after a provider switch:
+
+1. A fresh `status:"invoked"` line appears in `stop-hook.jsonl` with your actor.
+2. `session_present` is `true`. If it is `false`, the `SessionStart` bridge is
+   missing — that is the half-installed failure above.
+3. A line appears in `prompt-hook.jsonl` for each prompt. `no-results` is a
+   healthy outcome; *no line at all* means the hook is not loaded.
+4. Inside a Claude session, `echo $AGENT_MEMORY_SESSION_ID` in Bash should print
+   the host session id — the most direct proof the bridge is live.
 
 ## CodeBuddy Code (CLI)
 

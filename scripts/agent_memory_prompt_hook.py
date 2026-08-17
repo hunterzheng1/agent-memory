@@ -79,6 +79,43 @@ def should_skip(prompt: str) -> bool:
     return text.startswith(SKIP_PREFIXES)
 
 
+def heartbeat(session_id: str, outcome: str, injected: int, prompt_chars: int) -> None:
+    """Record that the hook was invoked at all.
+
+    Both memory hooks are silent when there is nothing to do, which makes
+    "the hook never ran" and "the hook ran and had nothing to say"
+    indistinguishable — the exact ambiguity that let a half-installed Claude
+    setup look healthy for five days. A compact per-invocation line makes
+    "is it actually loaded?" answerable from evidence instead of inference.
+    """
+    try:
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        from agent_memory_env import env_value, resolve_config_path  # noqa: PLC0415
+
+        root = resolve_config_path(
+            env_value("CONFIG_ROOT", "$HOME/.config/agent-memory")
+        )
+        path = root / "logs" / "prompt-hook.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "time": int(time.time()),
+            "event": "prompt-hook",
+            "actor": "claude",
+            "outcome": outcome,
+            "injected": injected,
+            "promptChars": prompt_chars,
+            # Hash, never the raw id or prompt text.
+            "session_hash": hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+            if session_id
+            else "",
+        }
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        # Observability must never break the hook's fail-open contract.
+        return
+
+
 def _state_dir() -> Path | None:
     """Per-session dedupe stamps; None when no writable location resolves."""
     try:
@@ -218,16 +255,18 @@ def main() -> int:
     args = parse_args()
     payload = read_payload()
     prompt = str(payload.get("prompt") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
     if not prompt or should_skip(prompt):
+        heartbeat(session_id, "skipped", 0, len(prompt))
         return 0
     if not SEARCH_SCRIPT.is_file():
+        heartbeat(session_id, "no-search-script", 0, len(prompt))
         return 0
 
     entries = search(prompt, args)
     if not entries:
+        heartbeat(session_id, "no-results", 0, len(prompt))
         return 0
-
-    session_id = str(payload.get("session_id") or "").strip()
     seen = set() if args.no_dedupe else load_seen(session_id)
 
     selected: list[dict] = []
@@ -248,9 +287,11 @@ def main() -> int:
             break
 
     if not selected:
+        heartbeat(session_id, "below-threshold-or-seen", 0, len(prompt))
         return 0
     if not args.no_dedupe:
         save_seen(session_id, seen)
+    heartbeat(session_id, "injected", len(selected), len(prompt))
 
     sys.stdout.write(
         json.dumps(

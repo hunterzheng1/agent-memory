@@ -656,6 +656,47 @@ def audit_lifecycle_failure(
         return
 
 
+def record_invocation(
+    *,
+    actor: str,
+    protocol: str,
+    event: str,
+    session_id: str,
+    pending: int,
+    claims: int,
+    auto_closeout: bool,
+) -> None:
+    """Record that the hook was invoked, regardless of outcome.
+
+    Until now this log only captured failures, so a hook that ran and had
+    nothing to do was indistinguishable from a hook that was never wired up.
+    That ambiguity is what let a half-installed Claude setup look healthy while
+    writing nothing to the vault for five days. docs/automation.md tells people
+    to verify here — this makes that advice actually actionable.
+    """
+    record = {
+        "time": int(time.time()),
+        "event": event,
+        "protocol": protocol,
+        "actor": actor,
+        "status": "invoked",
+        "pending": pending,
+        "claims": claims,
+        "autoCloseout": bool(auto_closeout),
+        "session_present": bool(session_id),
+        "session_hash": hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+        if session_id
+        else "",
+    }
+    try:
+        secure_append_text(
+            HOOK_AUDIT_LOG,
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n",
+        )
+    except OSError:
+        return
+
+
 def run_due_audit() -> None:
     if not AUDIT_AUTORUN.exists():
         return
@@ -683,6 +724,15 @@ def main() -> int:
         raw_session_id,
         args.actor,
         max_age_hours=24,
+    )
+    record_invocation(
+        actor=args.actor,
+        protocol=args.protocol,
+        event=args.event,
+        session_id=raw_session_id,
+        pending=len(paths),
+        claims=len(current_claims),
+        auto_closeout=bool(args.auto_closeout),
     )
     if args.auto_closeout and current_claims:
         result = run_closeout(payload, args.actor, args.timeout, args.event)
