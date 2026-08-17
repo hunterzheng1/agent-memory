@@ -612,6 +612,10 @@ def _run_git(*args: str, binary: bool = False) -> subprocess.CompletedProcess[An
         ["git", "-C", str(_absolute_lexical(GIT_ROOT)), *args],
         capture_output=True,
         text=not binary,
+        # Text mode must decode git's UTF-8 output explicitly — vault paths are
+        # Chinese and the locale codec (cp936 on zh-CN Windows) mangles them.
+        # Binary callers want raw bytes, where encoding must stay unset.
+        **({} if binary else {"encoding": "utf-8", "errors": "replace"}),
         timeout=30,
         check=False,
     )

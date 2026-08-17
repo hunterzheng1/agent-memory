@@ -373,6 +373,11 @@ def zvec_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]
         completed = subprocess.run(
             command,
             text=True,
+            # The backend emits UTF-8 JSON. Without an explicit encoding Python
+            # decodes with the locale codec (cp936 on zh-CN Windows), which
+            # mangles every non-ASCII summary before it reaches the caller.
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=args.zvec_timeout,
             env=command_env_offline(),
@@ -452,7 +457,16 @@ def rg_search(args: argparse.Namespace) -> tuple[list[SearchResult], list[str]]:
         return [], []
     command = ["rg", "--line-number", "--ignore-case", "--fixed-strings", "--", args.query, str(VAULT_ROOT)]
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=args.rg_timeout, check=False)
+        # rg always writes UTF-8; decode it as such regardless of console locale.
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=args.rg_timeout,
+            check=False,
+        )
     except FileNotFoundError:
         return [], ["rg not found"]
     except subprocess.TimeoutExpired:

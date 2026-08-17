@@ -174,6 +174,10 @@ def run_command(
         completed = subprocess.run(
             command,
             text=True,
+            # Vault paths are Chinese (项目/ 决策/ 用户记忆/). Locale decoding
+            # (cp936 on zh-CN Windows) corrupts git output and child JSON.
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             env=env,

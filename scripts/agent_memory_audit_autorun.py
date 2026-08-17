@@ -126,6 +126,10 @@ def run_command(command: list[str], timeout: int = 180) -> dict[str, Any]:
         completed = subprocess.run(
             command,
             text=True,
+            # Child emits UTF-8; locale decoding (cp936 on zh-CN Windows) would
+            # corrupt Chinese vault paths in the captured output.
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             env=env,

@@ -292,6 +292,8 @@ def git_remote_has_embedded_credential() -> tuple[bool, str]:
         completed = subprocess.run(
             ["git", "-C", str(GIT_ROOT), "config", "--get-regexp", r"^remote\..*\.url$"],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=15,
             check=False,

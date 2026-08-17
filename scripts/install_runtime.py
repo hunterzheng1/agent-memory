@@ -474,6 +474,10 @@ def git_value(*args: str) -> str:
     completed = subprocess.run(
         ["git", "-C", str(REPO_ROOT), *args],
         text=True,
+        # git writes UTF-8; the locale codec (cp936 on zh-CN Windows) would
+        # corrupt any non-ASCII value this returns.
+        encoding="utf-8",
+        errors="replace",
         capture_output=True,
         timeout=15,
         check=False,

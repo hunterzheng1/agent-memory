@@ -198,7 +198,18 @@ def utc_now() -> str:
 
 def run(command: list[str], timeout: int = 300, env: dict[str, str] | None = None) -> dict[str, Any]:
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=timeout, env=env, check=False)
+        # Children emit UTF-8 and vault paths are Chinese; locale decoding
+        # (cp936 on zh-CN Windows) would corrupt every captured diagnostic.
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "returncode": 127, "detail": type(exc).__name__}
     return {"ok": completed.returncode == 0, "returncode": completed.returncode, "stdout": completed.stdout, "detail": (completed.stderr or completed.stdout).strip()[:500]}

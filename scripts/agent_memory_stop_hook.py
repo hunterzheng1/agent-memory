@@ -545,7 +545,18 @@ def run_closeout(
     if trigger == "session-end":
         command.append("--skip-audit")
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=max(timeout, 30), env=clean_env(), check=False)
+        # closeout replies with UTF-8 JSON that names Chinese vault paths;
+        # locale decoding (cp936) would corrupt it before json.loads below.
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=max(timeout, 30),
+            env=clean_env(),
+            check=False,
+        )
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"closeout timed out after {timeout}s"}
     except OSError as exc:
@@ -652,6 +663,8 @@ def run_due_audit() -> None:
         subprocess.run(
             [sys.executable, str(AUDIT_AUTORUN), "--reason", "hook", "--min-interval-days", "7", "--notify", "--json"],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=180,
             env=clean_env(),
