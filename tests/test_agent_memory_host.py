@@ -27,10 +27,10 @@ class HostRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             host.actor_names(),
-            ("codex", "claude", "codebuddy", "cursor", "human", "migration", "test"),
+            ("codex", "claude", "codebuddy", "cursor", "pi", "human", "migration", "test"),
         )
         self.assertEqual(host.actor_names(hook_only=True), ("codex", "claude", "codebuddy"))
-        self.assertEqual(host.scope_names(), ("shared", "codex", "claude", "codebuddy", "cursor"))
+        self.assertEqual(host.scope_names(), ("shared", "codex", "claude", "codebuddy", "cursor", "pi"))
         self.assertNotIn("shared", host.actor_names())
         self.assertEqual(
             host.__all__,
@@ -44,6 +44,7 @@ class HostRegistryTests(unittest.TestCase):
             "claude": ("claude", "claude"),
             "codebuddy": ("codebuddy", "claude"),
             "cursor": ("cursor", ""),
+            "pi": ("pi", ""),
             "human": ("", ""),
             "migration": ("", ""),
             "test": ("", ""),
@@ -128,6 +129,7 @@ class HostRegistryTests(unittest.TestCase):
                 "codebuddy-session",
             ),
             ("cursor", {"AGENT_MEMORY_SESSION_ID": " cursor-session "}, "cursor-session"),
+            ("pi", {"AGENT_MEMORY_SESSION_ID": " ", "PI_SESSION_ID": " pi-session "}, "pi-session"),
             ("human", {"AGENT_MEMORY_SESSION_ID": " human-session "}, "human-session"),
             ("migration", {"AGENT_MEMORY_SESSION_ID": " migration-session "}, "migration-session"),
             ("test", {"AGENT_MEMORY_SESSION_ID": " test-session "}, "test-session"),
@@ -177,6 +179,25 @@ class HostRegistryTests(unittest.TestCase):
         self.assertEqual(generic.session_id, "generic-session")
         self.assertEqual(generic.search_scope, "cursor")
         self.assertEqual(generic.hook_protocol, "")
+
+    def test_pi_uses_native_session_and_has_no_hook(self) -> None:
+        host = load_host()
+        inherited = host.resolve(
+            "pi",
+            env={
+                "CLAUDE_SESSION_ID": "claude-session",
+                "CODEX_THREAD_ID": "codex-thread",
+            },
+        )
+        native = host.resolve(
+            "pi",
+            env={"AGENT_MEMORY_SESSION_ID": " ", "PI_SESSION_ID": " pi-native "},
+        )
+
+        self.assertEqual(inherited.session_id, "")
+        self.assertEqual(native.session_id, "pi-native")
+        self.assertEqual(native.search_scope, "pi")
+        self.assertEqual(native.hook_protocol, "")
 
     def test_unknown_and_legacy_actor_names_are_rejected(self) -> None:
         host = load_host()

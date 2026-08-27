@@ -52,6 +52,11 @@ _REGISTRY: Mapping[str, _HostPolicy] = MappingProxyType(
             search_scope="cursor",
             hook_protocol="",
         ),
+        "pi": _HostPolicy(
+            session_env=("AGENT_MEMORY_SESSION_ID", "PI_SESSION_ID"),
+            search_scope="pi",
+            hook_protocol="",
+        ),
         "human": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "migration": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "test": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
