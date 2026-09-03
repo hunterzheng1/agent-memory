@@ -57,6 +57,14 @@ _REGISTRY: Mapping[str, _HostPolicy] = MappingProxyType(
             search_scope="pi",
             hook_protocol="",
         ),
+        # ZCode injects CLAUDE_SESSION_ID into hook processes (its hook system
+        # keeps Claude-compatible variable names), so no env-file bridge is
+        # needed; hook payloads are Claude-shaped, hence hook_protocol="claude".
+        "zcode": _HostPolicy(
+            session_env=("AGENT_MEMORY_SESSION_ID", "ZCODE_SESSION_ID", "CLAUDE_SESSION_ID"),
+            search_scope="zcode",
+            hook_protocol="claude",
+        ),
         "human": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "migration": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "test": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),

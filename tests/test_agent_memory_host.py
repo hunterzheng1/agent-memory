@@ -27,10 +27,13 @@ class HostRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             host.actor_names(),
-            ("codex", "claude", "codebuddy", "cursor", "pi", "human", "migration", "test"),
+            ("codex", "claude", "codebuddy", "cursor", "pi", "zcode", "human", "migration", "test"),
         )
-        self.assertEqual(host.actor_names(hook_only=True), ("codex", "claude", "codebuddy"))
-        self.assertEqual(host.scope_names(), ("shared", "codex", "claude", "codebuddy", "cursor", "pi"))
+        self.assertEqual(host.actor_names(hook_only=True), ("codex", "claude", "codebuddy", "zcode"))
+        self.assertEqual(
+            host.scope_names(),
+            ("shared", "codex", "claude", "codebuddy", "cursor", "pi", "zcode"),
+        )
         self.assertNotIn("shared", host.actor_names())
         self.assertEqual(
             host.__all__,
@@ -45,6 +48,7 @@ class HostRegistryTests(unittest.TestCase):
             "codebuddy": ("codebuddy", "claude"),
             "cursor": ("cursor", ""),
             "pi": ("pi", ""),
+            "zcode": ("zcode", "claude"),
             "human": ("", ""),
             "migration": ("", ""),
             "test": ("", ""),
@@ -130,6 +134,11 @@ class HostRegistryTests(unittest.TestCase):
             ),
             ("cursor", {"AGENT_MEMORY_SESSION_ID": " cursor-session "}, "cursor-session"),
             ("pi", {"AGENT_MEMORY_SESSION_ID": " ", "PI_SESSION_ID": " pi-session "}, "pi-session"),
+            (
+                "zcode",
+                {"AGENT_MEMORY_SESSION_ID": " ", "ZCODE_SESSION_ID": " ", "CLAUDE_SESSION_ID": " zcode-hook-session "},
+                "zcode-hook-session",
+            ),
             ("human", {"AGENT_MEMORY_SESSION_ID": " human-session "}, "human-session"),
             ("migration", {"AGENT_MEMORY_SESSION_ID": " migration-session "}, "migration-session"),
             ("test", {"AGENT_MEMORY_SESSION_ID": " test-session "}, "test-session"),
@@ -198,6 +207,30 @@ class HostRegistryTests(unittest.TestCase):
         self.assertEqual(native.session_id, "pi-native")
         self.assertEqual(native.search_scope, "pi")
         self.assertEqual(native.hook_protocol, "")
+
+    def test_zcode_reads_hook_injected_session_and_uses_claude_protocol(self) -> None:
+        host = load_host()
+        inherited = host.resolve(
+            "zcode",
+            env={
+                "CLAUDE_SESSION_ID": "zcode-hook-session",
+                "CODEX_THREAD_ID": "codex-thread",
+                "PI_SESSION_ID": "pi-session",
+            },
+        )
+        explicit = host.resolve(
+            "zcode",
+            env={"AGENT_MEMORY_SESSION_ID": " explicit-session ", "CLAUDE_SESSION_ID": "zcode-hook-session"},
+        )
+
+        # ZCode injects CLAUDE_SESSION_ID into hook processes; other hosts'
+        # session variables must never leak into zcode attribution.
+        self.assertEqual(inherited.session_id, "zcode-hook-session")
+        self.assertEqual(explicit.session_id, "explicit-session")
+        self.assertEqual(explicit.search_scope, "zcode")
+        # ZCode hook payloads are Claude-shaped, so the stop hook reuses the
+        # claude protocol parser.
+        self.assertEqual(explicit.hook_protocol, "claude")
 
     def test_unknown_and_legacy_actor_names_are_rejected(self) -> None:
         host = load_host()

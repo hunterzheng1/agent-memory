@@ -24,6 +24,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEARCH_SCRIPT = REPO_ROOT / "scripts" / "agent_memory_search.py"
 
+if str(REPO_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from agent_memory_host import actor_names  # noqa: E402
+
 # Prompts shorter than this are continuations ("继续", "ok", "go on") that carry
 # no retrievable intent; searching on them returns noise.
 MIN_PROMPT_CHARS = 8
@@ -36,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Inject relevant Agent Memory entries into the Claude prompt context."
     )
-    parser.add_argument("--actor", default="claude", choices=("claude", "codebuddy", "codex"))
+    parser.add_argument("--actor", default="claude", choices=actor_names(hook_only=True))
     parser.add_argument("--limit", type=int, default=3, help="max memories injected per prompt")
     parser.add_argument(
         "--min-score",
@@ -79,7 +83,7 @@ def should_skip(prompt: str) -> bool:
     return text.startswith(SKIP_PREFIXES)
 
 
-def heartbeat(session_id: str, outcome: str, injected: int, prompt_chars: int) -> None:
+def heartbeat(session_id: str, outcome: str, injected: int, prompt_chars: int, actor: str = "claude") -> None:
     """Record that the hook was invoked at all.
 
     Both memory hooks are silent when there is nothing to do, which makes
@@ -100,7 +104,7 @@ def heartbeat(session_id: str, outcome: str, injected: int, prompt_chars: int) -
         record = {
             "time": int(time.time()),
             "event": "prompt-hook",
-            "actor": "claude",
+            "actor": actor,
             "outcome": outcome,
             "injected": injected,
             "promptChars": prompt_chars,
@@ -257,15 +261,15 @@ def main() -> int:
     prompt = str(payload.get("prompt") or "").strip()
     session_id = str(payload.get("session_id") or "").strip()
     if not prompt or should_skip(prompt):
-        heartbeat(session_id, "skipped", 0, len(prompt))
+        heartbeat(session_id, "skipped", 0, len(prompt), args.actor)
         return 0
     if not SEARCH_SCRIPT.is_file():
-        heartbeat(session_id, "no-search-script", 0, len(prompt))
+        heartbeat(session_id, "no-search-script", 0, len(prompt), args.actor)
         return 0
 
     entries = search(prompt, args)
     if not entries:
-        heartbeat(session_id, "no-results", 0, len(prompt))
+        heartbeat(session_id, "no-results", 0, len(prompt), args.actor)
         return 0
     seen = set() if args.no_dedupe else load_seen(session_id)
 
@@ -287,11 +291,11 @@ def main() -> int:
             break
 
     if not selected:
-        heartbeat(session_id, "below-threshold-or-seen", 0, len(prompt))
+        heartbeat(session_id, "below-threshold-or-seen", 0, len(prompt), args.actor)
         return 0
     if not args.no_dedupe:
         save_seen(session_id, seen)
-    heartbeat(session_id, "injected", len(selected), len(prompt))
+    heartbeat(session_id, "injected", len(selected), len(prompt), args.actor)
 
     sys.stdout.write(
         json.dumps(
