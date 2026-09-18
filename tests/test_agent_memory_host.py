@@ -27,12 +27,12 @@ class HostRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             host.actor_names(),
-            ("codex", "claude", "codebuddy", "cursor", "pi", "zcode", "human", "migration", "test"),
+            ("codex", "claude", "codebuddy", "cursor", "pi", "zcode", "qoder", "human", "migration", "test"),
         )
         self.assertEqual(host.actor_names(hook_only=True), ("codex", "claude", "codebuddy", "zcode"))
         self.assertEqual(
             host.scope_names(),
-            ("shared", "codex", "claude", "codebuddy", "cursor", "pi", "zcode"),
+            ("shared", "codex", "claude", "codebuddy", "cursor", "pi", "zcode", "qoder"),
         )
         self.assertNotIn("shared", host.actor_names())
         self.assertEqual(
@@ -49,6 +49,7 @@ class HostRegistryTests(unittest.TestCase):
             "cursor": ("cursor", ""),
             "pi": ("pi", ""),
             "zcode": ("zcode", "claude"),
+            "qoder": ("qoder", ""),
             "human": ("", ""),
             "migration": ("", ""),
             "test": ("", ""),
@@ -139,6 +140,7 @@ class HostRegistryTests(unittest.TestCase):
                 {"AGENT_MEMORY_SESSION_ID": " ", "ZCODE_SESSION_ID": " ", "CLAUDE_SESSION_ID": " zcode-hook-session "},
                 "zcode-hook-session",
             ),
+            ("qoder", {"AGENT_MEMORY_SESSION_ID": " qoder-session "}, "qoder-session"),
             ("human", {"AGENT_MEMORY_SESSION_ID": " human-session "}, "human-session"),
             ("migration", {"AGENT_MEMORY_SESSION_ID": " migration-session "}, "migration-session"),
             ("test", {"AGENT_MEMORY_SESSION_ID": " test-session "}, "test-session"),
@@ -231,6 +233,27 @@ class HostRegistryTests(unittest.TestCase):
         # ZCode hook payloads are Claude-shaped, so the stop hook reuses the
         # claude protocol parser.
         self.assertEqual(explicit.hook_protocol, "claude")
+
+    def test_qoder_uses_only_generic_session_and_has_no_hook(self) -> None:
+        host = load_host()
+        inherited = host.resolve(
+            "qoder",
+            env={
+                "QODER_SESSION_ID": "qoder-native-session",
+                "CLAUDE_SESSION_ID": "claude-session",
+                "CODEX_THREAD_ID": "codex-thread",
+                "PI_SESSION_ID": "pi-session",
+            },
+        )
+        generic = host.resolve(
+            "qoder",
+            env={"AGENT_MEMORY_SESSION_ID": " generic-session ", "QODER_SESSION_ID": "qoder-native-session"},
+        )
+
+        self.assertEqual(inherited.session_id, "")
+        self.assertEqual(generic.session_id, "generic-session")
+        self.assertEqual(generic.search_scope, "qoder")
+        self.assertEqual(generic.hook_protocol, "")
 
     def test_unknown_and_legacy_actor_names_are_rejected(self) -> None:
         host = load_host()

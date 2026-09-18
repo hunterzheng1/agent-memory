@@ -65,6 +65,14 @@ _REGISTRY: Mapping[str, _HostPolicy] = MappingProxyType(
             search_scope="zcode",
             hook_protocol="claude",
         ),
+        # Qoder injects no native session-ID environment variable, so writes
+        # must pass --session-id or set AGENT_MEMORY_SESSION_ID explicitly;
+        # there is no Stop hook protocol yet.
+        "qoder": _HostPolicy(
+            session_env=_GENERIC_SESSION_ENV,
+            search_scope="qoder",
+            hook_protocol="",
+        ),
         "human": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "migration": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "test": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
