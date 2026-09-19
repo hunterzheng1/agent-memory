@@ -23,6 +23,16 @@ run_sqlite_index_after_closeout = true
 run_audit_after_interval_days = 7
 commit_scoped_memory_files = true
 
+[safety]
+# What the prewrite gate does with source_class = local_verified
+# (agent self-attested "verified locally" memories).
+# "ask_user" (default): keep the TRUSTED_VERIFICATION_RECEIPT_REQUIRED checkpoint.
+# "allow": let local_verified memories proceed to reconciliation on the agent's
+# own judgment, for single-user hosts where the checkpoint is noise.
+# Allowing never upgrades provenance: records stay self_attested / unverified
+# and still cannot authorize actions. Malformed values fail closed to "ask_user".
+local_verified_decision = "ask_user"
+
 [write_intents]
 # Disabled by default for upgrades. Start with a few exact high-impact paths;
 # do not protect the entire vault or use broad wildcards as a first rollout.

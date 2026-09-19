@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import sqlite3
@@ -19,6 +20,7 @@ REPO_ROOT = SCRIPTS.parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import agent_memory_safety as memory_safety_module
 import agent_memory_closeout as closeout
 from agent_memory_check import scan_for_secrets
 from agent_memory_safety import assess_source
@@ -160,23 +162,78 @@ class SourceSafetyTests(unittest.TestCase):
         self.assertFalse(result["can_reconcile"])
 
     def test_self_attested_local_evidence_cannot_claim_verification(self) -> None:
-        missing = assess_source(
-            "Runtime check passed",
-            source_class="local_verified",
-            knowledge_kind="fact",
-        )
-        present = assess_source(
-            "Runtime check passed",
-            source_class="local_verified",
-            knowledge_kind="fact",
-            evidence_ref="doctor-report:2026-07-19",
-        )
+        with mock.patch.object(
+            memory_safety_module,
+            "_local_verified_decision",
+            return_value=memory_safety_module.LOCAL_VERIFIED_ASK_USER,
+        ):
+            missing = assess_source(
+                "Runtime check passed",
+                source_class="local_verified",
+                knowledge_kind="fact",
+            )
+            present = assess_source(
+                "Runtime check passed",
+                source_class="local_verified",
+                knowledge_kind="fact",
+                evidence_ref="doctor-report:2026-07-19",
+            )
         self.assertEqual(missing["decision"], "ASK_USER")
         self.assertEqual(present["decision"], "ASK_USER")
         self.assertEqual(present["reason_code"], "TRUSTED_VERIFICATION_RECEIPT_REQUIRED")
         self.assertTrue(present["has_evidence"])
         self.assertEqual(present["provenance_trust"], "self_attested")
         self.assertFalse(present["can_authorize_action"])
+
+    def test_config_allow_lets_local_verified_proceed_without_claiming_verification(self) -> None:
+        with mock.patch.object(
+            memory_safety_module,
+            "_local_verified_decision",
+            return_value=memory_safety_module.LOCAL_VERIFIED_ALLOW,
+        ):
+            result = assess_source(
+                "Runtime check passed",
+                source_class="local_verified",
+                knowledge_kind="fact",
+            )
+        self.assertEqual(result["decision"], "ALLOW")
+        self.assertEqual(result["reason_code"], "SOURCE_ALLOWED")
+        self.assertTrue(result["can_reconcile"])
+        self.assertTrue(result["can_create_intent"])
+        self.assertEqual(result["provenance_trust"], "self_attested")
+        self.assertEqual(result["verification_status"], "unverified")
+        self.assertFalse(result["can_authorize_action"])
+
+    def test_local_verified_policy_parsing_fails_closed_on_malformed_values(self) -> None:
+        original = os.environ.get("AGENT_MEMORY_CONFIG_FILE")
+        try:
+            with tempfile.TemporaryDirectory(prefix="safety-policy-") as raw_root:
+                config = Path(raw_root) / "agent-memory.toml"
+                cases = (
+                    ("allow", "allow"),
+                    ("ask_user", "ask_user"),
+                    ("yes", "ask_user"),
+                    ("", "ask_user"),
+                )
+                for configured, expected in cases:
+                    with self.subTest(configured=configured):
+                        config.write_text(
+                            f'[safety]\nlocal_verified_decision = "{configured}"\n',
+                            encoding="utf-8",
+                        )
+                        os.environ["AGENT_MEMORY_CONFIG_FILE"] = str(config)
+                        self.assertEqual(memory_safety_module._local_verified_decision(), expected)
+                with self.subTest(configured="missing-config"):
+                    os.environ["AGENT_MEMORY_CONFIG_FILE"] = str(config.parent / "absent.toml")
+                    self.assertEqual(
+                        memory_safety_module._local_verified_decision(),
+                        memory_safety_module.LOCAL_VERIFIED_ASK_USER,
+                    )
+        finally:
+            if original is None:
+                os.environ.pop("AGENT_MEMORY_CONFIG_FILE", None)
+            else:
+                os.environ["AGENT_MEMORY_CONFIG_FILE"] = original
 
     def test_direct_or_manual_source_rejects_obviously_conflicting_assertion(self) -> None:
         for source_class in ("user_direct", "manual_edit"):

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent_memory_env import load_config
 from agent_memory_state import secure_sqlite_connect
 
 
@@ -22,6 +23,26 @@ SOURCE_CLASSES = {
 }
 KNOWLEDGE_KINDS = {"fact", "preference", "rule", "inference", "hypothesis"}
 SELF_ATTESTED = "self_attested"
+LOCAL_VERIFIED_ASK_USER = "ask_user"
+LOCAL_VERIFIED_ALLOW = "allow"
+
+
+def _local_verified_decision() -> str:
+    """Read [safety] local_verified_decision from the runtime config.
+
+    Anything missing, malformed, or unreadable fails closed to ask_user.
+    Allowing the write never upgrades provenance: the assessment stays
+    self_attested / unverified and cannot authorize actions.
+    """
+    try:
+        section = load_config().get("safety", {})
+    except OSError:
+        return LOCAL_VERIFIED_ASK_USER
+    if not isinstance(section, dict):
+        return LOCAL_VERIFIED_ASK_USER
+    value = str(section.get("local_verified_decision", LOCAL_VERIFIED_ASK_USER))
+    value = value.strip().lower()
+    return value if value in {LOCAL_VERIFIED_ASK_USER, LOCAL_VERIFIED_ALLOW} else LOCAL_VERIFIED_ASK_USER
 _CONTRADICTORY_DIRECT_ASSERTION = re.compile(
     r"(?i)(?:^|[^a-z0-9])(web|remote|agent)(?:$|[^a-z0-9])"
 )
@@ -136,7 +157,7 @@ def assess_source(
     elif source == "unknown":
         decision = "ASK_USER"
         reason_code = "SOURCE_UNKNOWN"
-    elif source == "local_verified":
+    elif source == "local_verified" and _local_verified_decision() != LOCAL_VERIFIED_ALLOW:
         decision = "ASK_USER"
         reason_code = "TRUSTED_VERIFICATION_RECEIPT_REQUIRED"
 
