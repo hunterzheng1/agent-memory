@@ -462,10 +462,18 @@ def read_json_object(path: Path) -> dict[str, Any]:
 def claude_compatible_hook_semantics(
     hooks: dict[str, Any],
     actor: str,
+    *,
+    requires_session_start: bool = True,
 ) -> tuple[bool, dict[str, Any]]:
-    """Validate lifecycle semantics for Claude-protocol hosts without actor aliasing."""
+    """Validate lifecycle semantics for Claude-protocol hosts without actor aliasing.
 
-    if actor not in {"claude", "codebuddy"}:
+    ``requires_session_start`` is False for hosts that inject a session id
+    natively (CodeBuddy, WorkBuddy): for them the SessionStart bridge is
+    explicitly not part of the managed wiring, so demanding it would report a
+    permanent false warning.
+    """
+
+    if actor not in {"claude", "codebuddy", "workbuddy"}:
         return False, {"error": "unsupported_actor"}
 
     def command_entries(event: str) -> list[dict[str, Any]]:
@@ -508,17 +516,22 @@ def claude_compatible_hook_semantics(
         and 0 < float(item["timeout"]) <= 60
         for item in command_entries("SessionEnd")
     )
-    session_start_ok = any(
-        "agent_memory_session_hook.py" in (command := str(item.get("command", "")))
-        and has_value(command, "--actor", actor)
-        and isinstance(item.get("timeout"), (int, float))
-        and 0 < float(item["timeout"]) <= 10
-        for item in command_entries("SessionStart")
-    )
+    session_start_ok = True
+    if requires_session_start:
+        session_start_ok = any(
+            "agent_memory_session_hook.py" in (command := str(item.get("command", "")))
+            and has_value(command, "--actor", actor)
+            and isinstance(item.get("timeout"), (int, float))
+            and 0 < float(item["timeout"]) <= 10
+            for item in command_entries("SessionStart")
+        )
+    # Report the real state instead of a bare True: hosts with a native session
+    # id are expected to have no SessionStart bridge at all.
+    session_start_detail: bool | str = session_start_ok if requires_session_start else "not_required"
     return stop_ok and session_end_ok and session_start_ok, {
         "stop_scoped_and_blocking": stop_ok,
         "session_end_non_blocking": session_end_ok,
-        "session_start_bridge": session_start_ok,
+        "session_start_bridge": session_start_detail,
     }
 
 
@@ -1105,10 +1118,12 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
             live_semantics_ok, live_semantics_detail = claude_compatible_hook_semantics(
                 codebuddy_live_hooks,
                 "codebuddy",
+                requires_session_start=False,
             )
             fragment_semantics_ok, fragment_semantics_detail = claude_compatible_hook_semantics(
                 codebuddy_expected,
                 "codebuddy",
+                requires_session_start=False,
             )
             semantics_ok = live_semantics_ok and (
                 fragment_semantics_ok if codebuddy_fragment_path else True
@@ -1121,6 +1136,56 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
                     "CodeBuddy uses scoped Claude-compatible lifecycle hooks."
                     if semantics_ok
                     else "CodeBuddy hooks have unsafe Stop/SessionEnd lifecycle semantics."
+                ),
+                {"live": live_semantics_detail, "managed_fragment": fragment_semantics_detail},
+            )
+
+        workbuddy_settings_path = configured_path("workbuddy_settings_json")
+        workbuddy_fragment_path = configured_path("workbuddy_hooks_fragment")
+        workbuddy_settings = read_json_object(workbuddy_settings_path) if workbuddy_settings_path else {}
+        workbuddy_expected = read_json_object(workbuddy_fragment_path) if workbuddy_fragment_path else {}
+        if workbuddy_settings_path or workbuddy_fragment_path:
+            workbuddy_blob = json.dumps(workbuddy_settings.get("hooks", {}), ensure_ascii=False)
+            fragment_ok = bool(workbuddy_expected) and workbuddy_settings.get("hooks") == workbuddy_expected
+            mention_ok = (
+                "agent_memory_stop_hook.py" in workbuddy_blob
+                and "--actor workbuddy" in workbuddy_blob
+            )
+            workbuddy_ok = fragment_ok or mention_ok
+            add(
+                checks,
+                "workbuddy_stop_hook",
+                "pass" if workbuddy_ok else "warn",
+                "WorkBuddy Stop/SessionEnd hooks are configured."
+                if workbuddy_ok
+                else "WorkBuddy hooks differ from the managed fragment or lack stop_hook --actor workbuddy.",
+            )
+            workbuddy_live_hooks = (
+                workbuddy_settings.get("hooks")
+                if isinstance(workbuddy_settings.get("hooks"), dict)
+                else {}
+            )
+            live_semantics_ok, live_semantics_detail = claude_compatible_hook_semantics(
+                workbuddy_live_hooks,
+                "workbuddy",
+                requires_session_start=False,
+            )
+            fragment_semantics_ok, fragment_semantics_detail = claude_compatible_hook_semantics(
+                workbuddy_expected,
+                "workbuddy",
+                requires_session_start=False,
+            )
+            semantics_ok = live_semantics_ok and (
+                fragment_semantics_ok if workbuddy_fragment_path else True
+            )
+            add(
+                checks,
+                "workbuddy_hook_semantics",
+                "pass" if semantics_ok else "warn",
+                (
+                    "WorkBuddy uses scoped Claude-compatible lifecycle hooks."
+                    if semantics_ok
+                    else "WorkBuddy hooks have unsafe Stop/SessionEnd lifecycle semantics."
                 ),
                 {"live": live_semantics_detail, "managed_fragment": fragment_semantics_detail},
             )

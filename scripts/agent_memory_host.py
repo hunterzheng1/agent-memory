@@ -73,6 +73,16 @@ _REGISTRY: Mapping[str, _HostPolicy] = MappingProxyType(
             search_scope="qoder",
             hook_protocol="",
         ),
+        # WorkBuddy (昆仑小智) runs the same engine as CodeBuddy Code but with a
+        # separate config root (~/.kunlunxiaozhi), so it needs its own actor:
+        # its settings file and hook install target are different from the
+        # CodeBuddy CLI. It injects CODEBUDDY_SESSION_ID natively (no
+        # SessionStart bridge) and its hook payloads are Claude-shaped.
+        "workbuddy": _HostPolicy(
+            session_env=("AGENT_MEMORY_SESSION_ID", "CODEBUDDY_SESSION_ID"),
+            search_scope="workbuddy",
+            hook_protocol="claude",
+        ),
         "human": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "migration": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),
         "test": _HostPolicy(session_env=_GENERIC_SESSION_ENV, search_scope="", hook_protocol=""),

@@ -78,3 +78,5 @@ include_model_cache = false
 # claude_hooks_fragment = "~/.config/agent-memory/config/claude-hooks.json"
 # codebuddy_settings_json = "~/.codebuddy/settings.json"
 # codebuddy_hooks_fragment = "~/.config/agent-memory/config/codebuddy-hooks.json"
+# workbuddy_settings_json = "~/.kunlunxiaozhi/settings.json"
+# workbuddy_hooks_fragment = "~/.config/agent-memory/config/workbuddy-hooks.json"

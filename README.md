@@ -1,6 +1,6 @@
-# Agent Memory Vault：Claude Code、Codex、CodeBuddy 与 Cursor 共享记忆
+# Agent Memory Vault：多 Agent 共享的长期记忆库
 
-这是一个可由 Claude Code、Codex、CodeBuddy Code CLI 与 Cursor 共用的长期记忆库模板。它把普通 Markdown 文件作为唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
+这是一个可由 Claude Code、Codex、CodeBuddy Code CLI、Cursor、Pi、ZCode、Qoder 与 WorkBuddy（昆仑小智）共用的长期记忆库模板。它把普通 Markdown 文件作为唯一长期事实源，用 SQLite 建全库索引，并用少量固定字段支持按用户、Agent、项目、应用、会话和记忆类型过滤。需要语义检索时，也可以额外启用本地 EmbeddingGemma + Zvec 向量旁路。
 
 这个仓库只包含模板、脚本和假示例，不应该包含你的真实记忆、真实路径、API key、私人项目名或聊天原文。
 
@@ -8,7 +8,7 @@
 
 ## 它解决什么问题
 
-- 让 Claude Code、Codex、CodeBuddy 与 Cursor 每次开始重要任务时，读取同一份相关长期记忆。
+- 让 Claude Code、Codex、CodeBuddy、Cursor、WorkBuddy（昆仑小智）等宿主每次开始重要任务时，读取同一份相关长期记忆。
 - 让每次任务结束时，把稳定事实、项目状态、工作流和 Agent 经验沉淀到 Markdown。
 - 让 Markdown 仍然是源文件，SQLite 只做索引和搜索，Obsidian 只是可选的查看和编辑方式。
 - 可选增加向量检索：只记得大概意思时，用 embedding + Zvec 找到相关 Markdown，再回读原文。
@@ -63,6 +63,9 @@ scripts/
   install-claude-hooks.ps1
                           # 幂等合并 Claude 四个 hook（SessionStart/UserPromptSubmit/Stop/SessionEnd）
                           # 保留无关 hook；被 provider 切换器清空后重跑即可修复
+  install-workbuddy-hooks.ps1
+                          # 幂等合并 WorkBuddy（昆仑小智）的 UserPromptSubmit/Stop/SessionEnd
+                          # 写入 ~/.kunlunxiaozhi/settings.json；原生会话 ID，无需 SessionStart 桥
   install_runtime.py     # 把当前 Git 版本安装为可校验的本机 Runtime
   memoryctl               # 所有宿主共用的平台中立命令入口
   agent_memory_zvec_index.py
@@ -104,20 +107,22 @@ cp config/agent-memory.example.toml "$HOME/.config/agent-memory/config/agent-mem
   --config-root "$HOME/.config/agent-memory" --verify --json
 ```
 
-## Claude Code、Codex、CodeBuddy 与 Cursor 共用
+## Claude Code、Codex、CodeBuddy、Cursor 与 WorkBuddy 共用
 
 保持一个 Markdown vault、一个 Git 基线、一个 SQLite、一个 Zvec 和一个 audit 调度器。各宿主只维护薄适配层：
 
 - Codex 的 `AGENTS.md` 指向 vault 规则。
 - Claude Code 的 `CLAUDE.md` 使用 `@/absolute/path/to/AGENTS.md` 导入同一规则。
 - CodeBuddy 的 `CODEBUDDY.md` 指向同一 vault 规则；Bash 原生提供 `CODEBUDDY_SESSION_ID`。
+- WorkBuddy（昆仑小智）同样读取 `CODEBUDDY.md`，配置根是 `~/.kunlunxiaozhi`（与 CodeBuddy CLI 的 `~/.codebuddy` 分离），也原生提供 `CODEBUDDY_SESSION_ID`；hook 用 `install-workbuddy-hooks.ps1` 合并。
 - Cursor 使用项目规则或 [Cursor User Rule](docs/cursor-user-rule.md)，并通过 `--actor cursor` 进入同一检索 scope。Cursor 当前没有 Stop Hook 协议，写入时需显式设置 `AGENT_MEMORY_SESSION_ID` 或传入 `--session-id`。
 - Claude Code 原生 auto-memory 不要指向正式 vault；推荐关闭，或只把它当作非正式草稿层。
-- 通过 `memoryctl --actor codex|claude|codebuddy|cursor` 使用同一搜索和 closeout。
+- 通过 `memoryctl --actor codex|claude|codebuddy|cursor|pi|zcode|qoder|workbuddy` 使用同一搜索和 closeout。
 
 ```bash
 python3 scripts/memoryctl --actor claude search "项目状态" --limit 5
 python3 scripts/memoryctl --actor codebuddy search "项目状态" --limit 5
+python3 scripts/memoryctl --actor workbuddy search "项目状态" --limit 5
 python3 scripts/memoryctl --actor cursor search "项目状态" --limit 5
 python3 scripts/memoryctl --actor codex prewrite "准备写入的记忆摘要" \
   --source-class user_direct --knowledge-kind fact \
@@ -126,7 +131,7 @@ python3 scripts/memoryctl --actor codex claim --file "/absolute/path/to/changed-
 python3 scripts/memoryctl --actor claude closeout
 ```
 
-写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session ID 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。当前会话没有有效认领，但所有待处理文件都能证明属于其他活跃会话时，Stop Hook 保持静默；真正未认领、同一 actor 无法确定会话或证据不完整时仍会阻止静默结束。成功 closeout 还会记录每个文件的内容哈希，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude`、`codebuddy` 或 `cursor`。
+写完正式记忆后先 `claim`。认领记录保存在 SQLite，只存 session ID 的哈希；Agent 会话内的 closeout 和 Stop Hook 只处理本会话认领的文件，其他会话的脏文件明确排除。当前会话没有有效认领，但所有待处理文件都能证明属于其他活跃会话时，Stop Hook 保持静默；真正未认领、同一 actor 无法确定会话或证据不完整时仍会阻止静默结束。成功 closeout 还会记录每个文件的内容哈希，只有具备这份完成证据的历史文件才允许 Git 观察基线跨过。普通事实默认 `agent_scope: shared`；只有宿主特有经验才标为 `codex`、`claude`、`codebuddy`、`cursor`、`pi`、`zcode`、`qoder` 或 `workbuddy`。
 
 异常退出可能留下旧认领。Stop Hook 不会继续信任超过 24 小时的认领，Doctor 会把它列为警告。清理时先预览，再显式应用；这只把 SQLite 账本状态改为 `expired`，不会删除或改写 Markdown：
 

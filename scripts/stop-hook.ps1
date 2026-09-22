@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('codex', 'claude', 'codebuddy')]
+    [ValidateSet('codex', 'claude', 'codebuddy', 'workbuddy')]
     [string]$Actor = 'codex',
     [ValidateSet('', 'codex', 'claude')]
     [string]$Protocol = '',

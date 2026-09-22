@@ -35,7 +35,7 @@ If another tool auto-commits the vault before closeout runs, closeout compares t
 
 ## Stop Hook Modes
 
-Stop is turn-scoped in Claude Code, Codex, and CodeBuddy, so the hook must stay quiet and idempotent.
+Stop is turn-scoped in Claude Code, Codex, CodeBuddy, and WorkBuddy, so the hook must stay quiet and idempotent.
 
 Reminder mode:
 
@@ -48,7 +48,8 @@ Automatic closeout mode is appropriate when the Agent has already written and cl
 
 - Claude must run `agent_memory_session_hook.py` from `SessionStart`. It writes the hook payload's real `session_id` to `CLAUDE_ENV_FILE`, so later Bash calls to `memoryctl claim` and the Stop payload use the same ownership key. It also clears an inherited `CODEX_THREAD_ID` inside Claude Bash commands.
 - CodeBuddy Bash already exports `CODEBUDDY_SESSION_ID`; **default: no SessionStart bridge**. Use `memoryctl --actor codebuddy` and Stop with `--actor codebuddy --protocol claude` (JSON `decision: block` on failure).
-- After each formal write, run `memoryctl --actor codex|claude|codebuddy claim --file <path>`.
+- WorkBuddy (昆仑小智) behaves like CodeBuddy but keeps its own config root `~/.kunlunxiaozhi`; use `memoryctl --actor workbuddy` and the same Claude-compatible Stop protocol.
+- After each formal write, run `memoryctl --actor codex|claude|codebuddy|workbuddy claim --file <path>`.
 - Gate on active claims for the current session. Dirty files claimed by another session stay untouched.
 - When the current session has no active claims, stay silent only if every pending file is covered by another active claim. Truly unclaimed files still block silent completion and require claim or review.
 - Treat claims older than 24 hours as abandoned for Stop-hook ownership checks. `doctor` reports them, and `memoryctl --actor human claims-expire` previews them before an explicit `--apply` changes only the SQLite ledger.
@@ -225,6 +226,61 @@ Merge into existing hooks; do not overwrite unrelated entries:
 ```
 
 Keep a managed hooks fragment for Doctor comparison (`codebuddy_hooks_fragment` in toml). If the IDE/sandbox denies writes to `~/.codebuddy/settings.json`, merge via a writable path or temporarily adjust sandbox `denyWrite`.
+
+## WorkBuddy（昆仑小智）
+
+WorkBuddy runs the same CodeBuddy engine but keeps its own config root `~/.kunlunxiaozhi` (not `~/.codebuddy`), so it has its own actor `workbuddy` and its own hook install target `~/.kunlunxiaozhi/settings.json`. The engine reads hooks from that file's `hooks` key and supports `UserPromptSubmit`, `Stop`, `SessionEnd`, `SessionStart`, `PreToolUse`, `PostToolUse`, `SubagentStop`, `PreCompact`, and `Notification`.
+
+- Use `memoryctl --actor workbuddy` for search / prewrite / claim / closeout.
+- **Default: no SessionStart bridge** — Bash already exports `CODEBUDDY_SESSION_ID`, exactly like the CodeBuddy CLI.
+- Stop uses the Claude-compatible block protocol (`--protocol claude`, `{"decision":"block"}` on failure); SessionEnd is a short non-blocking fallback.
+- One-shot install: `pwsh -File scripts/install-workbuddy-hooks.ps1 -DryRun`, then re-run without `-DryRun`. The script merges idempotently, only rewrites the entries it owns, and preserves unrelated settings such as `claw` and `sandbox`.
+- A second automatic *read* path: `~/.kunlunxiaozhi/MEMORY.md` is injected every turn as user-level long-term memory (4000-character cap). Keep cross-project standing conventions there.
+- Doctor compares the live hooks against `workbuddy_settings_json` / `workbuddy_hooks_fragment`.
+
+### WorkBuddy automatic closeout example
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_prompt_hook.py --actor workbuddy",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_stop_hook.py --actor workbuddy --protocol claude --event stop-hook --auto-closeout --timeout 300",
+            "timeout": 320
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python /absolute/path/to/agent-memory/scripts/agent_memory_stop_hook.py --actor workbuddy --protocol claude --event session-end --non-blocking --auto-closeout --timeout 30",
+            "timeout": 40
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The recall hook gets 20 seconds rather than the 8-second default: a real search takes several seconds, and a silent timeout drops recall with no error.
 
 ### Claude Code CLI automatic closeout example
 

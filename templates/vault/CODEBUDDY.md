@@ -4,6 +4,8 @@
 
 本 vault 是项目级长期记忆层，与 CodeBuddy 全局配置（`~/.codebuddy/`）互补不替代：全局配置管 hooks/settings，本 vault 管稳定事实与状态。
 
+> WorkBuddy（昆仑小智）读取同一份 `CODEBUDDY.md`，但配置根是 `~/.kunlunxiaozhi`、actor 是 `workbuddy`。它同样原生注入 `CODEBUDDY_SESSION_ID`，因此下面的会话桥说明对它同样适用；把示例里的 `--actor codebuddy` 换成 `--actor workbuddy` 即可。
+
 > Codex / Claude 用户看 `AGENTS.md`；Cursor 用户看项目 `.cursor/rules/agent-memory.mdc` 或 Cursor User Rule。规则等价，写入时用各自 `agent_id`。
 
 读取顺序：

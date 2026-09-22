@@ -95,8 +95,8 @@ app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
 agent_scope: shared
-created_by: human | codex | claude | codebuddy | cursor
-last_updated_by: human | codex | claude | codebuddy | cursor
+created_by: human | codex | claude | codebuddy | cursor | pi | zcode | qoder | workbuddy
+last_updated_by: human | codex | claude | codebuddy | cursor | pi | zcode | qoder | workbuddy
 session_id: ""
 status: active
 sensitivity: normal

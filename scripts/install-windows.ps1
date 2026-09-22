@@ -3,7 +3,7 @@ param(
     [string]$MemoryRoot = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Agent Memory Vault'),
     [string]$ConfigRoot = (Join-Path $env:LOCALAPPDATA 'AgentMemoryVault'),
     [string]$UserId = 'demo-user',
-    [ValidateSet('shared', 'codex', 'claude', 'codebuddy', 'cursor')]
+    [ValidateSet('shared', 'codex', 'claude', 'codebuddy', 'cursor', 'pi', 'zcode', 'qoder', 'workbuddy')]
     [string]$AgentId = 'shared',
     [string]$AppId = 'agent-memory',
     [switch]$OverwriteConfig,

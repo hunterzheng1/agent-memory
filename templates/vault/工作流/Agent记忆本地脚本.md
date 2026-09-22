@@ -80,7 +80,7 @@ python3 scripts/agent_memory_zvec_index.py --search "只记得大概意思的问
 python3 scripts/agent_memory_retrieval_benchmark.py --limit 5
 ```
 
-`memoryctl --actor` 支持 `codex`、`claude`、`codebuddy`、`cursor`、`human`、`migration` 和 `test`。普通 Agent 写入必须有稳定会话 ID；Cursor 需要显式设置 `AGENT_MEMORY_SESSION_ID` 或传入 `--session-id`。
+`memoryctl --actor` 支持 `codex`、`claude`、`codebuddy`、`cursor`、`pi`、`zcode`、`qoder`、`workbuddy`、`human`、`migration` 和 `test`。普通 Agent 写入必须有稳定会话 ID；Cursor 需要显式设置 `AGENT_MEMORY_SESSION_ID` 或传入 `--session-id`。
 
 ## 下次优先看
 

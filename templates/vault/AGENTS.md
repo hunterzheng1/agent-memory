@@ -1,6 +1,6 @@
 # Shared Agent Memory Vault Instructions
 
-这是 Codex、Claude Code、CodeBuddy 与 Cursor 可共用的本地长期记忆库。Markdown 是唯一正式事实源；各 Agent 不各自维护第二套正式事实。
+这是 Codex、Claude Code、CodeBuddy、Cursor、Pi、ZCode、Qoder 与 WorkBuddy（昆仑小智）可共用的本地长期记忆库。Markdown 是唯一正式事实源；各 Agent 不各自维护第二套正式事实。
 
 读取顺序：
 
@@ -114,8 +114,8 @@ app_id: {{APP_ID}}
 user_id: {{USER_ID}}
 agent_id: {{AGENT_ID}}
 agent_scope: shared
-created_by: human | codex | claude | codebuddy | cursor
-last_updated_by: human | codex | claude | codebuddy | cursor
+created_by: human | codex | claude | codebuddy | cursor | pi | zcode | qoder | workbuddy
+last_updated_by: human | codex | claude | codebuddy | cursor | pi | zcode | qoder | workbuddy
 session_id: ""
 status: active
 sensitivity: normal

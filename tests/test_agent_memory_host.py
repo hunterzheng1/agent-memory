@@ -27,12 +27,27 @@ class HostRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             host.actor_names(),
-            ("codex", "claude", "codebuddy", "cursor", "pi", "zcode", "qoder", "human", "migration", "test"),
+            (
+                "codex",
+                "claude",
+                "codebuddy",
+                "cursor",
+                "pi",
+                "zcode",
+                "qoder",
+                "workbuddy",
+                "human",
+                "migration",
+                "test",
+            ),
         )
-        self.assertEqual(host.actor_names(hook_only=True), ("codex", "claude", "codebuddy", "zcode"))
+        self.assertEqual(
+            host.actor_names(hook_only=True),
+            ("codex", "claude", "codebuddy", "zcode", "workbuddy"),
+        )
         self.assertEqual(
             host.scope_names(),
-            ("shared", "codex", "claude", "codebuddy", "cursor", "pi", "zcode", "qoder"),
+            ("shared", "codex", "claude", "codebuddy", "cursor", "pi", "zcode", "qoder", "workbuddy"),
         )
         self.assertNotIn("shared", host.actor_names())
         self.assertEqual(
@@ -50,6 +65,7 @@ class HostRegistryTests(unittest.TestCase):
             "pi": ("pi", ""),
             "zcode": ("zcode", "claude"),
             "qoder": ("qoder", ""),
+            "workbuddy": ("workbuddy", "claude"),
             "human": ("", ""),
             "migration": ("", ""),
             "test": ("", ""),
@@ -141,6 +157,11 @@ class HostRegistryTests(unittest.TestCase):
                 "zcode-hook-session",
             ),
             ("qoder", {"AGENT_MEMORY_SESSION_ID": " qoder-session "}, "qoder-session"),
+            (
+                "workbuddy",
+                {"AGENT_MEMORY_SESSION_ID": " ", "CODEBUDDY_SESSION_ID": " workbuddy-session "},
+                "workbuddy-session",
+            ),
             ("human", {"AGENT_MEMORY_SESSION_ID": " human-session "}, "human-session"),
             ("migration", {"AGENT_MEMORY_SESSION_ID": " migration-session "}, "migration-session"),
             ("test", {"AGENT_MEMORY_SESSION_ID": " test-session "}, "test-session"),
@@ -254,6 +275,31 @@ class HostRegistryTests(unittest.TestCase):
         self.assertEqual(generic.session_id, "generic-session")
         self.assertEqual(generic.search_scope, "qoder")
         self.assertEqual(generic.hook_protocol, "")
+
+    def test_workbuddy_reads_native_session_and_uses_claude_protocol(self) -> None:
+        host = load_host()
+        inherited = host.resolve(
+            "workbuddy",
+            env={
+                "CLAUDE_SESSION_ID": "claude-session",
+                "CODEX_THREAD_ID": "codex-thread",
+                "PI_SESSION_ID": "pi-session",
+                "ZCODE_SESSION_ID": "zcode-session",
+            },
+        )
+        native = host.resolve(
+            "workbuddy",
+            env={"AGENT_MEMORY_SESSION_ID": " ", "CODEBUDDY_SESSION_ID": " workbuddy-native "},
+        )
+
+        # WorkBuddy injects CODEBUDDY_SESSION_ID natively; other hosts' session
+        # variables must never leak into its attribution.
+        self.assertEqual(inherited.session_id, "")
+        self.assertEqual(native.session_id, "workbuddy-native")
+        self.assertEqual(native.search_scope, "workbuddy")
+        # WorkBuddy hook payloads are Claude-shaped, so the stop hook reuses the
+        # claude protocol parser.
+        self.assertEqual(native.hook_protocol, "claude")
 
     def test_unknown_and_legacy_actor_names_are_rejected(self) -> None:
         host = load_host()

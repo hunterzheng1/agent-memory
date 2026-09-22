@@ -53,7 +53,7 @@ keywords:
 - `app_id`：记忆来自哪个应用或工作区。
 - `user_id`：用户标识，公开模板用假名。
 - `agent_id`：Agent 标识。
-- `agent_scope`：可读取这条记忆的宿主范围。普通事实使用 `shared`；宿主专属经验才使用 `codex`、`claude`、`codebuddy` 或 `cursor`。
+- `agent_scope`：可读取这条记忆的宿主范围。普通事实使用 `shared`；宿主专属经验才使用 `codex`、`claude`、`codebuddy`、`cursor`、`pi`、`zcode`、`qoder` 或 `workbuddy`。
 - `created_by`：首次创建内容的主体。
 - `last_updated_by`：最近修改内容的主体。
 - `session_id`：可选，会话标识。
