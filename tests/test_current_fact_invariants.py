@@ -128,6 +128,124 @@ verified_at: 2026-07-11
             self.assertNotIn("current_metric_conflict", audit_kinds())
             self.assertNotIn("current_summary_invariant", audit_kinds())
 
+    def test_exempt_paths_suppress_invariant_finding(self) -> None:
+        """A rule with exempt_paths should not fire for those files."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp)
+            vault = tmp / "vault"
+            runtime = tmp / "runtime"
+            shutil.copytree(TEMPLATE, vault)
+            runtime.joinpath("config").mkdir(parents=True)
+
+            exempt_target = vault / "工作流" / "历史改名记录.md"
+            exempt_target.write_text(
+                """---
+memory_type: workflow
+track: workflow
+agent_scope: shared
+status: active
+verified_at: 2026-10-09
+---
+# 历史改名记录
+
+## 当前有效摘要
+
+- 此前已把 codex_memory_*.py 改名为 agent_memory_*.py。
+""",
+                encoding="utf-8",
+            )
+
+            non_exempt_target = vault / "工作流" / "现役指引.md"
+            non_exempt_target.write_text(
+                """---
+memory_type: workflow
+track: workflow
+agent_scope: shared
+status: active
+verified_at: 2026-10-09
+---
+# 现役指引
+
+## 当前有效摘要
+
+- 直接调用 codex_memory_index.py 即可。
+""",
+                encoding="utf-8",
+            )
+
+            invariants = runtime / "config" / "system-invariants.json"
+            invariants.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "system_name": "Agent Memory Vault",
+                        "memory_root": str(vault),
+                        "runtime_root": str(runtime),
+                        "canonical_script_prefix": "agent_memory_",
+                        "shared_tracks": ["project", "workflow", "decision", "user", "routing"],
+                        "scope_exceptions": [],
+                        "forbidden_current_summary_patterns": [
+                            {
+                                "id": "legacy_codex_script_prefix",
+                                "pattern": r"codex_memory_",
+                                "severity": "high",
+                                "exempt_paths": ["工作流/历史改名记录.md"],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config = runtime / "config" / "agent-memory.toml"
+            config.write_text(
+                "\n".join(
+                    [
+                        f'memory_root = "{vault.as_posix()}"',
+                        f'config_root = "{runtime.as_posix()}"',
+                        f'state_db = "{(runtime / "state.sqlite").as_posix()}"',
+                        f'audit_db = "{(runtime / "audit.sqlite").as_posix()}"',
+                        f'invariants_file = "{invariants.as_posix()}"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = isolated_subprocess_env(
+                {
+                    "AGENT_MEMORY_CONFIG_FILE": str(config),
+                    "AGENT_MEMORY_ROOT": str(vault),
+                }
+            )
+
+            scan = subprocess.run(
+                [sys.executable, str(SCRIPTS / "agent_memory_index.py"), "--init", "--scan"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(scan.returncode, 0, scan.stderr)
+
+            audit = subprocess.run(
+                [sys.executable, str(SCRIPTS / "agent_memory_audit.py"), "--json", "--limit", "200"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(audit.returncode, 0, audit.stderr)
+            payload = json.loads(audit.stdout)
+            invariant_paths = {
+                item["rel_path"]
+                for item in payload["findings"]
+                if item["kind"] == "current_summary_invariant"
+            }
+            self.assertNotIn("工作流/历史改名记录.md", invariant_paths)
+            self.assertIn("工作流/现役指引.md", invariant_paths)
+
 
 if __name__ == "__main__":
     unittest.main()

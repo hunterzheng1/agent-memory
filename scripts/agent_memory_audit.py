@@ -197,7 +197,15 @@ def add_current_fact_invariant_findings(conn: sqlite3.Connection, findings: list
             compiled = re.compile(str(rule["pattern"]), re.IGNORECASE)
         except re.error:
             continue
+        exempt_paths = {
+            str(item).replace("\\", "/").lstrip("/")
+            for item in rule.get("exempt_paths", [])
+            if isinstance(item, str)
+        }
         for row in rows:
+            rel_path_normalized = str(row["rel_path"]).replace("\\", "/").lstrip("/")
+            if rel_path_normalized in exempt_paths:
+                continue
             summary = str(row["summary"] or "")
             if compiled.search(summary):
                 rule_id = str(rule["id"])
