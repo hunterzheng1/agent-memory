@@ -2309,8 +2309,17 @@ class RuntimeInstallTests(unittest.TestCase):
                 for suffix in ("-wal", "-shm"):
                     self.assertEqual(stat.S_IMODE(Path(f"{state_db}{suffix}").stat().st_mode), 0o600)
             else:
-                self.assertEqual(payload["permissions"]["permission_model"], "windows_acl_unverified")
-                self.assertIn("windows_acl_unverified", payload["permissions"]["warnings"])
+                # 2026-11-24: Windows now reads the DACL, so the model is
+                # "windows_acl" once a private DACL is observed ("unverified" only
+                # remains as the fallback when PowerShell is unavailable).
+                self.assertIn(
+                    payload["permissions"]["permission_model"],
+                    {"windows_acl", "windows_acl_unverified"},
+                )
+                if payload["permissions"]["permission_model"] == "windows_acl_unverified":
+                    self.assertIn(
+                        "windows_acl_unverified", payload["permissions"]["warnings"]
+                    )
             connection.close()
 
     def test_installed_runtime_can_bootstrap_outside_repository(self) -> None:
