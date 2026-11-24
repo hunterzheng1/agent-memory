@@ -77,6 +77,7 @@ REQUIRED_LOCAL_FILES = [
     SCRIPT_ROOT / "agent_memory_claim.py",
     SCRIPT_ROOT / "agent_memory_zvec_index.py",
     SCRIPT_ROOT / "agent_memory_policy_benchmark.py",
+    SCRIPT_ROOT / "agent_memory_redact_search_log.py",
     SCRIPT_ROOT / "agent_memory_retrieval_benchmark.py",
     SCRIPT_ROOT / "agent_memory_doctor.py",
     SCRIPT_ROOT / "agent_memory_decision_outcomes.py",

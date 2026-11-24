@@ -53,6 +53,7 @@ CORE_FILES = (
     "agent_memory_lock.py",
     "agent_memory_paths.py",
     "agent_memory_policy_benchmark.py",
+    "agent_memory_redact_search_log.py",
     "agent_memory_retrieval_benchmark.py",
     "agent_memory_search.py",
     "agent_memory_safety.py",

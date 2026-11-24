@@ -36,11 +36,26 @@ def mode(path: Path) -> int:
 
 class StatePermissionTests(unittest.TestCase):
     def assert_permission_report_is_honest(self, path: Path) -> None:
+        """Windows now verifies the DACL, so honesty means matching the platform.
+
+        On POSIX the report must claim mode enforcement. On Windows it may only
+        claim enforcement when a private DACL was actually observed; a machine
+        without PowerShell still reports the unverified warning instead.
+        """
         report = sqlite_permission_report(path)
         self.assertEqual(report["permission_model"], PERMISSION_MODEL)
-        self.assertEqual(report["mode_enforced"], POSIX_MODE_ENFORCED)
-        if not POSIX_MODE_ENFORCED:
-            self.assertIn("windows_acl_unverified", report["warnings"])
+        if POSIX_MODE_ENFORCED:
+            self.assertTrue(report["mode_enforced"])
+            self.assertEqual(report["warnings"], [])
+        else:
+            if report["mode_enforced"]:
+                self.assertEqual(report["warnings"], [])
+                self.assertNotIn(
+                    "acl",
+                    [issue.get("reason") for issue in report["issues"]],
+                )
+            else:
+                self.assertIn("windows_acl_unverified", report["warnings"])
 
     def test_connection_context_closes_the_database_handle(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
@@ -115,10 +130,14 @@ class StatePermissionTests(unittest.TestCase):
             if POSIX_MODE_ENFORCED:
                 self.assertEqual(mode(parent), 0o700)
             else:
+                # Windows: after harden_sqlite_files the DACL should be private.
+                # If PowerShell is unavailable the report stays honestly unverified.
                 report = sqlite_permission_report(database)
-                self.assertFalse(report["mode_enforced"])
-                self.assertEqual(report["permission_model"], "windows_acl_unverified")
-                self.assertIn("windows_acl_unverified", report["warnings"])
+                self.assertEqual(report["permission_model"], PERMISSION_MODEL)
+                if report["mode_enforced"]:
+                    self.assertEqual(report["warnings"], [])
+                else:
+                    self.assertIn("windows_acl_unverified", report["warnings"])
 
     def test_secure_connect_rejects_database_symlink(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
@@ -144,8 +163,12 @@ class StatePermissionTests(unittest.TestCase):
             if POSIX_MODE_ENFORCED:
                 self.assertFalse(before["ok"])
             else:
-                self.assertTrue(before["ok"])
-                self.assertIn("windows_acl_unverified", before["warnings"])
+                # chmod is a no-op on Windows; an inherited DACL is reported as an
+                # acl issue (repairable) rather than a hard failure.
+                reasons = [issue.get("reason") for issue in before["issues"]]
+                self.assertIn(reasons, ([], ["acl"]))
+                if reasons == ["acl"]:
+                    self.assertFalse(before["mode_enforced"])
             connection = secure_sqlite_connect(database)
             connection.close()
             if POSIX_MODE_ENFORCED:
@@ -186,16 +209,25 @@ class StatePermissionTests(unittest.TestCase):
                 timeout=60,
                 check=False,
             )
-            self.assertEqual(checked.returncode, 2 if POSIX_MODE_ENFORCED else 0, checked.stdout + checked.stderr)
             payload = json.loads(checked.stdout)
             permission_check = next(
                 item for item in payload["checks"] if item["name"] == "state_db_permissions"
             )
-            self.assertEqual(permission_check["status"], "fail" if POSIX_MODE_ENFORCED else "warn")
             if POSIX_MODE_ENFORCED:
+                self.assertEqual(checked.returncode, 2, checked.stdout + checked.stderr)
+                self.assertEqual(permission_check["status"], "fail")
                 self.assertEqual(mode(state_db), 0o644)
             else:
-                self.assertIn("windows_acl_unverified", permission_check["detail"]["warnings"])
+                # chmod is a no-op on Windows: the DACL created by the indexer is
+                # still private, so doctor must NOT report a false violation.
+                # (When PowerShell is unavailable it degrades to the unverified warn.)
+                self.assertIn(permission_check["status"], ("pass", "warn"))
+                if permission_check["status"] == "pass":
+                    self.assertEqual(permission_check["detail"]["warnings"], [])
+                else:
+                    self.assertIn(
+                        "windows_acl_unverified", permission_check["detail"]["warnings"]
+                    )
 
     def test_read_only_connect_falls_back_to_query_only_rw_for_wal_open_failure(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
@@ -249,6 +281,81 @@ class StatePermissionTests(unittest.TestCase):
             with self.assertRaises(StateSecurityError):
                 secure_sqlite_connect(database, read_only=True)
             self.assertFalse(database.exists())
+
+
+
+@unittest.skipUnless(state.WINDOWS_ACL_SUPPORTED, "Windows DACL inspection only")
+class WindowsAclTests(unittest.TestCase):
+    """2026-11-24: Windows now inspects the DACL instead of only saying unverified.
+
+    The old behaviour could not tell a private file from one readable by every
+    authenticated user, so the state DB / search log / audit ledger were never
+    actually checked on Windows.
+    """
+
+    def test_inherited_dacl_is_reported_and_then_hardened(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            target = Path(raw_root).resolve() / "state.sqlite"
+            with sqlite3.connect(target) as connection:
+                connection.execute("CREATE TABLE sample(value TEXT)")
+
+            # The ACL cache is process-wide; clear it so this test observes the
+            # file's real inherited DACL rather than a cached verdict.
+            state._WINDOWS_ACL_PRIVATE_CACHE.discard(str(target))
+            report = state.windows_acl_report(target)
+            if report is None:
+                self.skipTest("PowerShell unavailable")
+            # A freshly created temp file inherits BUILTIN\\Users /
+            # Authenticated Users, which must not count as private.
+            # Not private either because inheritance is still on (the DACL is not
+            # protected) or because a broad grantee is present; both must be caught.
+            self.assertFalse(report["private"])
+            self.assertTrue(
+                report["untrusted_grantees"] or not report["inheritance_protected"],
+                report,
+            )
+            reasons = [
+                issue.get("reason")
+                for issue in state._inspect_private_file(target, required=True)
+            ]
+            self.assertEqual(reasons, ["acl"])
+
+            state._WINDOWS_ACL_PRIVATE_CACHE.discard(str(target))
+            self.assertTrue(state.harden_windows_acl(target))
+            after = state.windows_acl_report(target)
+            self.assertIsNotNone(after)
+            self.assertTrue(after["private"])
+            self.assertEqual(after["untrusted_grantees"], [])
+            self.assertTrue(after["inheritance_protected"])
+            self.assertEqual(state._inspect_private_file(target, required=True), [])
+
+    def test_permissive_acl_is_repairable_not_fatal(self) -> None:
+        """A permissive DACL must be tightened, not turned into a hard failure."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            database = Path(raw_root).resolve() / "state.sqlite"
+            # secure_sqlite_connect hardens on open; the connection must succeed
+            # even though the inherited DACL was not private beforehand.
+            connection = secure_sqlite_connect(database)
+            try:
+                connection.execute("CREATE TABLE sample(value TEXT)")
+            finally:
+                connection.close()
+            report = sqlite_permission_report(database)
+            self.assertTrue(report["ok"], report)
+            if report["mode_enforced"]:
+                self.assertEqual(report["warnings"], [])
+
+    def test_acl_query_failure_degrades_to_unverified(self) -> None:
+        """No PowerShell -> stay honest (unverified), never claim safety."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_root:
+            target = Path(raw_root).resolve() / "state.sqlite"
+            with sqlite3.connect(target) as connection:
+                connection.execute("CREATE TABLE sample(value TEXT)")
+            with mock.patch.object(state, "_powershell", return_value=[]):
+                self.assertIsNone(state.windows_acl_report(target))
+                self.assertEqual(
+                    state._inspect_private_file(target, required=True), []
+                )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import os
 import re
 import socket
 import sqlite3
+import time
 import stat
 import subprocess
 from pathlib import Path
@@ -760,6 +761,14 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         os.path.abspath(CONFIG_ROOT)
     )
     runtime_verification = verify_runtime_install(CONFIG_ROOT) if installed_runtime else None
+    if runtime_verification is not None and not runtime_verification.get("ok"):
+        # The Windows installer runs doctor immediately after staging the runtime;
+        # a manifest/hash read can race the final flush and report a transient
+        # drift. Re-verify once before declaring the closure broken.
+        time.sleep(0.5)
+        retry = verify_runtime_install(CONFIG_ROOT)
+        if retry.get("ok"):
+            runtime_verification = retry
     if runtime_verification is not None:
         runtime_closure = runtime_verification.get("closure", {})
         missing = sorted(
@@ -790,7 +799,11 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         (
             "Enforcement is unavailable until an independent trusted approval verifier is configured."
             if enforcement_status == "fail"
-            else "Write intents are self-attested audit records and cannot authorize actions."
+            else (
+                "Write intents are self-attested audit records and cannot authorize actions."
+                " This advisory warning is by design while enforcement=advisory; set"
+                " enforcement=off to silence it, or provide a trusted approval verifier."
+            )
         ),
         {
             "mode": intent_enforcement,
@@ -816,8 +829,16 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         add(checks, "state_db", "fail", "State database is missing.", {"path": str(STATE_DB)})
         return checks
     permission_detail = sqlite_permission_report(STATE_DB)
+    # Path-shape problems (missing / symlink / not regular / POSIX mode drift) are
+    # hard failures. A permissive DACL is repairable: the next secure connect or
+    # closeout tightens it, and a transient read during install must not fail
+    # doctor. So an "acl"-only issue degrades to warn.
+    issue_reasons = {item.get("reason") for item in permission_detail["issues"]}
+    acl_only = bool(issue_reasons) and issue_reasons <= {"acl"}
     permission_status = (
-        "fail"
+        "warn"
+        if acl_only
+        else "fail"
         if not permission_detail["ok"]
         else "pass"
         if permission_detail["mode_enforced"]
@@ -829,6 +850,8 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
         permission_status,
         (
             "State database and SQLite sidecars are private (0600)."
+            if permission_status == "pass" and permission_detail["permission_model"] == "posix_mode"
+            else "State database and SQLite sidecars have a private DACL (user + SYSTEM + Administrators only)."
             if permission_status == "pass"
             else "SQLite paths are regular and non-symlinked, but Windows ACL isolation was not verified."
             if permission_status == "warn"
@@ -864,7 +887,39 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     add(checks, "sqlite_fts_parity", "pass" if fts == set(db_by_path) else "fail", f"FTS covers {len(fts)}/{len(docs)} docs.")
     index_path = VAULT_ROOT / "INDEX.md"
     refs = set(re.findall(r"`([^`]+\.md)`", index_path.read_text(encoding="utf-8", errors="replace"))) if index_path.exists() else set()
-    add(checks, "index_navigation_parity", "pass" if refs == actual_rel else "warn", f"INDEX.md lists {len(refs)}/{len(actual_rel)} docs.", {"unlisted": sorted(actual_rel - refs), "broken": sorted(refs - actual_rel)})
+    # INDEX.md is a *routing* index, not a full catalogue (see the vault
+    # AGENTS.md read order and templates/vault/INDEX.md, which routes to ~23
+    # entry points on purpose). Demanding one entry per document produced a
+    # permanent warning on every real vault, so the contract is:
+    #   1. no broken link (every referenced file exists), and
+    #   2. the index is non-trivial (at least one entry per top-level area).
+    # Ignore references that point outside the vault (host-level entry files such
+    # as ~/.pi/agent/AGENTS.md): they are routing targets, not vault documents.
+    external_refs = {ref for ref in refs if ref.startswith("~/") or ":" in ref}
+    broken_refs = sorted(refs - actual_rel - external_refs)
+    top_levels = {rel.split("/", 1)[0] for rel in actual_rel if "/" in rel}
+    routed_levels = {rel.split("/", 1)[0] for rel in refs if "/" in rel and rel in actual_rel}
+    uncovered_levels = sorted(top_levels - routed_levels)
+    navigation_ok = not broken_refs and not uncovered_levels
+    add(
+        checks,
+        "index_navigation_parity",
+        "pass" if navigation_ok else "warn",
+        (
+            f"INDEX.md routes to {len(refs & actual_rel)} entry points with no broken link; "
+            f"{len(actual_rel)} documents total (routing index, not a full catalogue)."
+            if navigation_ok
+            else f"INDEX.md routing is incomplete: {len(broken_refs)} broken link(s), "
+                 f"{len(uncovered_levels)} top-level area(s) not routed."
+        ),
+        {
+            "routed_entries": len(refs & actual_rel),
+            "documents_total": len(actual_rel),
+            "broken": broken_refs,
+            "unrouted_areas": uncovered_levels,
+            "unlisted_documents": sorted(actual_rel - refs),
+        },
+    )
     tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     # 2026-11-24：语义检索未启用时，zvec 相关检查一律 skipped（附原因），既不算 fail 也不算
     # warn。此前安装器写入 `[semantic_retrieval] enabled = false` 却没人读取，doctor 仍把
