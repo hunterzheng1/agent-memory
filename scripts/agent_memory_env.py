@@ -50,6 +50,8 @@ CONFIG_KEYS: dict[str, tuple[str, ...]] = {
     "ZVEC_PYTHON": ("semantic_retrieval", "python"),
     "ZVEC_LOCK": ("semantic_retrieval", "lock_path"),
     "REQUIRE_LOCAL_MODEL": ("semantic_retrieval", "require_local_model"),
+    "SEMANTIC_ENABLED": ("semantic_retrieval", "enabled"),
+    "VECTOR_AFTER_CLOSEOUT": ("semantic_retrieval", "run_vector_index_after_closeout"),
     "MODEL_MANIFEST": ("semantic_retrieval", "model_manifest"),
     "MODEL_REVISION": ("semantic_retrieval", "model_revision"),
     "DEPENDENCY_LOCK": ("semantic_retrieval", "dependency_lock"),

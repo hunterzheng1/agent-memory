@@ -767,5 +767,58 @@ class CloseoutCommitSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(git(self.root, "rev-parse", "HEAD"), self.baseline)
 
+
+class CloseoutSemanticIndexGateTests(unittest.TestCase):
+    """2026-11-24：``[semantic_retrieval]`` 的两个开关只被安装器写入、从未被读取。
+
+    后果：未安装可选依赖 zvec 的机器上，每次 closeout 都无条件调用
+    ``agent_memory_zvec_index.py``，报 ``zvec_not_installed``，
+    使 ``zvec=failed`` → ``status=error`` → commit 被跳过。
+    下面钉住：默认关闭、显式 true 才启用、``run_vector_index_after_closeout=false`` 可单独关掉。
+    """
+
+    def setUp(self) -> None:
+        self.module = load_closeout()
+
+    def _enabled(self, env: dict[str, str]) -> bool:
+        with mock.patch.dict("os.environ", env, clear=False):
+            for key in ("AGENT_MEMORY_SEMANTIC_ENABLED", "AGENT_MEMORY_VECTOR_AFTER_CLOSEOUT"):
+                if key not in env:
+                    self.module.os.environ.pop(key, None)
+            return self.module.semantic_index_enabled()
+
+    def test_absent_section_keeps_optional_dependency_off(self) -> None:
+        # 未配置（或配置缺段）：不得因未安装 zvec 把例行 closeout 变成 error。
+        self.assertFalse(self._enabled({}))
+
+    def test_explicit_enabled_true_turns_refresh_on(self) -> None:
+        self.assertTrue(
+            self._enabled({"AGENT_MEMORY_SEMANTIC_ENABLED": "true"})
+        )
+
+    def test_enabled_but_after_closeout_false_skips_refresh(self) -> None:
+        self.assertFalse(
+            self._enabled(
+                {
+                    "AGENT_MEMORY_SEMANTIC_ENABLED": "true",
+                    "AGENT_MEMORY_VECTOR_AFTER_CLOSEOUT": "false",
+                }
+            )
+        )
+
+    def test_run_zvec_skips_without_touching_subprocess_when_disabled(self) -> None:
+        args = Namespace(skip_zvec=False, dry_run=False, zvec_timeout=10)
+        with (
+            mock.patch.dict("os.environ", {}, clear=False),
+            mock.patch.object(self.module, "run_command") as run_command,
+        ):
+            self.module.os.environ.pop("AGENT_MEMORY_SEMANTIC_ENABLED", None)
+            self.module.os.environ.pop("AGENT_MEMORY_VECTOR_AFTER_CLOSEOUT", None)
+            step = self.module.run_zvec([Path("x.md")], args)
+        self.assertTrue(step["ok"], step)
+        self.assertTrue(step["skipped"], step)
+        self.assertEqual(step["detail"], "semantic_retrieval_disabled")
+        run_command.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

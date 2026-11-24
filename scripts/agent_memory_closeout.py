@@ -890,11 +890,33 @@ def run_index(args: argparse.Namespace) -> dict[str, Any]:
     return run_command([PYTHON, str(INDEX_SCRIPT), "--init", "--scan", "--report"], timeout=180)
 
 
+def semantic_index_enabled() -> bool:
+    """Whether the optional semantic (Zvec) index is enabled on this host.
+
+    ``[semantic_retrieval] enabled`` (and ``run_vector_index_after_closeout``)
+    are written by the installers but were never read, so every closeout
+    invoked the Zvec refresher unconditionally. On hosts without the optional
+    ``zvec`` package that turned a routine closeout into ``status=error``
+    (``zvec=failed``) and blocked the commit.
+
+    Fail-safe default: only an explicit truthy ``enabled`` turns it on, so an
+    absent section keeps hosts that never opted in from being broken by an
+    optional dependency. ``run_vector_index_after_closeout = false`` also
+    disables the refresh even when the index itself is enabled.
+    """
+    truthy = {"1", "true", "yes", "on"}
+    if env_value("SEMANTIC_ENABLED", "false").strip().lower() not in truthy:
+        return False
+    return env_value("VECTOR_AFTER_CLOSEOUT", "true").strip().lower() in truthy
+
+
 def run_zvec(files: list[Path], args: argparse.Namespace) -> dict[str, Any]:
     if args.skip_zvec:
         return {"ok": True, "skipped": True, "detail": "skip_zvec"}
     if args.dry_run:
         return {"ok": True, "skipped": True, "detail": "dry_run"}
+    if not semantic_index_enabled():
+        return {"ok": True, "skipped": True, "detail": "semantic_retrieval_disabled"}
     command = [ZVEC_PYTHON, str(ZVEC_SCRIPT), "--prune", "--json"]
     for path in files:
         command.extend(["--changed-file", str(path)])
