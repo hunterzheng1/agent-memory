@@ -25,6 +25,10 @@ WINDOWS_ACL_SUPPORTED = os.name == "nt"
 # SIDs allowed to keep access on a private runtime file:
 # current user, LocalSystem, BUILTIN\\Administrators.
 WINDOWS_TRUSTED_SIDS = frozenset({"S-1-5-18", "S-1-5-32-544", "S-1-3-4"})
+_CURRENT_USER_SID: str | None = None
+# Paths whose DACL this process already verified as private. Avoids re-spawning
+# PowerShell for every SQLite connection in one closeout run.
+_WINDOWS_ACL_PRIVATE_CACHE: set[str] = set()
 WINDOWS_ACL_QUERY = (
     "$ErrorActionPreference='Stop';"
     "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
@@ -63,14 +67,15 @@ def _powershell() -> list[str]:
     for candidate in ("pwsh", "powershell"):
         if shutil.which(candidate):
             return [candidate, "-NoProfile", "-NonInteractive", "-Command"]
+    # Fall back to the well-known install path: PATH can be minimal inside host
+    # installers/hooks even though PowerShell is present.
+    for candidate in (
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    ):
+        if os.path.isfile(candidate):
+            return [candidate, "-NoProfile", "-NonInteractive", "-Command"]
     return []
-
-
-_CURRENT_USER_SID: str | None = None
-# Paths whose DACL this process has already verified/hardened. Avoids re-spawning
-# PowerShell for every SQLite connection in one closeout run (which pushed the
-# run past its own --lock-timeout in concurrent tests).
-_WINDOWS_ACL_PRIVATE_CACHE: set[str] = set()
 
 
 def _current_user_sid() -> str:
@@ -185,6 +190,10 @@ def windows_acl_reports(paths: list[Path]) -> dict[str, dict[str, Any]]:
         verdict = _acl_verdict(entry, current_user)
         if verdict["private"]:
             _WINDOWS_ACL_PRIVATE_CACHE.add(raw_path)
+        else:
+            # A negative verdict must not stick: the file may be hardened a
+            # moment later by the installer or a concurrent closeout.
+            _WINDOWS_ACL_PRIVATE_CACHE.discard(raw_path)
         out[raw_path] = verdict
     return out
 
