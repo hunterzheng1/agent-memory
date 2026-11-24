@@ -21,6 +21,7 @@ from agent_memory_env import (
     env_value,
     load_config_stable,
     resolve_config_path,
+    venv_python,
 )
 from agent_memory_state import absolute_path, secure_sqlite_connect, sqlite_permission_report
 from install_runtime import CORE_FILES, managed_path_issue, verify as verify_runtime_install
@@ -145,12 +146,14 @@ if PRELOAD_PATH_ISSUES:
     STATE_DB = CONFIG_ROOT / "state.sqlite"
     AUDIT_LOG = CONFIG_ROOT / "logs" / "audit_runs.jsonl"
     CLOSEOUT_LOG = CONFIG_ROOT / "logs" / "closeout.jsonl"
-    ZVEC_PYTHON = CONFIG_ROOT / ".venv" / "bin" / "python"
+    ZVEC_PYTHON = venv_python(CONFIG_ROOT)
     EMBEDDING_MODEL = Path()
     MODEL_MANIFEST = CONFIG_ROOT / "models" / "embeddinggemma-300m" / "model-manifest.json"
     MODEL_REVISION = ""
     DEPENDENCY_LOCK = CONFIG_ROOT / "requirements-vector.lock"
     REQUIRE_LOCAL_MODEL = False
+    VECTOR_DIR = CONFIG_ROOT / "zvec" / "memory_chunks_embeddinggemma_768"
+    EMBEDDING_DIM = ""
 else:
     VAULT_ROOT = resolve_config_path(env_value("ROOT", str(REPO_ROOT / "templates" / "vault")))
     GIT_ROOT = resolve_config_path(env_value("GIT_ROOT", str(REPO_ROOT)))
@@ -164,7 +167,7 @@ else:
         env_value("CLOSEOUT_LOG", str(CONFIG_ROOT / "logs" / "closeout.jsonl"))
     )
     ZVEC_PYTHON = resolve_config_path(
-        env_value("ZVEC_PYTHON", str(CONFIG_ROOT / ".venv" / "bin" / "python"))
+        env_value("ZVEC_PYTHON", str(venv_python(CONFIG_ROOT)))
     )
     _EMBEDDING_MODEL_RAW = env_value("EMBEDDING_MODEL", "")
     EMBEDDING_MODEL = (
@@ -186,6 +189,10 @@ else:
         "yes",
         "on",
     }
+    VECTOR_DIR = resolve_config_path(
+        env_value("VECTOR_DIR", str(CONFIG_ROOT / "zvec" / "memory_chunks_embeddinggemma_768"))
+    )
+    EMBEDDING_DIM = env_value("EMBEDDING_DIM", "768")
 EXCLUDED_VECTOR_TYPES = {"routing", "directory_index", "template", "agent_case_candidate", "skill_candidate"}
 EXCLUDED_VECTOR_STATUS = {"archived", "deleted", "obsolete", "outdated", "deprecated", "stale"}
 STALE_CLAIM_HOURS = 24
@@ -745,6 +752,43 @@ def repair_derived() -> list[dict[str, Any]]:
     return actions
 
 
+def inspect_vector_store(ledger_indexed: int) -> tuple[dict[str, Any], list[str]]:
+    """Read the real Zvec collection and compare it with the ledger.
+
+    Returns ``(store_state, problems)``. ``problems`` is empty only when the
+    collection exists, opens, and its document count / vector dimension agree
+    with the SQLite ledger and the configured ``embedding_dim``.
+    """
+
+    state: dict[str, Any] = {}
+    problems: list[str] = []
+    try:
+        import agent_memory_zvec_index as zvec_index
+    except Exception as exc:  # noqa: BLE001 - optional module
+        return {}, [f"zvec_module_unavailable: {exc}"]
+    expected_dim = int(EMBEDDING_DIM) if str(EMBEDDING_DIM or "").strip().isdigit() else None
+    try:
+        store = zvec_index.ZvecStore(VECTOR_DIR, expected_dim or 0)
+        state = store.inspect()
+    except Exception as exc:  # noqa: BLE001
+        return {}, [f"collection_inspect_failed: {exc}"]
+    if not state.get("exists"):
+        problems.append("collection_missing_on_disk")
+        return state, problems
+    if state.get("error"):
+        problems.append(str(state["error"]))
+        return state, problems
+    actual_docs = state.get("doc_count")
+    if actual_docs is not None and int(actual_docs) != int(ledger_indexed):
+        problems.append(
+            f"collection_doc_count_mismatch: store={actual_docs} ledger_indexed={ledger_indexed}"
+        )
+    actual_dim = state.get("embedding_dim")
+    if expected_dim and actual_dim is not None and int(actual_dim) != expected_dim:
+        problems.append(f"collection_dim_mismatch: store={actual_dim} configured={expected_dim}")
+    return state, problems
+
+
 def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
     if PRELOAD_PATH_ISSUES:
@@ -960,16 +1004,33 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
                 if str(row["status"]) == "error"
             )
             vector_ok = not (vector_missing or vector_stale or vector_hash_mismatch or vector_errors)
+            # The ledger alone is not evidence: it can report "111 indexed" while
+            # the collection holds zero vectors (exactly what happened on this
+            # host). Verify the real store's doc count and dimension too.
+            store_state, store_problems = inspect_vector_store(len(indexed))
+            vector_ok = vector_ok and not store_problems
             add(
                 checks,
                 "zvec_parity",
                 "pass" if vector_ok else "fail",
-                f"Zvec covers {len(indexed & eligible.keys())}/{len(eligible)} docs.",
+                (
+                    f"Zvec covers {len(indexed & eligible.keys())}/{len(eligible)} docs; "
+                    f"collection holds {store_state.get('doc_count')} vectors at "
+                    f"{store_state.get('embedding_dim')} dims."
+                    if vector_ok
+                    else "Zvec index does not match the ledger or the configured dimension: "
+                         + "; ".join(
+                             [*vector_missing, *vector_stale, *vector_hash_mismatch, *vector_errors,
+                              *store_problems][:5]
+                         )
+                ),
                 {
                     "missing": vector_missing,
                     "stale": vector_stale,
                     "hash_mismatch": vector_hash_mismatch,
                     "errors": vector_errors,
+                    "collection": store_state,
+                    "collection_problems": store_problems,
                 },
             )
     else:

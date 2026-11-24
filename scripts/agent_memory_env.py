@@ -29,6 +29,27 @@ LOCAL_PATH_DEFAULTS: dict[str, tuple[str, ...]] = {
     "MODEL_MANIFEST": ("models", "embeddinggemma-300m", "model-manifest.json"),
     "DEPENDENCY_LOCK": ("requirements-vector.lock",),
 }
+#: True on Windows; module-level so tests can flip it safely.
+WINDOWS = os.name == "nt"
+
+
+def venv_python(config_root: str | os.PathLike[str]) -> Path:
+    """Interpreter inside a virtualenv rooted at ``config_root``.
+
+    The layout is platform specific: POSIX puts it at ``.venv/bin/python``,
+    Windows at ``.venv/Scripts/python.exe``. Hard-coding the POSIX form made
+    doctor report a permanently missing interpreter on Windows even when the
+    venv was installed correctly.
+    """
+
+    root = Path(os.path.abspath(os.path.expanduser(os.fspath(config_root))))
+    # Use the module-level flag so tests can exercise both layouts without
+    # monkeypatching os.name (which would make pathlib pick the wrong class).
+    if WINDOWS:
+        return root / ".venv" / "Scripts" / "python.exe"
+    return root / ".venv" / "bin" / "python"
+
+
 CONFIG_KEYS: dict[str, tuple[str, ...]] = {
     "ROOT": ("memory_root",),
     "GIT_ROOT": ("git_root",),

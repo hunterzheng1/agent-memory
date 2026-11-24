@@ -567,6 +567,59 @@ class ZvecStore:
         else:
             self._collection = zvec.create_and_open(path=str(self.collection_path), schema=self._schema())
 
+    def inspect(self) -> dict[str, Any]:
+        """Actual on-disk state of the collection (doc count + vector dimension).
+
+        ``parity_report`` used to read only the SQLite ledger, so a collection
+        that had been recreated (or emptied) while the ledger still said
+        "indexed" reported a healthy parity — the 111/112 figure was such an
+        artefact. Reading the real store makes that impossible.
+        """
+
+        result: dict[str, Any] = {
+            "collection_path": str(self.collection_path),
+            "exists": self.collection_path.exists(),
+            "opened": False,
+            "doc_count": None,
+            "embedding_dim": None,
+            "error": "",
+        }
+        if not result["exists"]:
+            return result
+        try:
+            zvec = self._load_zvec()
+        except RuntimeError as exc:
+            result["error"] = str(exc)
+            return result
+        try:
+            collection = zvec.open(path=str(self.collection_path))
+        except Exception as exc:  # noqa: BLE001 - surface any store error verbatim
+            result["error"] = f"collection_open_failed: {exc}"
+            return result
+        result["opened"] = True
+        try:
+            stats = collection.stats
+            if callable(stats):
+                stats = stats()
+            if isinstance(stats, dict):
+                result["doc_count"] = int(stats.get("doc_count") or 0)
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"collection_stats_failed: {exc}"
+        try:
+            schema = collection.schema
+            if callable(schema):
+                schema = schema()
+            # zvec returns a dict-like schema; the vector field carries the dim.
+            fields = schema.get("fields") if isinstance(schema, dict) else None
+            if isinstance(fields, dict):
+                for spec in fields.values():
+                    if isinstance(spec, dict) and "dimension" in spec:
+                        result["embedding_dim"] = int(spec["dimension"])
+                        break
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = (result["error"] + "; " if result["error"] else "") + f"collection_schema_failed: {exc}"
+        return result
+
     @property
     def collection(self) -> Any:
         self.init()
@@ -810,7 +863,21 @@ def vector_rows(conn: sqlite3.Connection, scored_ids: list[tuple[str, float]], q
     return deduped
 
 
-def parity_report(conn: sqlite3.Connection, vault_root: Path) -> dict[str, object]:
+def parity_report(
+    conn: sqlite3.Connection,
+    vault_root: Path,
+    store: "ZvecStore | None" = None,
+    expected_dim: int | None = None,
+) -> dict[str, object]:
+    """Compare the SQLite ledger against the real Zvec collection.
+
+    The ledger alone is not evidence: it can say "111 indexed" while the
+    collection holds zero vectors (that is exactly what happened here). When a
+    ``store`` is supplied the report also verifies the collection's actual
+    document count and vector dimension against the ledger and the configured
+    ``embedding_dim``, and marks ``parity_ok`` False on any mismatch.
+    """
+
     eligible_docs = load_index_docs(conn, vault_root)
     eligible = {str(doc.path): doc.rel_path for doc in eligible_docs}
     rows = conn.execute("SELECT path, rel_path, status, chunk_count, last_error FROM memory_vector_index_state").fetchall()
@@ -823,10 +890,33 @@ def parity_report(conn: sqlite3.Connection, vault_root: Path) -> dict[str, objec
         for row in rows if row["status"] == "error"
     ]
     chunk_count = int(conn.execute("SELECT COUNT(*) FROM memory_vector_chunks").fetchone()[0])
+
+    store_problems: list[str] = []
+    store_state: dict[str, Any] = {}
+    if store is not None:
+        store_state = store.inspect()
+        if not store_state.get("exists"):
+            store_problems.append("collection_missing_on_disk")
+        elif store_state.get("error"):
+            store_problems.append(str(store_state["error"]))
+        else:
+            actual_docs = store_state.get("doc_count")
+            actual_dim = store_state.get("embedding_dim")
+            if actual_docs is not None and int(actual_docs) != len(indexed):
+                store_problems.append(
+                    f"collection_doc_count_mismatch: store={actual_docs} ledger_indexed={len(indexed)}"
+                )
+            if expected_dim and actual_dim is not None and int(actual_dim) != int(expected_dim):
+                store_problems.append(
+                    f"collection_dim_mismatch: store={actual_dim} configured={expected_dim}"
+                )
+
     return {
         "eligible_docs": len(eligible), "indexed_docs": len(indexed), "chunk_count": chunk_count,
         "missing_docs": missing, "stale_paths": stale, "errors": errors,
-        "parity_ok": not missing and not stale and not errors,
+        "collection": store_state,
+        "collection_problems": store_problems,
+        "parity_ok": not missing and not stale and not errors and not store_problems,
     }
 
 
@@ -1025,8 +1115,14 @@ def run_locked(args: argparse.Namespace) -> int:
             if args.scan or args.prune or args.changed_file:
                 exit_code = max(exit_code, run_indexing(args, sqlite_index, conn, store))
             if args.report:
-                report = parity_report(conn, Path(sqlite_index.VAULT_ROOT))
+                report = parity_report(
+                    conn, Path(sqlite_index.VAULT_ROOT), store, args.embedding_dim
+                )
                 print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else "\n".join(f"{k}={v}" for k, v in report.items()))
+                # A parity mismatch is a real integrity failure, not a note:
+                # exit non-zero so callers cannot treat it as healthy.
+                if not report.get("parity_ok"):
+                    exit_code = max(exit_code, 1)
             if args.search:
                 exit_code = max(exit_code, run_search(args, conn, store))
             return exit_code
