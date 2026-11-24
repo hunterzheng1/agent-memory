@@ -66,6 +66,9 @@ scripts/
   install-workbuddy-hooks.ps1
                           # 幂等合并 WorkBuddy（昆仑小智）的 UserPromptSubmit/Stop/SessionEnd
                           # 写入 ~/.kunlunxiaozhi/settings.json；原生会话 ID，无需 SessionStart 桥
+  install-pi-extension.ps1
+                          # 幂等安装 Pi 的 TS 扩展（Pi 无 JSON hook 配置，宿主接入靠扩展）
+                          # 从 templates/pi/ 复制到 ~/.pi/agent/extensions/；默认不覆盖本地改过的副本
   install_runtime.py     # 把当前 Git 版本安装为可校验的本机 Runtime
   memoryctl               # 所有宿主共用的平台中立命令入口
   agent_memory_zvec_index.py

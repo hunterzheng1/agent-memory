@@ -292,6 +292,37 @@ python3 scripts/agent_memory_stop_hook.py \
   --timeout 300
 ```
 
+## Pi
+
+Pi has no JSON hook config: host integration is done with a TypeScript
+extension, not a Stop-hook script. The repository ships the extension as a
+template and an idempotent installer.
+
+- Use `memoryctl --actor pi` for search / prewrite / claim / closeout. Pi
+  exports `PI_SESSION_ID` natively, so no `SessionStart` bridge is needed.
+- One-shot install: `pwsh -File scripts/install-pi-extension.ps1 -DryRun`, then
+  re-run without `-DryRun`. It copies `templates/pi/agent-memory.ts` into
+  `~/.pi/agent/extensions/`, refuses to clobber a differing local copy unless
+  `-Force` is passed, and backs up before replacing.
+- The extension is a read-only reminder: on `tool_result` it tracks memory files
+  written this turn; on `agent_settled` it claims them and runs
+  `closeout --dry-run`, reporting `MERGE_REQUIRED` / `ASK_USER` / deletion
+  signals. It never commits. The formal closeout stays an explicit agent action.
+- **Point it at the installed Runtime, not the source checkout.** The source repo
+  has no `config/agent-memory.toml`, so closeout falls back to template defaults
+  (`VAULT_ROOT=templates/vault`, `REPO_ROOT=<source repo>`) and then compares
+  vault history against the source repo HEAD — which always fails with
+  `closeout git baseline is not an ancestor of HEAD`. The extension resolves the
+  Runtime by default and honours `AGENT_MEMORY_MEMORYCTL` /
+  `AGENT_MEMORY_CONFIG_ROOT` / `AGENT_MEMORY_PYTHON` for non-default layouts.
+- Closeout exit codes are `0=ok`, `1=warning` (advisories such as a due audit or
+  unpushed commits — not a failure), `2=error/blocked`. The extension reports
+  only code 2 as a failure, so a routine warning does not look like a broken
+  install.
+- Doctor does not check Pi hooks (there is no hook file to compare). Verify the
+  wiring by writing a vault file in a Pi session and confirming the settle
+  notification, then cross-check with `memoryctl --actor pi closeout --dry-run`.
+
 ## Claude Settings Managers
 
 Some provider switchers and configuration managers regenerate `~/.claude/settings.json` when they start or change providers. A hook added only to the live file can therefore disappear even though the original installation succeeded.

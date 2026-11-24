@@ -20,6 +20,7 @@ import agent_memory_check as check
 import agent_memory_closeout as closeout
 import agent_memory_doctor as doctor
 import agent_memory_index as index
+import agent_memory_zvec_index as zvec_index
 import install_runtime as runtime
 
 
@@ -357,6 +358,89 @@ class DurabilityGuardTests(unittest.TestCase):
         self.assertEqual(closeout[0], "pass")
         self.assertFalse(strict[2]["allowed_precommit"])
         self.assertTrue(closeout[2]["allowed_precommit"])
+
+    def test_zvec_parity_is_skipped_when_semantic_retrieval_disabled(self) -> None:
+        """2026-11-24：语义检索未启用时，zvec_parity 必须 skipped（不算 fail 也不算 warn）。
+
+        与 closeout 的 1b86c09 同一个问题：安装器写入 `[semantic_retrieval] enabled = false`，
+        检查却仍把从未刷新的向量索引判成 fail，把 doctor 顶层拖成 error。
+        """
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp).resolve()
+            vault = tmp / "vault"
+            vault.mkdir()
+            (vault / "note.md").write_text("# Note\n\nBody.\n", encoding="utf-8")
+            state_db = tmp / "state.sqlite"
+            with sqlite3.connect(state_db) as conn:
+                index.init_db(conn)
+                zvec_index.init_db(conn)
+                # 一个陈旧/缺失的向量索引：启用时必然是 fail。
+                conn.execute(
+                    "INSERT INTO memory_vector_index_state (path, rel_path, doc_sha256, status, last_error, updated_at) "
+                    "VALUES (?, ?, ?, 'indexed', '', '2026-11-24T00:00:00+00:00')",
+                    (str(tmp / "gone.md"), "gone.md", "deadbeef"),
+                )
+                conn.commit()
+            doctor_globals = {
+                "STATE_DB": state_db,
+                "VAULT_ROOT": vault,
+                "GIT_ROOT": tmp,
+                "CONFIG_ROOT": tmp / "runtime",
+                "AUDIT_LOG": tmp / "audit.jsonl",
+                "CLOSEOUT_LOG": tmp / "closeout.jsonl",
+                "HOST_CONFIG": {},
+            }
+            with mock.patch.multiple(doctor, SEMANTIC_ENABLED=False, **doctor_globals):
+                checks = doctor.collect_checks(allow_dirty_memory=True)
+            parity = next(c for c in checks if c["name"] == "zvec_parity")
+            self.assertEqual(parity["status"], "skipped", parity)
+            self.assertIn("disabled", parity["message"])
+            # 未启用时不得产生其它 semantic_* 检查。
+            self.assertFalse([c for c in checks if c["name"].startswith("semantic_")])
+            # 且 skipped 不得把顶层判成 error：zvec 相关项不得再贡献 fail。
+            self.assertNotIn(
+                "fail",
+                {c["status"] for c in checks if "zvec" in c["name"] or c["name"].startswith("semantic_")},
+            )
+
+    def test_zvec_parity_still_fails_when_semantic_retrieval_enabled(self) -> None:
+        """启用时行为不变：向量索引陈旧/缺失仍必须 fail。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:
+            tmp = Path(raw_tmp).resolve()
+            vault = tmp / "vault"
+            vault.mkdir()
+            (vault / "note.md").write_text("# Note\n\nBody.\n", encoding="utf-8")
+            state_db = tmp / "state.sqlite"
+            with sqlite3.connect(state_db) as conn:
+                index.init_db(conn)
+                zvec_index.init_db(conn)
+                conn.execute(
+                    "INSERT INTO memory_vector_index_state (path, rel_path, doc_sha256, status, last_error, updated_at) "
+                    "VALUES (?, ?, ?, 'indexed', '', '2026-11-24T00:00:00+00:00')",
+                    (str(tmp / "gone.md"), "gone.md", "deadbeef"),
+                )
+                conn.commit()
+            doctor_globals = {
+                "STATE_DB": state_db,
+                "VAULT_ROOT": vault,
+                "GIT_ROOT": tmp,
+                "CONFIG_ROOT": tmp / "runtime",
+                "AUDIT_LOG": tmp / "audit.jsonl",
+                "CLOSEOUT_LOG": tmp / "closeout.jsonl",
+                "HOST_CONFIG": {},
+                "REQUIRE_LOCAL_MODEL": False,
+            }
+            with (
+                mock.patch.multiple(doctor, SEMANTIC_ENABLED=True, **doctor_globals),
+                mock.patch.object(doctor, "verify_model_manifest", return_value=(True, {})),
+                mock.patch.object(doctor, "verify_semantic_python_runtime", return_value=(True, {})),
+                mock.patch.object(doctor, "verify_dependency_lock", return_value=(True, {})),
+                mock.patch.object(doctor, "offline_semantic_probe", return_value=(True, {})),
+            ):
+                checks = doctor.collect_checks(allow_dirty_memory=True)
+            parity = next(c for c in checks if c["name"] == "zvec_parity")
+            self.assertEqual(parity["status"], "fail", parity)
+            self.assertEqual(parity["detail"]["stale"], ["gone.md"])
 
     def test_codebuddy_stop_hook_requires_actor_flag_in_settings(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as raw_tmp:

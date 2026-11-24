@@ -866,7 +866,18 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     refs = set(re.findall(r"`([^`]+\.md)`", index_path.read_text(encoding="utf-8", errors="replace"))) if index_path.exists() else set()
     add(checks, "index_navigation_parity", "pass" if refs == actual_rel else "warn", f"INDEX.md lists {len(refs)}/{len(actual_rel)} docs.", {"unlisted": sorted(actual_rel - refs), "broken": sorted(refs - actual_rel)})
     tables = {str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if {"memory_vector_chunks", "memory_vector_index_state"}.issubset(tables):
+    # 2026-11-24：语义检索未启用时，zvec 相关检查一律 skipped（附原因），既不算 fail 也不算
+    # warn。此前安装器写入 `[semantic_retrieval] enabled = false` 却没人读取，doctor 仍把
+    # 从未刷新的向量索引判成 fail，把顶层状态拖成 error（与 1b86c09 同一个问题）。
+    if not SEMANTIC_ENABLED:
+        add(
+            checks,
+            "zvec_parity",
+            "skipped",
+            "Semantic retrieval is disabled ([semantic_retrieval] enabled = false); optional vector index is not checked.",
+            {"semantic_retrieval_enabled": False},
+        )
+    elif {"memory_vector_chunks", "memory_vector_index_state"}.issubset(tables):
         eligible = {
             str(row["path"]): {"rel_path": str(row["rel_path"]), "sha256": str(row["sha256"])}
             for row in docs
@@ -1228,7 +1239,7 @@ def main() -> int:
     checks = collect_checks(allow_dirty_memory=args.allow_dirty_memory)
     statuses = {str(item["status"]) for item in checks}
     status = "error" if "fail" in statuses else ("warning" if "warn" in statuses else "ok")
-    payload = {"time": utc_now(), "version": VERSION, "status": status, "summary": {name: sum(1 for item in checks if item["status"] == name) for name in ("pass", "warn", "fail")}, "checks": checks, "repair_actions": repairs}
+    payload = {"time": utc_now(), "version": VERSION, "status": status, "summary": {name: sum(1 for item in checks if item["status"] == name) for name in ("pass", "warn", "fail", "skipped")}, "checks": checks, "repair_actions": repairs}
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
