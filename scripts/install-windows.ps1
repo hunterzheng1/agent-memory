@@ -552,6 +552,10 @@ if ($InstallAuditTask) {
 # changes the file inside this boundary; refresh the snapshot first so the check
 # reflects the post-install state instead of a transient mid-write read.
 Set-InstallerPathSnapshot
+# doctor verifies (and may tighten) the state DB DACL, which legitimately
+# changes the file inside this boundary; refresh the snapshot first so the check
+# reflects the post-install state instead of a transient mid-write read.
+Set-InstallerPathSnapshot
 Assert-InstallerBoundary
 Invoke-Checked $venvPython @((Join-Path $runtimeScripts 'agent_memory_doctor.py')) 'doctor'
 Write-Warning 'windows_acl: POSIX modes are not a Windows access boundary; NTFS ACLs on the state DB and audit ledger are verified (and tightened when needed) on open and by doctor.'

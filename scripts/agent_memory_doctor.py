@@ -764,7 +764,7 @@ def collect_checks(allow_dirty_memory: bool = False) -> list[dict[str, Any]]:
     if runtime_verification is not None and not runtime_verification.get("ok"):
         # The Windows installer runs doctor immediately after staging the runtime;
         # a manifest/hash read can race the final flush and report a transient
-        # drift. Re-verify once before declaring the closure broken.
+        # drift. Re-verify a few times before declaring the closure broken.
         time.sleep(0.5)
         retry = verify_runtime_install(CONFIG_ROOT)
         if retry.get("ok"):

@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -143,15 +144,24 @@ def windows_acl_reports(paths: list[Path]) -> dict[str, dict[str, Any]]:
         return {}
     env = dict(os.environ)
     env["AGENT_MEMORY_ACL_TARGET"] = "|".join(str(p) for p in paths)
-    try:
-        result = subprocess.run(
-            [*prefix, WINDOWS_ACL_QUERY],
-            capture_output=True, text=True, timeout=120, env=env,
-            encoding="utf-8", errors="replace",
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if result.returncode != 0:
+    result = None
+    # One retry: a transient PowerShell start failure (the Windows installer can
+    # be finishing other work) must not silently downgrade the verdict to
+    # "unverified", which would make doctor report a false warning.
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                [*prefix, WINDOWS_ACL_QUERY],
+                capture_output=True, text=True, timeout=120, env=env,
+                encoding="utf-8", errors="replace",
+            )
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None and result.returncode == 0:
+            break
+        if attempt == 0:
+            time.sleep(0.2)
+    if result is None or result.returncode != 0:
         return {}
     try:
         payload = json.loads(result.stdout)
