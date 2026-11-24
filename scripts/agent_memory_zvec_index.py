@@ -603,21 +603,39 @@ class ZvecStore:
                 stats = stats()
             if isinstance(stats, dict):
                 result["doc_count"] = int(stats.get("doc_count") or 0)
+            else:
+                # zvec returns a CollectionStats object with a doc_count attribute.
+                count = getattr(stats, "doc_count", None)
+                if count is not None:
+                    result["doc_count"] = int(count)
         except Exception as exc:  # noqa: BLE001
             result["error"] = f"collection_stats_failed: {exc}"
         try:
             schema = collection.schema
             if callable(schema):
                 schema = schema()
-            # zvec returns a dict-like schema; the vector field carries the dim.
-            fields = schema.get("fields") if isinstance(schema, dict) else None
-            if isinstance(fields, dict):
-                for spec in fields.values():
-                    if isinstance(spec, dict) and "dimension" in spec:
-                        result["embedding_dim"] = int(spec["dimension"])
+            # zvec exposes the vector specs as ``schema.vectors`` (a list of
+            # dicts); older/simplified shapes use a dict. Accept both.
+            dim = None
+            vectors = getattr(schema, "vectors", None)
+            if vectors is None and isinstance(schema, dict):
+                vectors = schema.get("vectors") or schema.get("fields")
+            if isinstance(vectors, dict):
+                vectors = list(vectors.values())
+            if isinstance(vectors, list):
+                for spec in vectors:
+                    # zvec returns VectorSchema objects (dimension attribute);
+                    # simplified/older shapes may return dicts.
+                    value = getattr(spec, "dimension", None)
+                    if value is None and isinstance(spec, dict):
+                        value = spec.get("dimension")
+                    if value is not None:
+                        dim = int(value)
                         break
+            if dim is not None:
+                result["embedding_dim"] = dim
         except Exception as exc:  # noqa: BLE001
-            result["error"] = (result["error"] + "; " if result["error"] else "") + f"collection_schema_failed: {exc}"
+            result["error"] = (result["error"] or "") + f"collection_schema_failed: {exc}"
         return result
 
     @property
